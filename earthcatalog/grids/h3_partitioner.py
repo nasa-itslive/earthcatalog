@@ -1,13 +1,12 @@
 import h3
 import numpy as np
 from shapely import wkb
-from shapely.geometry import mapping, Polygon
-from shapely.geometry.base import BaseGeometry
+from shapely.geometry import Polygon, mapping
 
 from earthcatalog.core.partitioner import AbstractPartitioner
 
 
-def _boundary_cells(geom, resolution: int) -> set[str]:
+def _boundary_cells(geom: object, resolution: int) -> set[str]:
     """
     Return all H3 cells touched by the polygon's exterior boundary ring.
     Densify the ring so no cell is skipped between two vertices.
@@ -37,7 +36,7 @@ class H3Partitioner(AbstractPartitioner):
     - Point: single cell containing the point (h3.latlng_to_cell)
     """
 
-    def __init__(self, resolution: int = 3):
+    def __init__(self, resolution: int = 3) -> None:
         self.resolution = resolution
 
     def get_intersecting_keys(self, geom_wkb: bytes) -> list[str]:

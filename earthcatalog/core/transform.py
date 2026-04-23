@@ -58,12 +58,13 @@ import pyarrow.parquet as pq
 import rustac
 
 from .partitioner import AbstractPartitioner
-from .schema import GEOMETRY_FIELDS, schema as ARROW_SCHEMA
-
+from .schema import GEOMETRY_FIELDS
+from .schema import schema as ARROW_SCHEMA
 
 # ---------------------------------------------------------------------------
 # FileMetadata — tiny serialisable record returned by ingest / compact workers
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class FileMetadata:
@@ -90,11 +91,13 @@ class FileMetadata:
     file_size_bytes:
         Byte size of the written Parquet file.
     """
+
     s3_key: str
     grid_partition: str
     year: int | None
     row_count: int
     file_size_bytes: int
+
 
 # ---------------------------------------------------------------------------
 # Target schema — derived from the canonical schema.py so there is one source
@@ -130,7 +133,8 @@ assert [c[0] for c in _COLUMNS] == _EXPECTED_NAMES, "schema.py field order misma
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _to_int(value) -> int | None:
+
+def _to_int(value: object) -> int | None:
     """Round a float/int value to Python int, or None if missing."""
     if value is None:
         return None
@@ -200,6 +204,7 @@ def _sort_key(item: dict) -> tuple[str, str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def fan_out(
     stac_items: list[dict],
     partitioner: AbstractPartitioner,
@@ -225,37 +230,39 @@ def fan_out(
             continue
 
         base_props = {
-            "datetime":             props.get("datetime"),
-            "start_datetime":       props.get("start_datetime"),
-            "mid_datetime":         props.get("mid_datetime"),
-            "end_datetime":         props.get("end_datetime"),
-            "created":              props.get("created"),
-            "updated":              props.get("updated"),
+            "datetime": props.get("datetime"),
+            "start_datetime": props.get("start_datetime"),
+            "mid_datetime": props.get("mid_datetime"),
+            "end_datetime": props.get("end_datetime"),
+            "created": props.get("created"),
+            "updated": props.get("updated"),
             "percent_valid_pixels": _to_int(props.get("percent_valid_pixels")),
-            "date_dt":              _to_int(props.get("date_dt")),
-            "latitude":             props.get("latitude"),
-            "longitude":            props.get("longitude"),
-            "platform":             props.get("platform"),
-            "version":              props.get("version"),
-            "proj_code":            props.get("proj:code"),
-            "sat_orbit_state":      props.get("sat:orbit_state"),
-            "scene_1_id":           props.get("scene_1_id"),
-            "scene_2_id":           props.get("scene_2_id"),
-            "scene_1_frame":        props.get("scene_1_frame"),
-            "scene_2_frame":        props.get("scene_2_frame"),
-            "raw_stac":             json.dumps(item),
+            "date_dt": _to_int(props.get("date_dt")),
+            "latitude": props.get("latitude"),
+            "longitude": props.get("longitude"),
+            "platform": props.get("platform"),
+            "version": props.get("version"),
+            "proj_code": props.get("proj:code"),
+            "sat_orbit_state": props.get("sat:orbit_state"),
+            "scene_1_id": props.get("scene_1_id"),
+            "scene_2_id": props.get("scene_2_id"),
+            "scene_1_frame": props.get("scene_1_frame"),
+            "scene_2_frame": props.get("scene_2_frame"),
+            "raw_stac": json.dumps(item),
         }
 
         for key in keys:
-            result.append({
-                "type":         "Feature",
-                "stac_version": item.get("stac_version", "1.0.0"),
-                "id":           item["id"],
-                "geometry":     item["geometry"],
-                "properties":   {**base_props, "grid_partition": key},
-                "links":        [],
-                "assets":       {},
-            })
+            result.append(
+                {
+                    "type": "Feature",
+                    "stac_version": item.get("stac_version", "1.0.0"),
+                    "id": item["id"],
+                    "geometry": item["geometry"],
+                    "properties": {**base_props, "grid_partition": key},
+                    "links": [],
+                    "assets": {},
+                }
+            )
 
     return result
 
@@ -336,9 +343,9 @@ def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
         finally:
             loop.close()
 
-        raw      = pq.ParquetFile(tmp).read()
+        raw = pq.ParquetFile(tmp).read()
         geo_meta = pq.ParquetFile(tmp).metadata.metadata.get(b"geo", b"")
-        aligned  = _align_schema(raw, geo_meta)
+        aligned = _align_schema(raw, geo_meta)
         pq.write_table(aligned, path)
         return len(aligned)
     finally:
@@ -348,7 +355,7 @@ def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
 
 def write_geoparquet_s3(
     fan_out_items: list[dict],
-    store,
+    store: object,
     s3_key: str,
 ) -> tuple[int, int]:
     """

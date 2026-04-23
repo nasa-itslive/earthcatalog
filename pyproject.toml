@@ -18,9 +18,6 @@ dependencies = [
     "typer",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest"]
-
 [project.scripts]
 earthcatalog-ingest = "earthcatalog.pipelines.incremental:main"
 earthcatalog = "earthcatalog.cli:main"
@@ -29,8 +26,23 @@ earthcatalog = "earthcatalog.cli:main"
 where = ["."]
 include = ["earthcatalog*"]
 
+[dependency-groups]
+dev = ["pytest", "ruff", "mypy"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP"]
+ignore = ["E501"]  # line length enforced by formatter
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

@@ -2,9 +2,7 @@
 Tests for earthcatalog.grids.h3_partitioner — H3Partitioner.
 """
 
-import pytest
-from shapely.geometry import Point, Polygon, mapping
-from shapely import wkb as shapely_wkb
+from shapely.geometry import Point, Polygon
 
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
@@ -60,7 +58,6 @@ class TestH3Partitioner:
 
     def test_resolution_respected(self):
         """Higher resolution → more (smaller) cells for same geometry."""
-        import h3
         p2 = H3Partitioner(resolution=2)
         p3 = H3Partitioner(resolution=3)
         keys2 = p2.get_intersecting_keys(_wkb(SMALL_POLYGON))

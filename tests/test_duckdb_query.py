@@ -8,13 +8,12 @@ via ``table.add_files()``, DuckDB can read the Iceberg table directly using
 No network calls are made — the catalog lives entirely in tmp_path.
 """
 
-import json
 
 import duckdb
 import pytest
 
 from earthcatalog.core.catalog import get_or_create_table, open_catalog
-from earthcatalog.core.transform import fan_out, write_geoparquet, group_by_partition
+from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
 # ---------------------------------------------------------------------------

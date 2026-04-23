@@ -25,7 +25,7 @@ Usage:
 import json
 import os
 import socket
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import obstore
 from obstore.exceptions import AlreadyExistsError
@@ -48,7 +48,7 @@ class S3Lock:
     Stale locks (older than ttl_hours) are automatically overridden.
     """
 
-    def __init__(self, owner: str, ttl_hours: int = 12):
+    def __init__(self, owner: str, ttl_hours: int = 12) -> None:
         """
         Args:
             owner:     Human-readable name for the lock holder (e.g. "backfill").
@@ -57,19 +57,19 @@ class S3Lock:
         self._owner = owner
         self._ttl = ttl_hours
 
-    def __enter__(self):
+    def __enter__(self) -> "S3Lock":
         self.acquire()
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *_: object) -> None:
         self.release()
 
     @property
-    def _store(self):
+    def _store(self) -> object:
         return store_config.get_store()
 
     @property
-    def _key(self):
+    def _key(self) -> str:
         return store_config.get_lock_key()
 
     def acquire(self) -> None:
@@ -98,7 +98,7 @@ class S3Lock:
             return
 
         acquired_at = datetime.fromisoformat(existing["acquired"])
-        age = datetime.now(timezone.utc) - acquired_at
+        age = datetime.now(UTC) - acquired_at
         ttl = timedelta(hours=existing.get("ttl_hours", self._ttl))
 
         if age >= ttl:
@@ -130,7 +130,7 @@ class S3Lock:
                 "owner": self._owner,
                 "pid": os.getpid(),
                 "hostname": socket.gethostname(),
-                "acquired": datetime.now(timezone.utc).isoformat(),
+                "acquired": datetime.now(UTC).isoformat(),
                 "ttl_hours": self._ttl,
             }
         ).encode()

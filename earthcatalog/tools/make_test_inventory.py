@@ -10,7 +10,6 @@ Usage:
 
 import argparse
 import csv
-from pathlib import Path
 
 from obstore.store import S3Store
 

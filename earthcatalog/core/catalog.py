@@ -10,8 +10,6 @@ from pathlib import Path
 
 import obstore
 from pyiceberg.catalog.sql import SqlCatalog
-
-from . import store_config
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
@@ -20,11 +18,12 @@ from pyiceberg.types import (
     BinaryType,
     DoubleType,
     IntegerType,
-    LongType,
     NestedField,
     StringType,
     TimestamptzType,
 )
+
+from . import store_config
 
 NAMESPACE = "earthcatalog"
 TABLE_NAME = "stac_items"
@@ -33,28 +32,28 @@ FULL_NAME = f"{NAMESPACE}.{TABLE_NAME}"
 # PyIceberg schema — mirrors earthcatalog/schema.py (PyArrow)
 # Field IDs must be stable; never reorder or reuse them.
 ICEBERG_SCHEMA = Schema(
-    NestedField(1,  "id",                   StringType(),      required=True),
-    NestedField(2,  "grid_partition",        StringType(),      required=True),
-    NestedField(3,  "geometry",              BinaryType(),      required=False),
-    NestedField(4,  "datetime",              TimestamptzType(), required=False),
-    NestedField(5,  "start_datetime",        TimestamptzType(), required=False),
-    NestedField(6,  "mid_datetime",          TimestamptzType(), required=False),
-    NestedField(7,  "end_datetime",          TimestamptzType(), required=False),
-    NestedField(8,  "created",               TimestamptzType(), required=False),
-    NestedField(9,  "updated",               TimestamptzType(), required=False),
-    NestedField(10, "percent_valid_pixels",  IntegerType(),     required=False),
-    NestedField(11, "date_dt",               IntegerType(),     required=False),
-    NestedField(12, "latitude",              DoubleType(),      required=False),
-    NestedField(13, "longitude",             DoubleType(),      required=False),
-    NestedField(14, "platform",              StringType(),      required=False),
-    NestedField(15, "version",               StringType(),      required=False),
-    NestedField(16, "proj_code",             StringType(),      required=False),
-    NestedField(17, "sat_orbit_state",       StringType(),      required=False),
-    NestedField(18, "scene_1_id",            StringType(),      required=False),
-    NestedField(19, "scene_2_id",            StringType(),      required=False),
-    NestedField(20, "scene_1_frame",         StringType(),      required=False),
-    NestedField(21, "scene_2_frame",         StringType(),      required=False),
-    NestedField(22, "raw_stac",              StringType(),      required=False),
+    NestedField(1, "id", StringType(), required=True),
+    NestedField(2, "grid_partition", StringType(), required=True),
+    NestedField(3, "geometry", BinaryType(), required=False),
+    NestedField(4, "datetime", TimestamptzType(), required=False),
+    NestedField(5, "start_datetime", TimestamptzType(), required=False),
+    NestedField(6, "mid_datetime", TimestamptzType(), required=False),
+    NestedField(7, "end_datetime", TimestamptzType(), required=False),
+    NestedField(8, "created", TimestamptzType(), required=False),
+    NestedField(9, "updated", TimestamptzType(), required=False),
+    NestedField(10, "percent_valid_pixels", IntegerType(), required=False),
+    NestedField(11, "date_dt", IntegerType(), required=False),
+    NestedField(12, "latitude", DoubleType(), required=False),
+    NestedField(13, "longitude", DoubleType(), required=False),
+    NestedField(14, "platform", StringType(), required=False),
+    NestedField(15, "version", StringType(), required=False),
+    NestedField(16, "proj_code", StringType(), required=False),
+    NestedField(17, "sat_orbit_state", StringType(), required=False),
+    NestedField(18, "scene_1_id", StringType(), required=False),
+    NestedField(19, "scene_2_id", StringType(), required=False),
+    NestedField(20, "scene_1_frame", StringType(), required=False),
+    NestedField(21, "scene_2_frame", StringType(), required=False),
+    NestedField(22, "raw_stac", StringType(), required=False),
 )
 
 # Partition spec: grid cell (identity) + year of acquisition.
@@ -70,7 +69,7 @@ ICEBERG_SCHEMA = Schema(
 # files for those cells opened — O(query_cells / total_cells) of the data.
 PARTITION_SPEC = PartitionSpec(
     PartitionField(source_id=2, field_id=100, transform=IdentityTransform(), name="grid_partition"),
-    PartitionField(source_id=4, field_id=101, transform=YearTransform(),     name="year"),
+    PartitionField(source_id=4, field_id=101, transform=YearTransform(), name="year"),
 )
 
 
@@ -90,24 +89,23 @@ def open_catalog(db_path: str, warehouse_path: str) -> SqlCatalog:
     3. Hard-coded fallback ``us-west-2`` (ITS_LIVE bucket location)
     """
     import os
-    region = (
-        os.environ.get("AWS_DEFAULT_REGION")
-        or os.environ.get("AWS_REGION")
-        or "us-west-2"
-    )
+
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
 
     props: dict = {
-        "uri":       f"sqlite:///{db_path}",
+        "uri": f"sqlite:///{db_path}",
         "warehouse": warehouse_path,
     }
 
     # Only inject S3 properties when the warehouse is on S3.
     if warehouse_path.startswith("s3://"):
-        props.update({
-            "s3.region":             region,
-            "s3.access-key-id":      os.environ.get("AWS_ACCESS_KEY_ID", ""),
-            "s3.secret-access-key":  os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-        })
+        props.update(
+            {
+                "s3.region": region,
+                "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+                "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            }
+        )
         session_token = os.environ.get("AWS_SESSION_TOKEN", "")
         if session_token:
             props["s3.session-token"] = session_token
@@ -118,6 +116,7 @@ def open_catalog(db_path: str, warehouse_path: str) -> SqlCatalog:
 # ---------------------------------------------------------------------------
 # SQLite-in-S3 catalog lifecycle
 # ---------------------------------------------------------------------------
+
 
 def download_catalog(local_path: str) -> None:
     """
@@ -146,7 +145,7 @@ def upload_catalog(local_path: str) -> None:
     print(f"Catalog uploaded: {local_path} → {key}")
 
 
-def get_or_create_table(catalog: SqlCatalog):
+def get_or_create_table(catalog: SqlCatalog) -> object:
     """Return the stac_items table, creating it (and the namespace) if needed."""
     try:
         catalog.create_namespace(NAMESPACE)

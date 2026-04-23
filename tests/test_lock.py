@@ -5,15 +5,13 @@ All tests run fully offline with no S3 credentials needed.
 """
 
 import json
-import time
-from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from obstore.store import MemoryStore
 
 from earthcatalog.core import store_config
-from earthcatalog.core.lock import S3Lock, CatalogLocked
+from earthcatalog.core.lock import CatalogLocked, S3Lock
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +85,7 @@ class TestS3LockStaleLockOverride:
 
         # Plant a stale lock manually
         stale_time = (
-            datetime.now(timezone.utc) - timedelta(hours=13)
+            datetime.now(UTC) - timedelta(hours=13)
         ).isoformat()
         stale_payload = json.dumps({
             "owner": "old-job",
@@ -113,7 +111,7 @@ class TestS3LockStaleLockOverride:
             "owner": "active-job",
             "pid": 1,
             "hostname": "host",
-            "acquired": datetime.now(timezone.utc).isoformat(),
+            "acquired": datetime.now(UTC).isoformat(),
             "ttl_hours": 12,
         }).encode()
         obstore.put(memory_store, ".lock", fresh_payload)

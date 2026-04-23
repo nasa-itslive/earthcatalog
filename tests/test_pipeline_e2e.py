@@ -115,7 +115,7 @@ def _run_pipeline(inventory_csv, catalog_dirs, **kwargs):
             use_lock=False,
             **kwargs,
         )
-    from earthcatalog.core.catalog import open_catalog, get_or_create_table
+    from earthcatalog.core.catalog import get_or_create_table, open_catalog
     catalog = open_catalog(db_path=db, warehouse_path=wh)
     return get_or_create_table(catalog)
 
@@ -232,7 +232,7 @@ class TestPipelineE2E:
                 partitioner=H3Partitioner(resolution=2),
                 use_lock=False,
             )
-        from earthcatalog.core.catalog import open_catalog, get_or_create_table
+        from earthcatalog.core.catalog import get_or_create_table, open_catalog
         catalog = open_catalog(db_path=db, warehouse_path=wh)
         table   = get_or_create_table(catalog)
         assert len(table.history()) == 0
@@ -248,7 +248,7 @@ class TestPipelineE2E:
                                                           tmp_path):
         """With multiple chunks, batch_add_files=True still produces exactly
         one snapshot (chunk_size=2, 6 items → 3 chunks → 1 snapshot)."""
-        from earthcatalog.core.catalog import open_catalog, get_or_create_table
+        from earthcatalog.core.catalog import get_or_create_table, open_catalog
         db  = str(tmp_path / "catalog_mc.db")
         wh  = str(tmp_path / "wh_mc")
         with patch("earthcatalog.pipelines.incremental._fetch_item",

@@ -73,15 +73,16 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import configparser
 import csv
 import gzip
 import io
 import json
 import os
-import concurrent.futures
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import obstore
@@ -89,11 +90,13 @@ import pyarrow.parquet as pq
 from obstore.store import S3Store
 
 from earthcatalog.core.catalog import (
-    open_catalog, get_or_create_table,
-    download_catalog, upload_catalog,
+    download_catalog,
+    get_or_create_table,
+    open_catalog,
+    upload_catalog,
 )
 from earthcatalog.core.lock import S3Lock
-from earthcatalog.core.transform import fan_out, write_geoparquet, group_by_partition
+from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids import build_partitioner
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
@@ -124,8 +127,8 @@ def _get_authenticated_store(bucket: str) -> S3Store:
     13-second timeout.
     """
     key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-    secret  = os.environ.get("AWS_SECRET_ACCESS_KEY")
-    token   = os.environ.get("AWS_SESSION_TOKEN")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    token = os.environ.get("AWS_SESSION_TOKEN")
 
     if not (key_id and secret):
         creds_file = os.path.expanduser("~/.aws/credentials")
@@ -134,8 +137,8 @@ def _get_authenticated_store(bucket: str) -> S3Store:
         profile = os.environ.get("AWS_PROFILE", "default")
         if profile in cfg:
             key_id = cfg[profile].get("aws_access_key_id", key_id)
-            secret  = cfg[profile].get("aws_secret_access_key", secret)
-            token   = cfg[profile].get("aws_session_token", token) or token
+            secret = cfg[profile].get("aws_secret_access_key", secret)
+            token = cfg[profile].get("aws_session_token", token) or token
 
     kwargs: dict = dict(bucket=bucket, region="us-west-2")
     if key_id:
@@ -151,6 +154,7 @@ def _get_authenticated_store(bucket: str) -> S3Store:
 # ---------------------------------------------------------------------------
 # Inventory reading — streaming, never loads the whole file into RAM
 # ---------------------------------------------------------------------------
+
 
 def _fetch_inventory_bytes(inventory_path: str) -> bytes:
     """Download an inventory file from S3 via obstore (one round-trip)."""
@@ -171,13 +175,13 @@ def _parse_last_modified(value: str) -> datetime | None:
     try:
         # Strip trailing Z and parse; fromisoformat needs +00:00 style
         s = value.strip().rstrip("Z")
-        dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(s).replace(tzinfo=UTC)
         return dt
     except Exception:
         return None
 
 
-def _coerce_last_modified(lm_raw) -> datetime | None:
+def _coerce_last_modified(lm_raw: object) -> datetime | None:
     """
     Coerce a ``last_modified_date`` value from any Parquet type to UTC datetime.
 
@@ -188,11 +192,13 @@ def _coerce_last_modified(lm_raw) -> datetime | None:
     if lm_raw is None:
         return None
     if isinstance(lm_raw, datetime):
-        return lm_raw if lm_raw.tzinfo else lm_raw.replace(tzinfo=timezone.utc)
+        return lm_raw if lm_raw.tzinfo else lm_raw.replace(tzinfo=UTC)
     return _parse_last_modified(str(lm_raw))
 
 
-def _iter_inventory_csv(inventory_path: str, since: datetime | None = None):
+def _iter_inventory_csv(
+    inventory_path: str, since: datetime | None = None
+) -> Iterator[tuple[str, str]]:
     """
     Yield ``(bucket, key)`` pairs from a CSV or CSV.gz inventory.
 
@@ -221,8 +227,7 @@ def _iter_inventory_csv(inventory_path: str, since: datetime | None = None):
         if is_gz:
             fh = gzip.open(io.BytesIO(raw_bytes), "rt", newline="")
         else:
-            fh = io.TextIOWrapper(io.BytesIO(raw_bytes), encoding="utf-8",
-                                  newline="")
+            fh = io.TextIOWrapper(io.BytesIO(raw_bytes), encoding="utf-8", newline="")
     elif is_gz:
         fh = gzip.open(inventory_path, "rt", newline="")
     else:
@@ -258,7 +263,7 @@ def _iter_inventory_parquet(
     inventory_path: "str | io.BytesIO",
     batch_size: int = 65_536,
     since: datetime | None = None,
-):
+) -> Iterator[tuple[str, str]]:
     """
     Yield ``(bucket, key)`` pairs from a Parquet inventory.
 
@@ -296,7 +301,7 @@ def _iter_inventory_parquet(
 
     for batch in pf.iter_batches(batch_size=batch_size, columns=read_cols):
         buckets = batch.column("bucket").to_pylist()
-        keys    = batch.column("key").to_pylist()
+        keys = batch.column("key").to_pylist()
         if since is not None and has_lm:
             lm_values = batch.column("last_modified_date").to_pylist()
             for bucket, key, lm_raw in zip(buckets, keys, lm_values):
@@ -371,11 +376,11 @@ def _list_manifest_files(
 
 
 def _iter_inventory_file_from_store(
-    store,
+    store: object,
     data_key: str,
     batch_size: int = 65_536,
     since: datetime | None = None,
-):
+) -> Iterator[tuple[str, str]]:
     """
     Yield ``(bucket, key)`` pairs from a single Parquet inventory data file
     already located in *store* at *data_key*.
@@ -396,16 +401,14 @@ def _iter_inventory_file_from_store(
         When set, only rows with ``last_modified_date >= since`` are yielded.
     """
     raw_bytes = bytes(obstore.get(store, data_key).bytes())
-    yield from _iter_inventory_parquet(
-        io.BytesIO(raw_bytes), batch_size=batch_size, since=since
-    )
+    yield from _iter_inventory_parquet(io.BytesIO(raw_bytes), batch_size=batch_size, since=since)
 
 
 def _iter_inventory_manifest(
     manifest_s3_uri: str,
     batch_size: int = 65_536,
     since: datetime | None = None,
-):
+) -> Iterator[tuple[str, str]]:
     """
     Yield ``(bucket, key)`` pairs from all Parquet data files listed in an
     AWS S3 Inventory ``manifest.json``.
@@ -452,7 +455,7 @@ def _iter_inventory(
     inventory_path: str,
     parquet_batch_size: int = 65_536,
     since: datetime | None = None,
-):
+) -> Iterator[tuple[str, str]]:
     """
     Yield ``(bucket, key)`` pairs from an S3 Inventory file or manifest.
 
@@ -488,6 +491,7 @@ def _iter_inventory(
 # STAC item fetching
 # ---------------------------------------------------------------------------
 
+
 def _fetch_item(bucket: str, key: str) -> dict | None:
     try:
         raw = obstore.get(_get_store(bucket), key).bytes()
@@ -501,6 +505,7 @@ def _fetch_item(bucket: str, key: str) -> dict | None:
 # Main ingest loop
 # ---------------------------------------------------------------------------
 
+
 def run(
     inventory_path: str,
     catalog_path: str,
@@ -509,11 +514,11 @@ def run(
     max_workers: int = 16,
     limit: int | None = None,
     h3_resolution: int = 1,
-    partitioner=None,
+    partitioner: object = None,
     use_lock: bool = True,
     batch_add_files: bool = False,
     since: datetime | None = None,
-):
+) -> None:
     """
     Read inventory → fetch STAC JSON from S3 in parallel →
     fan_out() → write_geoparquet() → add_files() to PyIceberg table.
@@ -555,14 +560,14 @@ def run(
         download_catalog(catalog_path)
 
         catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
-        table   = get_or_create_table(catalog)
+        table = get_or_create_table(catalog)
         print(f"Catalog  : {catalog_path}")
         print(f"Table    : {table.name()}")
 
         chunk: list[tuple[str, str]] = []
         total_items = 0
-        total_rows  = 0
-        part_index  = 0
+        total_rows = 0
+        part_index = 0
         # Populated only when batch_add_files=True; flushed once at the end.
         pending_paths: list[str] = []
 
@@ -581,18 +586,16 @@ def run(
 
             # Group by (grid_partition, year) — each group produces exactly one
             # Parquet file with a single partition value for both Iceberg transforms.
-            groups  = group_by_partition(fan_out_items)
-            paths   = []
-            n_rows  = 0
+            groups = group_by_partition(fan_out_items)
+            paths = []
+            n_rows = 0
 
             for (cell, year), group_items in groups.items():
                 year_str = str(year) if year is not None else "unknown"
                 # Hive-style layout: grid_partition=<cell>/year=<year>/part_N.parquet
                 out_dir = warehouse / f"grid_partition={cell}" / f"year={year_str}"
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = str(
-                    out_dir / f"part_{part_index:06d}_{uuid.uuid4().hex[:8]}.parquet"
-                )
+                out_path = str(out_dir / f"part_{part_index:06d}_{uuid.uuid4().hex[:8]}.parquet")
                 n = write_geoparquet(group_items, out_path)
                 paths.append(out_path)
                 n_rows += n
@@ -647,7 +650,8 @@ def run(
 # Config-driven entry point
 # ---------------------------------------------------------------------------
 
-def run_from_config(inventory_path: str, config, limit: int | None = None):
+
+def run_from_config(inventory_path: str, config: object, limit: int | None = None) -> None:
     """
     Drive the incremental pipeline from an ``AppConfig`` instance.
 
@@ -678,17 +682,20 @@ def run_from_config(inventory_path: str, config, limit: int | None = None):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="EarthCatalog single-node ingest")
-    parser.add_argument("--inventory",  required=True)
-    parser.add_argument("--catalog",    default="/tmp/earthcatalog.db")
-    parser.add_argument("--warehouse",  default="/tmp/earthcatalog_warehouse")
+    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--catalog", default="/tmp/earthcatalog.db")
+    parser.add_argument("--warehouse", default="/tmp/earthcatalog_warehouse")
     parser.add_argument("--chunk-size", type=int, default=500)
-    parser.add_argument("--workers",    type=int, default=16)
-    parser.add_argument("--limit",      type=int, default=None)
+    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--h3-resolution", type=int, default=1)
     parser.add_argument(
-        "--since", default=None, metavar="YYYY-MM-DD",
+        "--since",
+        default=None,
+        metavar="YYYY-MM-DD",
         help=(
             "Only process inventory items modified on or after this date "
             "(UTC).  Format: YYYY-MM-DD or ISO-8601.  "
@@ -709,7 +716,7 @@ def main():
 
     since: datetime | None = None
     if args.since:
-        since = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+        since = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
 
     run(
         inventory_path=args.inventory,

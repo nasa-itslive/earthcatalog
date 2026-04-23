@@ -10,21 +10,19 @@ import csv
 import gzip
 import io
 import json
-import textwrap
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 from earthcatalog.pipelines.incremental import (
+    _coerce_last_modified,
     _iter_inventory,
     _iter_inventory_csv,
-    _iter_inventory_parquet,
     _iter_inventory_manifest,
-    _coerce_last_modified,
+    _iter_inventory_parquet,
 )
 
 # ---------------------------------------------------------------------------
@@ -39,7 +37,7 @@ ROWS = [
 
 _OLD  = "2026-01-01T00:00:00.000Z"
 _NEW  = "2026-04-20T00:00:00.000Z"
-_SINCE = datetime(2026, 4, 1, tzinfo=timezone.utc)
+_SINCE = datetime(2026, 4, 1, tzinfo=UTC)
 
 
 def _write_csv(path: Path, rows, with_header: bool = True, lm_dates=None):
@@ -152,7 +150,7 @@ class TestIterInventoryParquet:
 
     def test_parquet_batch_boundary(self, tmp_path):
         """Rows spanning multiple batches must all be yielded correctly."""
-        rows = [(f"b", f"k-{i}.stac.json") for i in range(250)]
+        rows = [("b", f"k-{i}.stac.json") for i in range(250)]
         p = tmp_path / "inv.parquet"
         _write_parquet(p, rows)
         # batch_size=100 forces 3 batches for 250 rows
@@ -367,18 +365,18 @@ class TestCoerceLastModified:
     def test_string_iso_z(self):
         """ISO-8601 string with trailing Z parses correctly."""
         result = _coerce_last_modified("2026-04-20T12:00:00.000Z")
-        assert result == datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc)
+        assert result == datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
 
     def test_datetime_with_tz(self):
         """A timezone-aware datetime is returned as-is."""
-        dt = datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
         assert _coerce_last_modified(dt) is dt
 
     def test_datetime_naive_gets_utc(self):
         """A naive datetime gets UTC attached."""
         dt = datetime(2026, 4, 20, 12, 0, 0)
         result = _coerce_last_modified(dt)
-        assert result.tzinfo == timezone.utc
+        assert result.tzinfo == UTC
         assert result.replace(tzinfo=None) == dt
 
     def test_bad_string_returns_none(self):
@@ -410,8 +408,8 @@ class TestSinceFilterParquetTimestamp:
     def test_filters_old_rows_timestamp(self, tmp_path):
         """TIMESTAMP rows < since are excluded."""
         p = tmp_path / "inv.parquet"
-        old_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        new_dt = datetime(2026, 4, 20, tzinfo=timezone.utc)
+        old_dt = datetime(2026, 1, 1, tzinfo=UTC)
+        new_dt = datetime(2026, 4, 20, tzinfo=UTC)
         _write_parquet_timestamp(p, ROWS, [old_dt, new_dt, new_dt])
         result = list(_iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[1], ROWS[2]]
@@ -468,15 +466,12 @@ class TestIterInventoryManifest:
         data_files_bytes[i] for each data key.  _get_authenticated_store is
         patched to return a sentinel string (store is never used directly).
         """
-        import json as _json
 
         manifest_bucket = "fake-log-bucket"
         manifest_key    = "inventory/manifest.json"
         data_keys       = [f"inventory/data/part_{i}.parquet"
                            for i in range(len(data_files_bytes))]
         manifest_blob   = _make_manifest_json(manifest_bucket, data_keys)
-
-        call_index = {"n": 0}
 
         def fake_get(store, key):
             class _FakeResult:

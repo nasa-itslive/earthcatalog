@@ -63,7 +63,8 @@ import json
 import tempfile
 import uuid
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from collections.abc import Generator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import dask
@@ -92,7 +93,6 @@ from earthcatalog.pipelines.incremental import (
     _list_manifest_files,
 )
 
-
 # ---------------------------------------------------------------------------
 # Default S3 item fetcher (production)
 # ---------------------------------------------------------------------------
@@ -100,8 +100,9 @@ from earthcatalog.pipelines.incremental import (
 _S3_STORES: dict[str, object] = {}
 
 
-def _get_s3_store(bucket: str):
+def _get_s3_store(bucket: str) -> object:
     from obstore.store import S3Store
+
     if bucket not in _S3_STORES:
         _S3_STORES[bucket] = S3Store(
             bucket=bucket,
@@ -125,12 +126,13 @@ def _s3_fetcher(bucket: str, key: str) -> dict | None:
 # Level 0 — ingest_chunk
 # ---------------------------------------------------------------------------
 
+
 def _ingest_chunk_impl(
     bucket_key_pairs: list[tuple[str, str]],
-    partitioner,
-    warehouse_store,
+    partitioner: object,
+    warehouse_store: object,
     chunk_id: int,
-    item_fetcher=None,
+    item_fetcher: object = None,
     max_workers: int = 16,
 ) -> tuple[list[FileMetadata], Counter]:
     """
@@ -170,10 +172,12 @@ def _ingest_chunk_impl(
         item_fetcher = _s3_fetcher
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        items = list(filter(
-            None,
-            pool.map(lambda bc: item_fetcher(*bc), bucket_key_pairs),
-        ))
+        items = list(
+            filter(
+                None,
+                pool.map(lambda bc: item_fetcher(*bc), bucket_key_pairs),
+            )
+        )
 
     if not items:
         return [], Counter()
@@ -186,11 +190,9 @@ def _ingest_chunk_impl(
     cells_per_id: dict[str, set[str]] = defaultdict(set)
     for item in fan_out_items:
         item_id = item["id"]
-        cell    = item["properties"].get("grid_partition", "__none__")
+        cell = item["properties"].get("grid_partition", "__none__")
         cells_per_id[item_id].add(cell)
-    fan_out_counter: Counter[int] = Counter(
-        len(cells) for cells in cells_per_id.values()
-    )
+    fan_out_counter: Counter[int] = Counter(len(cells) for cells in cells_per_id.values())
 
     groups = group_by_partition(fan_out_items)
     file_metas: list[FileMetadata] = []
@@ -203,13 +205,15 @@ def _ingest_chunk_impl(
         )
         n_rows, n_bytes = write_geoparquet_s3(group_items, warehouse_store, key)
         if n_rows > 0:
-            file_metas.append(FileMetadata(
-                s3_key=key,
-                grid_partition=cell,
-                year=year,
-                row_count=n_rows,
-                file_size_bytes=n_bytes,
-            ))
+            file_metas.append(
+                FileMetadata(
+                    s3_key=key,
+                    grid_partition=cell,
+                    year=year,
+                    row_count=n_rows,
+                    file_size_bytes=n_bytes,
+                )
+            )
 
     return file_metas, fan_out_counter
 
@@ -223,10 +227,11 @@ ingest_chunk = dask.delayed(_ingest_chunk_impl)
 # Level 1 — compact_group
 # ---------------------------------------------------------------------------
 
+
 def _compact_group_impl(
     file_metas: list[FileMetadata],
     out_key: str,
-    store,
+    store: object,
 ) -> FileMetadata:
     """
     Level 1 worker: merge all part files for one ``(cell, year)`` bucket,
@@ -328,17 +333,16 @@ def _compact_group_impl(
             seen.add(id_val)
             keep.append(i)
     if len(keep) < merged.num_rows:
-        print(
-            f"INFO: dedup removed {merged.num_rows - len(keep)} duplicate rows "
-            f"in {out_key}"
-        )
+        print(f"INFO: dedup removed {merged.num_rows - len(keep)} duplicate rows in {out_key}")
     merged = merged.take(pa.array(keep, type=pa.int64()))
 
     # Sort by (platform, datetime) for optimal Parquet predicate pushdown.
-    merged = merged.sort_by([
-        ("platform", "ascending"),
-        ("datetime", "ascending"),
-    ])
+    merged = merged.sort_by(
+        [
+            ("platform", "ascending"),
+            ("datetime", "ascending"),
+        ]
+    )
 
     # ------------------------------------------------------------------
     # Write compacted file to temp, then upload.
@@ -376,6 +380,7 @@ compact_group = dask.delayed(_compact_group_impl)
 # Ingest stats helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_processed_files(report_location: str) -> set[str]:
     """
     Read ``ingest_stats.json`` and return the set of ``inventory_file`` keys
@@ -395,27 +400,37 @@ def _load_processed_files(report_location: str) -> set[str]:
     try:
         if report_location.startswith("s3://"):
             import obstore as _obs
+
             no_scheme = report_location.removeprefix("s3://")
             s3_bucket, s3_key = no_scheme.split("/", 1)
+            import configparser as _cp
+            import os as _os
+
             from obstore.store import S3Store as _S3S
-            import os as _os, configparser as _cp
+
             key_id = _os.environ.get("AWS_ACCESS_KEY_ID")
-            secret  = _os.environ.get("AWS_SECRET_ACCESS_KEY")
-            token   = _os.environ.get("AWS_SESSION_TOKEN")
-            region  = (_os.environ.get("AWS_DEFAULT_REGION")
-                       or _os.environ.get("AWS_REGION") or "us-west-2")
+            secret = _os.environ.get("AWS_SECRET_ACCESS_KEY")
+            token = _os.environ.get("AWS_SESSION_TOKEN")
+            region = (
+                _os.environ.get("AWS_DEFAULT_REGION")
+                or _os.environ.get("AWS_REGION")
+                or "us-west-2"
+            )
             if not (key_id and secret):
                 cfg = _cp.ConfigParser()
                 cfg.read(_os.path.expanduser("~/.aws/credentials"))
                 profile = _os.environ.get("AWS_PROFILE", "default")
                 if profile in cfg:
                     key_id = cfg[profile].get("aws_access_key_id", key_id)
-                    secret  = cfg[profile].get("aws_secret_access_key", secret)
-                    token   = cfg[profile].get("aws_session_token", token) or token
+                    secret = cfg[profile].get("aws_secret_access_key", secret)
+                    token = cfg[profile].get("aws_session_token", token) or token
             sk: dict = dict(bucket=s3_bucket, region=region)
-            if key_id: sk["aws_access_key_id"] = key_id
-            if secret:  sk["aws_secret_access_key"] = secret
-            if token:   sk["aws_session_token"] = token
+            if key_id:
+                sk["aws_access_key_id"] = key_id
+            if secret:
+                sk["aws_secret_access_key"] = secret
+            if token:
+                sk["aws_session_token"] = token
             raw = bytes(_obs.get(_S3S(**sk), s3_key).bytes())
             records: list[dict] = json.loads(raw)
         else:
@@ -475,22 +490,21 @@ def _write_ingest_stats(
     fan_out_distribution  mapping of n_cells → item_count
     """
     record: dict = {
-        "run_id":          datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
-        "inventory":       inventory_path,
-        "inventory_file":  inventory_file,
-        "since":           since.isoformat() if since else None,
-        "h3_resolution":   h3_resolution,
-        "source_items":    source_items,
-        "total_rows":      total_rows,
-        "unique_cells":    len({fm.grid_partition for fm in final_metas}),
-        "unique_years":    len({fm.year for fm in final_metas}),
-        "files_written":   len(final_metas),
-        "avg_fan_out":     round(total_rows / source_items, 3) if source_items else 0,
-        "overhead_pct":    round((total_rows - source_items) * 100 / source_items, 1)
-                           if source_items else 0,
-        "fan_out_distribution": {
-            str(k): v for k, v in sorted(fan_out_counter.items())
-        },
+        "run_id": datetime.now(tz=UTC).isoformat(timespec="seconds"),
+        "inventory": inventory_path,
+        "inventory_file": inventory_file,
+        "since": since.isoformat() if since else None,
+        "h3_resolution": h3_resolution,
+        "source_items": source_items,
+        "total_rows": total_rows,
+        "unique_cells": len({fm.grid_partition for fm in final_metas}),
+        "unique_years": len({fm.year for fm in final_metas}),
+        "files_written": len(final_metas),
+        "avg_fan_out": round(total_rows / source_items, 3) if source_items else 0,
+        "overhead_pct": round((total_rows - source_items) * 100 / source_items, 1)
+        if source_items
+        else 0,
+        "fan_out_distribution": {str(k): v for k, v in sorted(fan_out_counter.items())},
     }
 
     # ------------------------------------------------------------------
@@ -502,6 +516,7 @@ def _write_ingest_stats(
     # Always write to a local staging file first
     if target_s3:
         import tempfile
+
         _tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         local_stats_path = Path(_tmp.name)
         _tmp.close()
@@ -522,26 +537,33 @@ def _write_ingest_stats(
     if target_s3:
         # Upload to S3: derive bucket + key from the s3:// URI
         import obstore
+
         no_scheme = effective.removeprefix("s3://")
         s3_bucket, s3_key = no_scheme.split("/", 1)
+        import configparser
+        import os
+
         from obstore.store import S3Store
-        import os, configparser
+
         key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-        secret  = os.environ.get("AWS_SECRET_ACCESS_KEY")
-        token   = os.environ.get("AWS_SESSION_TOKEN")
-        region  = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+        secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        token = os.environ.get("AWS_SESSION_TOKEN")
+        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
         if not (key_id and secret):
             cfg = configparser.ConfigParser()
             cfg.read(os.path.expanduser("~/.aws/credentials"))
             profile = os.environ.get("AWS_PROFILE", "default")
             if profile in cfg:
                 key_id = cfg[profile].get("aws_access_key_id", key_id)
-                secret  = cfg[profile].get("aws_secret_access_key", secret)
-                token   = cfg[profile].get("aws_session_token", token) or token
+                secret = cfg[profile].get("aws_secret_access_key", secret)
+                token = cfg[profile].get("aws_session_token", token) or token
         sk: dict = dict(bucket=s3_bucket, region=region)
-        if key_id: sk["aws_access_key_id"] = key_id
-        if secret:  sk["aws_secret_access_key"] = secret
-        if token:   sk["aws_session_token"] = token
+        if key_id:
+            sk["aws_access_key_id"] = key_id
+        if secret:
+            sk["aws_secret_access_key"] = secret
+        if token:
+            sk["aws_session_token"] = token
         rpt_store = S3Store(**sk)
         obstore.put(rpt_store, s3_key, local_stats_path.read_bytes())
         local_stats_path.unlink(missing_ok=True)
@@ -554,13 +576,14 @@ def _write_ingest_stats(
 # Orchestrator — run_backfill
 # ---------------------------------------------------------------------------
 
+
 def run_backfill(
     inventory_path: str,
     catalog_path: str,
-    warehouse_store,
+    warehouse_store: object,
     warehouse_root: str,
-    item_fetcher=None,
-    partitioner=None,
+    item_fetcher: object = None,
+    partitioner: object = None,
     h3_resolution: int = 1,
     chunk_size: int = 20_000,
     max_workers_per_task: int = 16,
@@ -674,9 +697,6 @@ def run_backfill(
             return root.rstrip("/") + "/" + key
         return str(Path(root) / key)
 
-    def _effective_report(catalog_p: str) -> str | None:
-        return report_location  # None means _write_ingest_stats uses catalog sibling
-
     def _run_one(
         item_pairs: list[tuple[str, str]],
         inv_file_key: str | None,
@@ -715,46 +735,54 @@ def run_backfill(
             chunk.append((bucket, key))
             total_items += 1
             if len(chunk) >= chunk_size:
-                level0_tasks.append(ingest_chunk(
-                    list(chunk), partitioner, warehouse_store,
-                    chunk_id, item_fetcher, max_workers_per_task,
-                ))
+                level0_tasks.append(
+                    ingest_chunk(
+                        list(chunk),
+                        partitioner,
+                        warehouse_store,
+                        chunk_id,
+                        item_fetcher,
+                        max_workers_per_task,
+                    )
+                )
                 chunk.clear()
                 chunk_id += 1
             if limit and total_items >= limit:
                 break
 
         if chunk:
-            level0_tasks.append(ingest_chunk(
-                list(chunk), partitioner, warehouse_store,
-                chunk_id, item_fetcher, max_workers_per_task,
-            ))
+            level0_tasks.append(
+                ingest_chunk(
+                    list(chunk),
+                    partitioner,
+                    warehouse_store,
+                    chunk_id,
+                    item_fetcher,
+                    max_workers_per_task,
+                )
+            )
 
         if not level0_tasks:
             print(f"  no .stac.json items found in {inv_file_key or 'chunk'}")
             # Still write stats so the caller knows this file was processed.
             _write_ingest_stats(
-                catalog_path    = catalog_path,
-                inventory_path  = inventory_path,
-                since           = since,
-                source_items    = 0,
-                total_rows      = 0,
-                final_metas     = [],
-                fan_out_counter = Counter(),
-                h3_resolution   = h3_resolution,
-                report_location = report_location,
-                inventory_file  = inv_file_key,
+                catalog_path=catalog_path,
+                inventory_path=inventory_path,
+                since=since,
+                source_items=0,
+                total_rows=0,
+                final_metas=[],
+                fan_out_counter=Counter(),
+                h3_resolution=h3_resolution,
+                report_location=report_location,
+                inventory_file=inv_file_key,
             )
             return
 
         print(f"Level 0: {len(level0_tasks)} ingest_chunk tasks ({total_items} items)")
         all_nested: tuple[tuple[list[FileMetadata], Counter], ...] = dask.compute(*level0_tasks)
-        all_metas: list[FileMetadata] = [
-            fm for file_metas, _ in all_nested for fm in file_metas
-        ]
-        fan_out_counter: Counter[int] = sum(
-            (counter for _, counter in all_nested), Counter()
-        )
+        all_metas: list[FileMetadata] = [fm for file_metas, _ in all_nested for fm in file_metas]
+        fan_out_counter: Counter[int] = sum((counter for _, counter in all_nested), Counter())
         total_rows = sum(fm.row_count for fm in all_metas)
         print(f"Level 0 done: {len(all_metas)} files, {total_rows} rows")
 
@@ -794,10 +822,7 @@ def run_backfill(
             final_metas = all_metas
 
         # Level 2 ─ register all files in one Iceberg snapshot
-        final_paths = [
-            _join_path(warehouse_root, fm.s3_key)
-            for fm in final_metas
-        ]
+        final_paths = [_join_path(warehouse_root, fm.s3_key) for fm in final_metas]
 
         if final_paths:
             print(f"Level 2: registering {len(final_paths)} files in one snapshot")
@@ -806,16 +831,16 @@ def run_backfill(
         upload_catalog(catalog_path)
 
         _write_ingest_stats(
-            catalog_path    = catalog_path,
-            inventory_path  = inventory_path,
-            since           = since,
-            source_items    = total_items,
-            total_rows      = total_rows,
-            final_metas     = final_metas,
-            fan_out_counter = fan_out_counter,
-            h3_resolution   = h3_resolution,
-            report_location = report_location,
-            inventory_file  = inv_file_key,
+            catalog_path=catalog_path,
+            inventory_path=inventory_path,
+            since=since,
+            source_items=total_items,
+            total_rows=total_rows,
+            final_metas=final_metas,
+            fan_out_counter=fan_out_counter,
+            h3_resolution=h3_resolution,
+            report_location=report_location,
+            inventory_file=inv_file_key,
         )
 
         print(
@@ -857,12 +882,12 @@ def run_backfill(
             # Collect (bucket, key) pairs from this one inventory file
             item_pairs = [
                 (bkt, k)
-                for bkt, k in _iter_inventory_file_from_store(
-                    dest_store, data_key, since=since
-                )
+                for bkt, k in _iter_inventory_file_from_store(dest_store, data_key, since=since)
             ]
 
-            def _mini_run(pairs=item_pairs, key=data_key):
+            def _mini_run(
+                pairs: list[tuple[str, str]] = item_pairs, key: str | None = data_key
+            ) -> None:
                 _run_one(pairs, inv_file_key=key, total_items_hint=len(pairs))
 
             if use_lock:
@@ -874,9 +899,7 @@ def run_backfill(
     else:
         # ── Monolithic path: original behaviour ───────────────────────────
         def _monolithic_run() -> None:
-            all_pairs: list[tuple[str, str]] = list(
-                _iter_inventory(inventory_path, since=since)
-            )
+            all_pairs: list[tuple[str, str]] = list(_iter_inventory(inventory_path, since=since))
             _run_one(all_pairs, inv_file_key=None, total_items_hint=len(all_pairs))
 
         if use_lock:
@@ -890,12 +913,13 @@ def run_backfill(
 # Scheduler context helpers
 # ---------------------------------------------------------------------------
 
-def _synchronous_context():
+
+def _synchronous_context() -> object:
     """Return a context manager that activates the Dask synchronous scheduler."""
     return dask.config.set(scheduler="synchronous")
 
 
-def _local_cluster_context(n_workers: int, threads_per_worker: int = 1):
+def _local_cluster_context(n_workers: int, threads_per_worker: int = 1) -> object:
     """
     Return a context manager that starts a ``LocalCluster`` and connects a
     ``Client`` to it.
@@ -905,8 +929,9 @@ def _local_cluster_context(n_workers: int, threads_per_worker: int = 1):
     import contextlib
 
     @contextlib.contextmanager
-    def _ctx():
+    def _ctx() -> Generator[object, None, None]:
         from dask.distributed import Client, LocalCluster
+
         cluster = LocalCluster(
             n_workers=n_workers,
             threads_per_worker=threads_per_worker,
@@ -925,7 +950,7 @@ def _local_cluster_context(n_workers: int, threads_per_worker: int = 1):
     return _ctx()
 
 
-def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs):
+def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs: object) -> object:
     """
     Return a context manager that starts a Coiled cloud cluster.
 
@@ -948,26 +973,22 @@ def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs):
     import contextlib
 
     @contextlib.contextmanager
-    def _ctx():
+    def _ctx() -> Generator[object, None, None]:
         try:
             import coiled
         except ImportError:
-            raise ImportError(
-                "coiled is not installed.  Run: pip install coiled"
-            ) from None
+            raise ImportError("coiled is not installed.  Run: pip install coiled") from None
 
         kwargs: dict = {"n_workers": n_workers, **extra_kwargs}
         if vm_type is not None:
             kwargs["vm_type"] = vm_type
 
         from dask.distributed import Client
+
         cluster = coiled.Cluster(**kwargs)
         client = Client(cluster)
         try:
-            print(
-                f"Coiled dashboard: {client.dashboard_link}\n"
-                f"Workers requested: {n_workers}"
-            )
+            print(f"Coiled dashboard: {client.dashboard_link}\nWorkers requested: {n_workers}")
             yield client
         finally:
             client.close()
@@ -979,6 +1000,7 @@ def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs):
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
 
 def _parse_coiled_extra(unknown_args: list[str]) -> dict:
     """
@@ -1008,7 +1030,7 @@ def _parse_coiled_extra(unknown_args: list[str]) -> dict:
     while i < len(unknown_args):
         token = unknown_args[i]
         if token.startswith("--coiled-"):
-            key = token[len("--coiled-"):].replace("-", "_")
+            key = token[len("--coiled-") :].replace("-", "_")
             value = unknown_args[i + 1] if i + 1 < len(unknown_args) else None
             if value is not None and not value.startswith("--"):
                 if key in result:
@@ -1087,27 +1109,59 @@ examples
 
     # Required
     parser.add_argument(
-        "--inventory", required=True, metavar="PATH",
+        "--inventory",
+        required=True,
+        metavar="PATH",
         help="Local path or s3:// URI to S3 Inventory file (CSV, CSV.gz, or Parquet).",
     )
 
     # Catalog / warehouse
-    parser.add_argument("--catalog",   default="/tmp/earthcatalog.db", metavar="PATH",
-                        help="Local path for the SQLite Iceberg catalog (default: /tmp/earthcatalog.db).")
-    parser.add_argument("--warehouse", default="/tmp/earthcatalog_warehouse", metavar="PATH",
-                        help="Local directory for GeoParquet warehouse files (default: /tmp/earthcatalog_warehouse).")
+    parser.add_argument(
+        "--catalog",
+        default="/tmp/earthcatalog.db",
+        metavar="PATH",
+        help="Local path for the SQLite Iceberg catalog (default: /tmp/earthcatalog.db).",
+    )
+    parser.add_argument(
+        "--warehouse",
+        default="/tmp/earthcatalog_warehouse",
+        metavar="PATH",
+        help="Local directory for GeoParquet warehouse files (default: /tmp/earthcatalog_warehouse).",
+    )
 
     # Ingest parameters
-    parser.add_argument("--h3-resolution", type=int, default=1, metavar="N",
-                        help="H3 grid resolution for spatial partitioning (default: 1 = 842 global cells).")
-    parser.add_argument("--chunk-size", type=int, default=500, metavar="N",
-                        help="Number of STAC items per Level-0 Dask task (default: 500).")
-    parser.add_argument("--fetch-workers", type=int, default=16, metavar="N",
-                        help="Thread-pool size inside each ingest_chunk worker (default: 16).")
-    parser.add_argument("--limit", type=int, default=None, metavar="N",
-                        help="Stop after N items (useful for smoke-tests).")
     parser.add_argument(
-        "--since", default=None, metavar="YYYY-MM-DD",
+        "--h3-resolution",
+        type=int,
+        default=1,
+        metavar="N",
+        help="H3 grid resolution for spatial partitioning (default: 1 = 842 global cells).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500,
+        metavar="N",
+        help="Number of STAC items per Level-0 Dask task (default: 500).",
+    )
+    parser.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Thread-pool size inside each ingest_chunk worker (default: 16).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop after N items (useful for smoke-tests).",
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        metavar="YYYY-MM-DD",
         help=(
             "Only process inventory items modified on or after this date (UTC). "
             "Format: YYYY-MM-DD or ISO-8601.  Example: --since 2026-04-21"
@@ -1115,14 +1169,27 @@ examples
     )
 
     # Compaction
-    parser.add_argument("--no-compact", action="store_true", default=False,
-                        help="Skip Level-1 compaction; leave one part file per (cell, year) per chunk.")
-    parser.add_argument("--compact-threshold", type=int, default=2, metavar="N",
-                        help="Compact buckets that have >= N part files (default: 2).")
+    parser.add_argument(
+        "--no-compact",
+        action="store_true",
+        default=False,
+        help="Skip Level-1 compaction; leave one part file per (cell, year) per chunk.",
+    )
+    parser.add_argument(
+        "--compact-threshold",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Compact buckets that have >= N part files (default: 2).",
+    )
 
     # Lock
-    parser.add_argument("--no-lock", action="store_true", default=False,
-                        help="Disable the S3 distributed lock (for local/test runs).")
+    parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        default=False,
+        help="Disable the S3 distributed lock (for local/test runs).",
+    )
 
     # Spot resilience
     parser.add_argument(
@@ -1140,7 +1207,9 @@ examples
 
     # Report
     parser.add_argument(
-        "--report-location", default=None, metavar="PATH_OR_URI",
+        "--report-location",
+        default=None,
+        metavar="PATH_OR_URI",
         help=(
             "Local path or s3:// URI for ingest_stats.json. "
             "Defaults to <catalog_dir>/ingest_stats.json for local catalogs "
@@ -1155,10 +1224,20 @@ examples
         default="local",
         help="Dask scheduler to use (default: local).",
     )
-    parser.add_argument("--workers", type=int, default=4, metavar="N",
-                        help="Number of workers for --scheduler local (default: 4).")
-    parser.add_argument("--threads-per-worker", type=int, default=1, metavar="N",
-                        help="Threads per worker for --scheduler local (default: 1).")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Number of workers for --scheduler local (default: 4).",
+    )
+    parser.add_argument(
+        "--threads-per-worker",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Threads per worker for --scheduler local (default: 1).",
+    )
 
     # Explicit coiled options (take precedence over pass-through kwargs)
     coiled_group = parser.add_argument_group(
@@ -1169,16 +1248,25 @@ examples
             "kwarg.  Repeated flags (e.g. --coiled-secret-env) are collected into a list."
         ),
     )
-    coiled_group.add_argument("--coiled-n-workers", type=int, default=10, metavar="N",
-                              help="Number of Coiled cloud workers (default: 10).")
-    coiled_group.add_argument("--coiled-vm-type", default=None, metavar="INSTANCE_TYPE",
-                              help="Cloud VM instance type (e.g. m6i.xlarge).")
+    coiled_group.add_argument(
+        "--coiled-n-workers",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of Coiled cloud workers (default: 10).",
+    )
+    coiled_group.add_argument(
+        "--coiled-vm-type",
+        default=None,
+        metavar="INSTANCE_TYPE",
+        help="Cloud VM instance type (e.g. m6i.xlarge).",
+    )
 
     args, unknown = parser.parse_known_args()
 
     since: datetime | None = None
     if args.since:
-        since = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+        since = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
 
     # ------------------------------------------------------------------
     # Build coiled kwargs: pass-through extras merged with explicit flags
@@ -1191,25 +1279,25 @@ examples
     # ------------------------------------------------------------------
     # Build stores from --catalog and --warehouse URIs
     # ------------------------------------------------------------------
-    import configparser, os
+    import configparser
+    import os
+
     from obstore.store import LocalStore, S3Store
 
     def _make_s3_store(bucket: str, prefix: str = "") -> S3Store:
         """Authenticated S3Store using env vars or ~/.aws/credentials."""
         key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-        secret  = os.environ.get("AWS_SECRET_ACCESS_KEY")
-        token   = os.environ.get("AWS_SESSION_TOKEN")
-        region  = (os.environ.get("AWS_DEFAULT_REGION")
-                   or os.environ.get("AWS_REGION")
-                   or "us-west-2")
+        secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        token = os.environ.get("AWS_SESSION_TOKEN")
+        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
         if not (key_id and secret):
             cfg = configparser.ConfigParser()
             cfg.read(os.path.expanduser("~/.aws/credentials"))
             profile = os.environ.get("AWS_PROFILE", "default")
             if profile in cfg:
                 key_id = cfg[profile].get("aws_access_key_id", key_id)
-                secret  = cfg[profile].get("aws_secret_access_key", secret)
-                token   = cfg[profile].get("aws_session_token", token) or token
+                secret = cfg[profile].get("aws_secret_access_key", secret)
+                token = cfg[profile].get("aws_session_token", token) or token
         kwargs: dict = dict(bucket=bucket, region=region)
         if prefix:
             kwargs["prefix"] = prefix
@@ -1221,31 +1309,33 @@ examples
             kwargs["aws_session_token"] = token
         return S3Store(**kwargs)
 
-    catalog_s3   = args.catalog.startswith("s3://")
+    catalog_s3 = args.catalog.startswith("s3://")
     warehouse_s3 = args.warehouse.startswith("s3://")
 
     if warehouse_s3:
         # s3://bucket/prefix/to/warehouse  →  bucket + prefix
-        wh_no_scheme  = args.warehouse.removeprefix("s3://")
+        wh_no_scheme = args.warehouse.removeprefix("s3://")
         wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
         warehouse_store = _make_s3_store(wh_bucket, prefix=wh_prefix)
-        warehouse_root  = args.warehouse          # full s3:// URI; used by add_files
+        warehouse_root = args.warehouse  # full s3:// URI; used by add_files
     else:
         warehouse_path = Path(args.warehouse)
         warehouse_path.mkdir(parents=True, exist_ok=True)
         warehouse_store = LocalStore(str(warehouse_path))
-        warehouse_root  = str(warehouse_path)
+        warehouse_root = str(warehouse_path)
 
     if catalog_s3:
         # s3://bucket/prefix/catalog.db  →  store on bucket, key = prefix/catalog.db
         cat_no_scheme = args.catalog.removeprefix("s3://")
         cat_bucket, cat_key = cat_no_scheme.split("/", 1)
         from earthcatalog.core import store_config
+
         store_config.set_store(_make_s3_store(cat_bucket))
         store_config.set_catalog_key(cat_key)
         store_config.set_lock_key(str(Path(cat_key).parent / ".lock"))
         # download_catalog needs a local temp file
         import tempfile
+
         _catalog_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         catalog_local = _catalog_tmp.name
         _catalog_tmp.close()

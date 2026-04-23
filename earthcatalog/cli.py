@@ -13,8 +13,6 @@ Usage
 
 from __future__ import annotations
 
-from typing import Optional
-
 import typer
 
 app = typer.Typer(
@@ -28,46 +26,56 @@ app = typer.Typer(
 # `incremental` sub-command
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def incremental(
     inventory: str = typer.Option(
-        ..., "--inventory", "-i",
+        ...,
+        "--inventory",
+        "-i",
         help="Path or s3:// URI to the S3 Inventory CSV / CSV.gz.",
     ),
-    config: Optional[str] = typer.Option(
-        None, "--config", "-c",
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
         help="Path to a YAML config file.  When provided, all other options default "
-             "to the values in the file.",
+        "to the values in the file.",
     ),
-    catalog: Optional[str] = typer.Option(
-        None, "--catalog",
+    catalog: str | None = typer.Option(
+        None,
+        "--catalog",
         help="Path to the SQLite catalog file (overrides config).",
     ),
-    warehouse: Optional[str] = typer.Option(
-        None, "--warehouse",
+    warehouse: str | None = typer.Option(
+        None,
+        "--warehouse",
         help="Path to the Iceberg warehouse directory (overrides config).",
     ),
-    chunk_size: Optional[int] = typer.Option(
-        None, "--chunk-size",
+    chunk_size: int | None = typer.Option(
+        None,
+        "--chunk-size",
         help="STAC items per fetch chunk (overrides config).",
     ),
-    workers: Optional[int] = typer.Option(
-        None, "--workers",
+    workers: int | None = typer.Option(
+        None,
+        "--workers",
         help="Thread-pool size for parallel S3 fetches (overrides config).",
     ),
-    h3_resolution: Optional[int] = typer.Option(
-        None, "--h3-resolution",
+    h3_resolution: int | None = typer.Option(
+        None,
+        "--h3-resolution",
         help="H3 resolution (overrides config grid.resolution).",
     ),
-    limit: Optional[int] = typer.Option(
-        None, "--limit",
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
         help="Stop after processing this many STAC items (for testing).",
     ),
-):
+) -> None:
     """Run single-node incremental ingest (for GitHub Actions / laptops)."""
     from earthcatalog.config import AppConfig, load_config
-    from earthcatalog.pipelines.incremental import run_from_config, run
-    from earthcatalog.grids import build_partitioner
+    from earthcatalog.pipelines.incremental import run, run_from_config
 
     if config:
         cfg = load_config(config)
@@ -103,7 +111,8 @@ def incremental(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     app()
 
 

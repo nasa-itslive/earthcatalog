@@ -25,7 +25,7 @@ _catalog_key: str = "catalog.db"
 _lock_key: str = ".lock"
 
 
-def get_store():
+def get_store() -> object:
     """Return the active obstore-compatible store."""
     return _store
 
@@ -38,7 +38,7 @@ def get_lock_key() -> str:
     return _lock_key
 
 
-def set_store(store) -> None:
+def set_store(store: object) -> None:
     """Override the store backend (e.g. S3Store for production)."""
     global _store
     _store = store

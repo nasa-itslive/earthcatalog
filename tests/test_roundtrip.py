@@ -10,8 +10,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from earthcatalog.core.catalog import open_catalog, get_or_create_table
-from earthcatalog.core.transform import fan_out, write_geoparquet, group_by_partition
+from earthcatalog.core.catalog import get_or_create_table, open_catalog
+from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
 # ---------------------------------------------------------------------------

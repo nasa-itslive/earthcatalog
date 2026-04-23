@@ -32,6 +32,7 @@ TestRunBackfillDask
 import io
 import json
 import uuid
+from datetime import UTC
 from pathlib import Path
 from unittest.mock import patch
 
@@ -47,7 +48,6 @@ from earthcatalog.core.transform import (
     FileMetadata,
     fan_out,
     group_by_partition,
-    write_geoparquet,
     write_geoparquet_s3,
 )
 from earthcatalog.grids.h3_partitioner import H3Partitioner
@@ -437,7 +437,7 @@ class TestRunBackfillUnit:
                 use_lock=False,
                 **kwargs,
             )
-        from earthcatalog.core.catalog import open_catalog, get_or_create_table
+        from earthcatalog.core.catalog import get_or_create_table, open_catalog
         catalog = open_catalog(db_path=catalog_path, warehouse_path=wh_root)
         return get_or_create_table(catalog)
 
@@ -499,7 +499,7 @@ class TestRunBackfillUnit:
         compact_files = len(list(wh2.glob("**/*.parquet")))
 
         # Row counts must be equal.
-        from earthcatalog.core.catalog import open_catalog, get_or_create_table
+        from earthcatalog.core.catalog import get_or_create_table, open_catalog
         t1 = get_or_create_table(open_catalog(
             str(Path(wh_root).parent / "catalog_no.db"), wh_root,
         ))
@@ -577,7 +577,7 @@ class TestRunBackfillDask:
                 use_lock=False,
                 **kwargs,
             )
-        from earthcatalog.core.catalog import open_catalog, get_or_create_table
+        from earthcatalog.core.catalog import get_or_create_table, open_catalog
         catalog = open_catalog(db_path=catalog_path, warehouse_path=wh_root)
         return get_or_create_table(catalog)
 
@@ -706,7 +706,7 @@ class TestCompactGroupImplDedup:
             {"id": "dup-item", "updated": "2026-04-01T00:00:00Z"},
         )
         out_key = f"{prefix}/compacted.parquet"
-        result = _compact_group_impl([fm1, fm2], out_key, store)
+        _compact_group_impl([fm1, fm2], out_key, store)
 
         tbl = _read_from_store(store, out_key)
         ids = tbl.column("id").to_pylist()
@@ -893,10 +893,10 @@ class TestIngestStats:
     def test_since_serialised(self, tmp_path):
         """When since is set, it is written as an ISO string."""
         from collections import Counter
-        from datetime import datetime, timezone
+        from datetime import datetime
         catalog = tmp_path / "catalog.db"
         catalog.touch()
-        since = datetime(2026, 4, 1, tzinfo=timezone.utc)
+        since = datetime(2026, 4, 1, tzinfo=UTC)
         _write_ingest_stats(
             catalog_path=str(catalog),
             inventory_path="s3://bucket/manifest.json",
@@ -956,8 +956,9 @@ class TestIngestStats:
 
     def test_run_backfill_writes_stats_file(self, tmp_path):
         """run_backfill() must create ingest_stats.json in the catalog directory."""
-        from earthcatalog.core import store_config
         from obstore.store import LocalStore, MemoryStore
+
+        from earthcatalog.core import store_config
 
         store_config.set_store(MemoryStore())
         store_config.set_catalog_key("catalog.db")
@@ -995,8 +996,10 @@ class TestIngestStats:
     def test_run_backfill_stats_with_items(self, tmp_path):
         """Stats record reflects correct counts when items are actually ingested."""
         import csv
-        from earthcatalog.core import store_config
+
         from obstore.store import LocalStore, MemoryStore
+
+        from earthcatalog.core import store_config
 
         # Write a tiny CSV inventory pointing at mock keys.
         inv = tmp_path / "inv.csv"
@@ -1092,8 +1095,9 @@ class TestPerFileMiniRuns:
 
     def _make_env(self, tmp_path):
         """Return (catalog_path, wh_store, wh_root, stats_path)."""
-        from earthcatalog.core import store_config
         from obstore.store import LocalStore, MemoryStore
+
+        from earthcatalog.core import store_config
 
         store_config.set_store(MemoryStore())
         store_config.set_catalog_key("catalog.db")
@@ -1111,8 +1115,7 @@ class TestPerFileMiniRuns:
         — one per file — each with a distinct inventory_file field.
         """
         import io
-        import csv
-        from unittest.mock import patch
+
         import dask
 
         catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
@@ -1182,8 +1185,6 @@ class TestPerFileMiniRuns:
         If ingest_stats.json already records fileA, only fileB should be
         processed in the new run.
         """
-        import io
-        from unittest.mock import patch
         import dask
 
         catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
@@ -1245,7 +1246,7 @@ class TestPerFileMiniRuns:
         monolithic _iter_inventory path (no _list_manifest_files call).
         """
         import csv
-        from unittest.mock import patch
+
         import dask
 
         catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
@@ -1290,6 +1291,7 @@ class TestPerFileMiniRuns:
         inventory_file=null (not a data-file key).
         """
         import csv
+
         import dask
 
         catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)

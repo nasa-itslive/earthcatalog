@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import obstore
-from obstore.store import S3Store, LocalStore
+from obstore.store import LocalStore, S3Store
 from shapely import wkb
 from shapely.geometry import shape
 from shapely.strtree import STRtree
@@ -53,7 +53,7 @@ class GeoJSONPartitioner(AbstractPartitioner):
         The GeoJSON feature property to use as the partition key string.
     """
 
-    def __init__(self, boundaries_path: str, id_field: str = "id"):
+    def __init__(self, boundaries_path: str, id_field: str = "id") -> None:
         raw = _load_bytes(boundaries_path)
         features = json.loads(raw)["features"]
 
