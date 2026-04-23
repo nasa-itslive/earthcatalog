@@ -1,0 +1,106 @@
+[project]
+site_name        = "earthcatalog"
+site_url         = "https://nsidc.github.io/earthcatalog/"
+site_description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
+site_author      = "NSIDC / ITS_LIVE"
+docs_dir         = "docs/site"
+
+[theme]
+name    = "material"
+palette = [
+    { scheme = "default", primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: light)" },
+    { scheme = "slate",   primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: dark)"  },
+]
+font    = { text = "Roboto", code = "Roboto Mono" }
+icon    = { logo = "material/earth" }
+features = [
+    "content.code.copy",
+    "content.code.annotate",
+    "navigation.tabs",
+    "navigation.sections",
+    "navigation.top",
+    "navigation.footer",
+    "search.suggest",
+    "search.highlight",
+    "toc.integrate",
+]
+
+[repository]
+url  = "https://github.com/nsidc/earthcatalog"
+name = "nsidc/earthcatalog"
+
+[[plugins]]
+name = "search"
+
+[[plugins]]
+name = "mkdocstrings"
+
+[plugins.mkdocstrings.handlers.python]
+paths = ["."]
+
+[plugins.mkdocstrings.handlers.python.options]
+docstring_style          = "google"
+show_source              = true
+show_root_heading        = true
+show_category_heading    = true
+members_order            = "source"
+
+[[markdown_extensions]]
+name = "admonition"
+
+[[markdown_extensions]]
+name = "pymdownx.details"
+
+[[markdown_extensions]]
+name = "pymdownx.superfences"
+
+[[markdown_extensions]]
+name = "pymdownx.highlight"
+
+[markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+
+[[markdown_extensions]]
+name = "pymdownx.tabbed"
+
+[markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[[markdown_extensions]]
+name = "pymdownx.emoji"
+
+[markdown_extensions.pymdownx.emoji]
+emoji_index    = "!!python/name:material.extensions.emoji.twemoji"
+emoji_generator = "!!python/name:material.extensions.emoji.to_svg"
+
+[[markdown_extensions]]
+name = "tables"
+
+[[markdown_extensions]]
+name = "toc"
+
+[markdown_extensions.toc]
+permalink = true
+
+[nav]
+Home            = "index.md"
+"Quick Start"   = "quickstart.md"
+Architecture    = "architecture.md"
+Configuration   = "configuration.md"
+
+[nav.Pipelines]
+Incremental  = "pipelines/incremental.md"
+Backfill     = "pipelines/backfill.md"
+
+[nav.Maintenance]
+Compaction = "maintenance/compact.md"
+
+[nav."API Reference"]
+Overview    = "api/index.md"
+Core        = "api/core.md"
+Grids       = "api/grids.md"
+Pipelines   = "api/pipelines.md"
+Maintenance = "api/maintenance.md"
+
+[nav.Operations]
+"Ingest Guide" = "operations/ingest_guide.md"

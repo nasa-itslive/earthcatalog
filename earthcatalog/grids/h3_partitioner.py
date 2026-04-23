@@ -1,3 +1,31 @@
+"""
+H3 hexagonal grid partitioner.
+
+Uses Uber's `H3 <https://h3geo.org/>`_ library to map geometries to
+hexagonal grid cells at a configurable resolution.
+
+Resolution guide
+----------------
+| Resolution | Avg. cell area | Global cells | Recommended use         |
+|:----------:|:--------------:|:------------:|-------------------------|
+| 0          | ~4,250,000 km² | 122          | Continental-scale        |
+| 1          | ~607,220 km²   | 842          | **Production default**   |
+| 2          | ~86,750 km²    | 5,882        | Sub-regional granularity |
+| 3          | ~12,390 km²    | 41,162       | Dense urban datasets     |
+
+Boundary-inclusive contract
+----------------------------
+A polygon whose edge passes through a cell — but whose interior does not
+contain that cell's centroid — is still assigned to the edge cell.
+:class:`H3Partitioner` achieves this by combining:
+
+1. ``h3.geo_to_cells()`` — cells whose *center* falls inside the polygon.
+2. A densified boundary walk (``_boundary_cells``) — cells touched by the
+   polygon's exterior ring sampled at ~10 km spacing.
+
+This guarantees no data gap at cell boundaries regardless of item shape.
+"""
+
 import h3
 import numpy as np
 from shapely import wkb

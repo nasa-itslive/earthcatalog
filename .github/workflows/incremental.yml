@@ -1,0 +1,113 @@
+name: Incremental Catalog Update
+
+# -----------------------------------------------------------------------
+# NOT YET ENABLED FOR PRODUCTION.
+#
+# This workflow will run the incremental ingest pipeline on a cron
+# schedule once the following prerequisites are met:
+#
+#   1. The initial full backfill has been validated against the live
+#      ITS_LIVE S3 bucket.
+#   2. AWS credentials (OIDC role or access key) have been configured
+#      as GitHub Actions secrets / environment variables.
+#   3. The S3 warehouse and catalog paths have been confirmed.
+#   4. An Athena cron job (or equivalent) produces a daily delta
+#      Parquet inventory file at a known S3 location.
+#
+# To enable:
+#   1. Uncomment the `schedule:` block below.
+#   2. Populate the env vars in the `run-incremental` job.
+#   3. Remove or adjust the `if: false` guard on the job.
+# -----------------------------------------------------------------------
+
+on:
+  # Uncomment to enable the daily cron trigger:
+  # schedule:
+  #   - cron: "0 6 * * *"   # 06:00 UTC daily
+
+  # Always keep manual dispatch so you can test the workflow:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Ingest items modified on or after this date (YYYY-MM-DD). Leave blank for full inventory."
+        required: false
+        default: ""
+      limit:
+        description: "Maximum number of STAC items to ingest (leave blank for no limit)."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write   # if using OIDC to assume an AWS role
+
+jobs:
+  run-incremental:
+    # -----------------------------------------------------------------------
+    # Remove the line below when this workflow is ready for production.
+    # -----------------------------------------------------------------------
+    if: false   # DISABLED — see header comment
+
+    name: Run incremental ingest
+    runs-on: ubuntu-latest
+
+    env:
+      # -----------------------------------------------------------------------
+      # Fill these in before enabling the workflow.
+      # -----------------------------------------------------------------------
+      INVENTORY_PATH:   ""   # e.g. s3://its-live-data/inventory/delta_latest.parquet
+      CATALOG_S3_PATH:  ""   # e.g. s3://my-bucket/earthcatalog/catalog.db
+      WAREHOUSE_PATH:   ""   # e.g. s3://my-bucket/earthcatalog/warehouse
+      AWS_REGION:       "us-west-2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      # If using OIDC:
+      # - name: Configure AWS credentials
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/earthcatalog-ingest
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download catalog from S3
+        run: |
+          aws s3 cp "$CATALOG_S3_PATH" /tmp/catalog.db
+
+      - name: Run incremental ingest
+        run: |
+          SINCE_FLAG=""
+          if [ -n "${{ github.event.inputs.since }}" ]; then
+            SINCE_FLAG="--since ${{ github.event.inputs.since }}"
+          fi
+          LIMIT_FLAG=""
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            LIMIT_FLAG="--limit ${{ github.event.inputs.limit }}"
+          fi
+          uv run earthcatalog incremental \
+            --inventory "$INVENTORY_PATH" \
+            --catalog   /tmp/catalog.db \
+            --warehouse "$WAREHOUSE_PATH" \
+            $SINCE_FLAG $LIMIT_FLAG
+
+      - name: Run compaction (post-ingest maintenance)
+        run: |
+          uv run python -m earthcatalog.maintenance.compact \
+            --warehouse "$WAREHOUSE_PATH" \
+            --catalog   /tmp/catalog.db \
+            --use-lock
+
+      - name: Upload updated catalog to S3
+        if: always()   # upload even if compaction fails so progress is not lost
+        run: |
+          aws s3 cp /tmp/catalog.db "$CATALOG_S3_PATH"

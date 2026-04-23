@@ -10,14 +10,12 @@ Ingest STAC catalogs from AWS S3 into a spatially-partitioned
 
 1. **Reads** an AWS S3 Inventory file (CSV, CSV.gz, or Parquet) to find `.stac.json` keys.
 2. **Fetches** each STAC item directly from S3 using
-   [obstore](https://github.com/developmentseed/obstore)
+   [obstore](https://github.com/developmentseed/obstore).
 3. **Fan-out** — assigns each item to every grid cell it intersects
-   (boundary-inclusive) via `fan_out()`.
-4. **Fan-out + partition grouping** — assigns each item to every grid cell it
-   intersects (boundary-inclusive) via `fan_out()`, then groups the results by
+   (boundary-inclusive) via `fan_out()`, then groups the results by
    `(grid_partition, year)` via `group_by_partition()` so each GeoParquet file
    covers exactly one partition value for both Iceberg transforms.
-5. **Writes** one GeoParquet file per `(grid_partition, year)` group using
+4. **Writes** one GeoParquet file per `(grid_partition, year)` group using
    [rustac](https://github.com/stac-utils/rustac) into a hive-style directory
    layout (`grid_partition=<cell>/year=<year>/`) — full GeoParquet compliance
    (`geo` key, `geoarrow.wkb` geometry extension) with no manual metadata
@@ -105,7 +103,8 @@ table.add_files(paths)      PyIceberg SQLite catalog registration (batch, all gr
 DuckDB / PyIceberg scan
 ```
 
-See [docs/DESIGN_v3.md](docs/DESIGN_v3.md) for the full design.
+See [docs/DESIGN_v3.md](docs/DESIGN_v3.md) for the full design, or the
+[hosted documentation](https://nsidc.github.io/earthcatalog/) for the user guide.
 
 ---
 
@@ -157,7 +156,7 @@ See [docs/DESIGN_v3.md](docs/DESIGN_v3.md) for the full design.
 
 ```bash
 mamba run -n itslive-ingest pytest --tb=short -q
-# 95 passed
+# 186 passed, 4 skipped
 ```
 
 | File | Tests | Covers |
@@ -170,6 +169,8 @@ mamba run -n itslive-ingest pytest --tb=short -q
 | `test_roundtrip.py` | 8 | 0→N insert, multi-append, schema preservation |
 | `test_duckdb_query.py` | 7 | DuckDB `iceberg_scan` — row count, filters, JSON extract |
 | `test_pipeline_e2e.py` | 11 | Full `run()` with mocked S3 fetch |
+| `test_backfill.py` | 52 | Dask backfill pipeline, compaction, spot-resilient mini-runs |
+| `test_compact.py` | 8 | Standalone compaction tool |
 
 ---
 
@@ -194,7 +195,7 @@ ingest:
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12+
 - mamba (conda-forge)
 - See `environment.yml` for the full dependency list
 

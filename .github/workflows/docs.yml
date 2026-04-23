@@ -1,0 +1,43 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages:    write
+  id-token: write
+
+jobs:
+  deploy:
+    name: Build and deploy docs
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install zensical and mkdocstrings
+        run: uv sync --group dev
+
+      - name: Build docs
+        run: uv run zensical build --clean --config-file zensical.toml
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
