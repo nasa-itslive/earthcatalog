@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "earthcatalog"
+version = "0.1.0"
+description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
+requires-python = ">=3.12"
+dependencies = [
+    "pyarrow",
+    "pyiceberg[pyiceberg-core]",
+    "obstore",
+    "h3",
+    "shapely",
+    "numpy",
+    "pyyaml",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+earthcatalog-ingest = "earthcatalog.pipelines.incremental:main"
+earthcatalog = "earthcatalog.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["earthcatalog*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
+]

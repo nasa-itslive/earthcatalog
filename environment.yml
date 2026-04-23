@@ -1,0 +1,45 @@
+name: itslive-ingest
+channels:
+  - conda-forge
+dependencies:
+  # Base
+  - python=3.12
+
+  # API & DB
+  - fastapi>=0.68.0
+  - uvicorn>=0.15.0
+  - python-multipart>=0.0.5
+  - psycopg2
+  - sqlalchemy
+
+  # AWS & Storage
+  - awscli
+  - boto3>=1.17.0 # Satisfies PyIceberg's [glue] requirement
+  - s3fs # Satisfies PyIceberg's [s3fs] requirement
+  - obstore
+
+  # Data Processing & Lakehouse
+  - pyarrow
+  - duckdb
+  - python-duckdb
+  - dask
+  - distributed
+  - pyiceberg # Moved to Conda! Automatically uses boto3/s3fs
+
+  # Geospatial Core
+  - h3-py
+  - shapely
+  - pystac
+  - geojson
+  - stac-geoparquet
+  - rustac
+
+  # Utils
+  - jq
+  - jupyterlab
+  - pytest
+  - pip
+  - pip:
+      - pypgstac[psycopg] # Kept in pip: pypgstac is heavily tied to pip extras
+      - cql2
+      - pyiceberg[pyiceberg-core] # Rust extension required for YearTransform
