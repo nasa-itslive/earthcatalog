@@ -313,25 +313,43 @@ python -m earthcatalog.pipelines.backfill \
 ### Manual compaction (standalone)
 
 If you ran with `--no-compact` or want to re-compact after multiple incremental
-runs have accumulated part files:
+runs have accumulated part files, use the standalone compaction tool:
 
 ```bash
-# Not yet implemented as a standalone CLI.
-# Invoke the compaction internals directly:
-python - <<'EOF'
-from earthcatalog.pipelines.backfill import _compact_all
-from earthcatalog.core.store_config import get_warehouse_store
+# Dry run — see what would be compacted without touching any files
+python -m earthcatalog.maintenance.compact \
+    --warehouse "$WAREHOUSE" \
+    --catalog   "$CATALOG" \
+    --dry-run
 
-_compact_all(
-    warehouse_path="$HOME/earthcatalog/warehouse",
-    h3_resolution=1,
-)
-EOF
+# Compact all buckets with ≥ 2 part files (default) and rebuild catalog
+python -m earthcatalog.maintenance.compact \
+    --warehouse "$WAREHOUSE" \
+    --catalog   "$CATALOG" \
+    --use-lock
+
+# S3 warehouse
+python -m earthcatalog.maintenance.compact \
+    --warehouse "$S3_WAREHOUSE" \
+    --catalog   "$S3_CATALOG" \
+    --use-lock
 ```
 
-> **Note**: `maintenance/compact.py` (a standalone CLI for post-hoc
-> compaction using PyIceberg's `rewrite_data_files`) is not yet implemented.
-> Track in §16 of `DESIGN_v3.md`.
+Or via the Python API:
+
+```python
+from earthcatalog.maintenance.compact import compact_warehouse
+
+summary = compact_warehouse(
+    warehouse_path="$HOME/earthcatalog/warehouse",
+    catalog_path="$HOME/earthcatalog/catalog.db",
+    threshold=2,
+    use_lock=True,
+)
+print(summary)
+# {"buckets_scanned": 150, "buckets_compacted": 45,
+#  "files_before": 195, "files_after": 150}
+```
 
 ### What compaction does
 
