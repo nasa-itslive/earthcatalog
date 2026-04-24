@@ -58,6 +58,20 @@ explains every layer from S3 inventory to Iceberg catalog.
 
 ---
 
+## Technology stack
+
+| Library | Role |
+|---|---|
+| **obstore** | All S3 and local I/O — fetch STAC items, write/read Parquet, upload `catalog.db`, acquire S3 lock |
+| **rustac** | Converts STAC item dicts to GeoParquet with correct `geo` metadata and `geoarrow.wkb` extension type |
+| **PyIceberg** | Manages the SQLite-backed file manifest: partition spec, snapshot history, schema enforcement at registration |
+| **PyArrow** | In-memory schema definition, type casting (`_align_schema`), Parquet read/write, compaction merges |
+| **H3** | Spatial partitioning index — maps item geometries to one or more hexagonal cells at a configurable resolution |
+
+obstore is used exclusively for all storage operations (no boto3, s3fs, or fsspec). rustac is used exclusively for GeoParquet production; PyIceberg's own writer (`table.append()`) is not used — see [Iceberg usage](#iceberg-usage) below.
+
+---
+
 ## Spatial partitioning
 
 ### Fan-out (Overlap Multiplier)
@@ -138,6 +152,58 @@ earthcatalog uses a **SQLite-backed PyIceberg catalog** (`catalog.db`).
 - `table.add_files()` registers each GeoParquet file in exactly one Iceberg
   snapshot.  Files must contain exactly one `grid_partition` value and one
   `year` value (enforced by `group_by_partition()`).
+
+---
+
+## Iceberg usage
+
+### What we use
+
+| Feature | How |
+|---|---|
+| `SqlCatalog` (SQLite) | `catalog.db` is the catalog — no Glue, no REST server |
+| `IdentityTransform(grid_partition)` + `YearTransform(datetime)` | Partition spec enables file pruning on spatial and temporal predicates |
+| `table.add_files(paths)` | Register pre-written Parquet files atomically in one snapshot |
+| Schema with stable field IDs (1–22) | Type mismatch raises `ValueError` at registration time, catching drift early |
+| `table.history()` | Audit trail of snapshots |
+
+### What we don't use and why
+
+| Feature | Reason not used |
+|---|---|
+| `table.append()` / `table.overwrite()` | Dask workers write directly to S3 (obstore); routing data through the head node would be a bottleneck |
+| `table.append()` for GeoParquet | PyIceberg's writer does not produce the `geo` Parquet key or `geoarrow.wkb` extension type; rustac does. PyIceberg GeometryType support is not yet implemented upstream. |
+| Schema evolution | `raw_stac` (full STAC JSON string) is the escape hatch — new fields can be recovered from it without a catalog migration |
+| Time travel, row deletes, merge-on-read | Not needed; deduplication is handled during compaction |
+| REST catalog / Glue / Hive Metastore | SQLite is sufficient for a single-writer workload |
+
+---
+
+## Compaction
+
+Over many incremental runs each `(grid_partition, year)` bucket accumulates many small part files. `maintenance/compact.py` merges them.
+
+```
+compact_warehouse(warehouse_path, catalog_path, threshold=2)
+
+1. Scan warehouse for all .parquet files grouped by (cell, year)
+2. For each bucket with >= threshold files:
+   - Download all part files via obstore
+   - pa.concat_tables → deduplicate on id (keep latest by updated DESC)
+   - Write one compacted file → obstore.put → S3
+   - Delete input part files
+3. Drop and recreate the Iceberg table
+4. table.add_files(all surviving files) → one clean snapshot
+5. upload_catalog
+```
+
+Step 3 (drop + recreate) is required because `table.add_files()` can only add
+files — it cannot remove stale references. After compaction the old manifest
+points to deleted files; dropping the table rebuilds it from what physically
+exists on disk.
+
+Run compaction periodically after many incremental runs, or after a backfill
+that produced a large number of small part files.
 
 ---
 

@@ -1,3 +1,5 @@
+<img src="docs/images/earthcatalog.png" alt="earthcatalog" width="200">
+
 # earthcatalog
 
 Ingest STAC catalogs from AWS S3 into a spatially-partitioned
