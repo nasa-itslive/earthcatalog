@@ -105,7 +105,7 @@ df = con.execute(f"""
 
 ## Documentation
 
-See the [hosted documentation](https://nsidc.github.io/earthcatalog/) for the full user guide,
+See the [hosted documentation](https://nasa-itslive.github.io/earthcatalog/) for the full user guide,
 architecture overview, and API reference.
 
 ---
