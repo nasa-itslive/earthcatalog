@@ -13,13 +13,9 @@ def _wkb(geom):
 
 ARCTIC_POINT = Point(-45.0, 75.0)
 
-SMALL_POLYGON = Polygon([
-    (-10, 60), (10, 60), (10, 70), (-10, 70), (-10, 60)
-])
+SMALL_POLYGON = Polygon([(-10, 60), (10, 60), (10, 70), (-10, 70), (-10, 60)])
 
-LARGE_POLYGON = Polygon([
-    (-80, -70), (80, -70), (80, -80), (-80, -80), (-80, -70)
-])
+LARGE_POLYGON = Polygon([(-80, -70), (80, -70), (80, -80), (-80, -80), (-80, -70)])
 
 
 class TestH3Partitioner:
@@ -35,6 +31,7 @@ class TestH3Partitioner:
 
     def test_all_keys_are_valid_h3(self):
         import h3
+
         p = H3Partitioner(resolution=3)
         keys = p.get_intersecting_keys(_wkb(SMALL_POLYGON))
         for key in keys:

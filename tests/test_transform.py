@@ -38,9 +38,15 @@ BASE_ITEM = {
     "id": "item-0001",
     "geometry": {
         "type": "Polygon",
-        "coordinates": [[
-            [-10, 60], [10, 60], [10, 70], [-10, 70], [-10, 60],
-        ]],
+        "coordinates": [
+            [
+                [-10, 60],
+                [10, 60],
+                [10, 70],
+                [-10, 70],
+                [-10, 60],
+            ]
+        ],
     },
     "properties": {
         "datetime": "2021-06-15T00:00:00Z",
@@ -74,10 +80,15 @@ FIVE_ITEMS = [
         "id": f"item-{i:04d}",
         "geometry": {
             "type": "Polygon",
-            "coordinates": [[
-                [-10 + i, 60], [10 + i, 60], [10 + i, 70],
-                [-10 + i, 70], [-10 + i, 60],
-            ]],
+            "coordinates": [
+                [
+                    [-10 + i, 60],
+                    [10 + i, 60],
+                    [10 + i, 70],
+                    [-10 + i, 70],
+                    [-10 + i, 60],
+                ]
+            ],
         },
         "properties": {
             **BASE_ITEM["properties"],
@@ -99,6 +110,7 @@ def partitioner():
 # _to_int helper
 # ---------------------------------------------------------------------------
 
+
 class TestToInt:
     def test_rounds_float(self):
         assert _to_int(5.0) == 5
@@ -116,6 +128,7 @@ class TestToInt:
 # ---------------------------------------------------------------------------
 # fan_out()
 # ---------------------------------------------------------------------------
+
 
 class TestFanOut:
     def test_produces_at_least_one_row_per_item(self, partitioner):
@@ -179,7 +192,7 @@ class TestFanOut:
 
     def test_multiple_items_accumulate(self, partitioner):
         rows = fan_out(FIVE_ITEMS, partitioner)
-        ids  = {r["id"] for r in rows}
+        ids = {r["id"] for r in rows}
         assert ids == {f"item-{i:04d}" for i in range(5)}
 
     def test_geometry_preserved_as_geojson(self, partitioner):
@@ -190,6 +203,7 @@ class TestFanOut:
 # ---------------------------------------------------------------------------
 # write_geoparquet()
 # ---------------------------------------------------------------------------
+
 
 class TestWriteGeoparquet:
     def test_file_created(self, tmp_path, partitioner):
@@ -231,9 +245,16 @@ class TestWriteGeoparquet:
         write_geoparquet(fan_out([BASE_ITEM], partitioner), out)
         t = pq.read_table(out)
         required = {
-            "id", "grid_partition", "geometry", "datetime",
-            "platform", "proj_code", "sat_orbit_state",
-            "percent_valid_pixels", "date_dt", "raw_stac",
+            "id",
+            "grid_partition",
+            "geometry",
+            "datetime",
+            "platform",
+            "proj_code",
+            "sat_orbit_state",
+            "percent_valid_pixels",
+            "date_dt",
+            "raw_stac",
         }
         assert required.issubset(set(t.schema.names))
 
@@ -263,10 +284,13 @@ class TestWriteGeoparquet:
 
     def test_missing_optional_props_are_null(self, tmp_path, partitioner):
         minimal = {
-            "type": "Feature", "stac_version": "1.0.0", "id": "min-001",
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "min-001",
             "geometry": BASE_ITEM["geometry"],
             "properties": {"datetime": "2021-01-01T00:00:00Z"},
-            "links": [], "assets": {},
+            "links": [],
+            "assets": {},
         }
         out = str(tmp_path / "out.parquet")
         write_geoparquet(fan_out([minimal], partitioner), out)
@@ -294,6 +318,7 @@ class TestWriteGeoparquet:
 # ---------------------------------------------------------------------------
 # group_by_partition()
 # ---------------------------------------------------------------------------
+
 
 class TestGroupByPartition:
     def test_each_group_has_single_grid_partition(self, partitioner):
@@ -333,8 +358,16 @@ class TestGroupByPartition:
         """Items from different years must land in different groups."""
         p = H3Partitioner(resolution=2)
         # Two items with identical geometry but different years
-        item_2021 = {**BASE_ITEM, "id": "a", "properties": {**BASE_ITEM["properties"], "datetime": "2021-06-15T00:00:00Z"}}
-        item_2024 = {**BASE_ITEM, "id": "b", "properties": {**BASE_ITEM["properties"], "datetime": "2024-06-15T00:00:00Z"}}
+        item_2021 = {
+            **BASE_ITEM,
+            "id": "a",
+            "properties": {**BASE_ITEM["properties"], "datetime": "2021-06-15T00:00:00Z"},
+        }
+        item_2024 = {
+            **BASE_ITEM,
+            "id": "b",
+            "properties": {**BASE_ITEM["properties"], "datetime": "2024-06-15T00:00:00Z"},
+        }
         rows = fan_out([item_2021, item_2024], p)
         groups = group_by_partition(rows)
         years_seen = {year for (_cell, year) in groups}
@@ -352,29 +385,37 @@ class TestGroupByPartition:
         """Items inside each group must be sorted by (platform, datetime)."""
         p = H3Partitioner(resolution=1)  # coarse — single cell for a small polygon
         items = [
-            {**BASE_ITEM, "id": f"item-{i}", "properties": {
-                **BASE_ITEM["properties"],
-                "platform": plat,
-                "datetime": dt,
-            }}
-            for i, (plat, dt) in enumerate([
-                ("sentinel-2", "2021-03-01T00:00:00Z"),
-                ("sentinel-1", "2021-06-15T00:00:00Z"),
-                ("sentinel-1", "2021-01-01T00:00:00Z"),
-                ("sentinel-2", "2021-01-01T00:00:00Z"),
-            ])
+            {
+                **BASE_ITEM,
+                "id": f"item-{i}",
+                "properties": {
+                    **BASE_ITEM["properties"],
+                    "platform": plat,
+                    "datetime": dt,
+                },
+            }
+            for i, (plat, dt) in enumerate(
+                [
+                    ("sentinel-2", "2021-03-01T00:00:00Z"),
+                    ("sentinel-1", "2021-06-15T00:00:00Z"),
+                    ("sentinel-1", "2021-01-01T00:00:00Z"),
+                    ("sentinel-2", "2021-01-01T00:00:00Z"),
+                ]
+            )
         ]
         rows = fan_out(items, p)
         groups = group_by_partition(rows)
         for group_items in groups.values():
-            keys = [(it["properties"]["platform"], it["properties"]["datetime"])
-                    for it in group_items]
+            keys = [
+                (it["properties"]["platform"], it["properties"]["datetime"]) for it in group_items
+            ]
             assert keys == sorted(keys), f"group not sorted: {keys}"
 
 
 # ---------------------------------------------------------------------------
 # write_geoparquet_s3()
 # ---------------------------------------------------------------------------
+
 
 class TestWriteGeoparquetS3:
     """
@@ -401,11 +442,13 @@ class TestWriteGeoparquetS3:
         assert n_bytes == 0
         # Nothing should have been written to the store.
         import obstore
+
         with pytest.raises(Exception):
             obstore.get(store, "test/out.parquet")
 
     def test_uploaded_file_is_readable_parquet(self, store, partitioner):
         import obstore as obs
+
         rows = fan_out([BASE_ITEM], partitioner)
         write_geoparquet_s3(rows, store, "test/out.parquet")
         raw = bytes(obs.get(store, "test/out.parquet").bytes())
@@ -414,6 +457,7 @@ class TestWriteGeoparquetS3:
 
     def test_geo_metadata_preserved(self, store, partitioner):
         import obstore as obs
+
         rows = fan_out([BASE_ITEM], partitioner)
         write_geoparquet_s3(rows, store, "test/out.parquet")
         raw = bytes(obs.get(store, "test/out.parquet").bytes())
@@ -424,6 +468,7 @@ class TestWriteGeoparquetS3:
 
     def test_int_fields_are_int32(self, store, partitioner):
         import obstore as obs
+
         rows = fan_out([BASE_ITEM], partitioner)
         write_geoparquet_s3(rows, store, "test/out.parquet")
         raw = bytes(obs.get(store, "test/out.parquet").bytes())
@@ -433,6 +478,7 @@ class TestWriteGeoparquetS3:
 
     def test_geoarrow_extension_on_geometry(self, store, partitioner):
         import obstore as obs
+
         rows = fan_out([BASE_ITEM], partitioner)
         write_geoparquet_s3(rows, store, "test/out.parquet")
         raw = bytes(obs.get(store, "test/out.parquet").bytes())
@@ -444,6 +490,7 @@ class TestWriteGeoparquetS3:
     def test_different_keys_are_independent(self, store, partitioner):
         """Two uploads to different keys must not interfere."""
         import obstore as obs
+
         rows = fan_out([BASE_ITEM], partitioner)
         write_geoparquet_s3(rows, store, "a/part1.parquet")
         write_geoparquet_s3(rows, store, "b/part2.parquet")

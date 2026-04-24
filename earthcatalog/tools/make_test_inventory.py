@@ -49,13 +49,22 @@ def write_csv(keys: list[str], output_path: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate test S3 Inventory CSV from public bucket")
-    parser.add_argument("--prefix", default="test-space/velocity_image_pair/nisar/v02",
-                        help="S3 prefix to list (default: nisar v02 test space)")
-    parser.add_argument("--limit",  type=int, default=2000,
-                        help="Max JSON files to include (default 2000)")
-    parser.add_argument("--output", default="/tmp/test_inventory.csv",
-                        help="Output CSV path (default /tmp/test_inventory.csv)")
+    parser = argparse.ArgumentParser(
+        description="Generate test S3 Inventory CSV from public bucket"
+    )
+    parser.add_argument(
+        "--prefix",
+        default="test-space/velocity_image_pair/nisar/v02",
+        help="S3 prefix to list (default: nisar v02 test space)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=2000, help="Max JSON files to include (default 2000)"
+    )
+    parser.add_argument(
+        "--output",
+        default="/tmp/test_inventory.csv",
+        help="Output CSV path (default /tmp/test_inventory.csv)",
+    )
     args = parser.parse_args()
 
     print(f"Listing s3://{BUCKET}/{args.prefix} (limit {args.limit} JSON files)...")

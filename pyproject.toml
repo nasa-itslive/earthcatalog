@@ -8,17 +8,17 @@ version = "0.1.0"
 description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
 requires-python = ">=3.12"
 dependencies = [
-    "pyarrow",
-    "pyiceberg[pyiceberg-core,sql-sqlite]",
-    "obstore",
-    "rustac",
-    "h3",
-    "shapely",
-    "numpy",
-    "pyyaml",
-    "typer",
-    "duckdb",
-    "dask[distributed]",
+  "pyarrow",
+  "pyiceberg[pyiceberg-core,sql-sqlite]",
+  "obstore",
+  "rustac",
+  "h3",
+  "shapely",
+  "numpy",
+  "pyyaml",
+  "typer",
+  "duckdb",
+  "dask[distributed]",
 ]
 
 [project.urls]
@@ -37,18 +37,12 @@ where = ["."]
 include = ["earthcatalog*"]
 
 [dependency-groups]
-dev = [
-    "pytest",
-    "ruff",
-    "mypy",
-    "zensical",
-    "mkdocstrings[python]",
-]
+dev = ["pytest", "ruff", "mypy", "zensical", "mkdocstrings[python]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
+  "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
 ]
 
 [tool.ruff]
@@ -57,7 +51,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "I", "UP"]
-ignore = ["E501"]  # line length enforced by formatter
+ignore = ["E501"]                   # line length enforced by formatter
 
 [tool.ruff.format]
 quote-style = "double"

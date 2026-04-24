@@ -8,7 +8,6 @@ via ``table.add_files()``, DuckDB can read the Iceberg table directly using
 No network calls are made — the catalog lives entirely in tmp_path.
 """
 
-
 import duckdb
 import pytest
 
@@ -27,10 +26,15 @@ ITEMS = [
         "stac_version": "1.0.0",
         "geometry": {
             "type": "Polygon",
-            "coordinates": [[
-                [-10 + i, 60], [10 + i, 60], [10 + i, 70],
-                [-10 + i, 70], [-10 + i, 60],
-            ]],
+            "coordinates": [
+                [
+                    [-10 + i, 60],
+                    [10 + i, 60],
+                    [10 + i, 70],
+                    [-10 + i, 70],
+                    [-10 + i, 60],
+                ]
+            ],
         },
         "properties": {
             "datetime": f"202{i % 4 + 1}-0{i % 9 + 1}-15T00:00:00Z",
@@ -50,12 +54,12 @@ ITEMS = [
 @pytest.fixture()
 def populated_table(tmp_path):
     """Build and populate an Iceberg table; return (table, duckdb_connection)."""
-    db  = str(tmp_path / "catalog.db")
-    wh  = str(tmp_path / "warehouse")
+    db = str(tmp_path / "catalog.db")
+    wh = str(tmp_path / "warehouse")
     cat = open_catalog(db_path=db, warehouse_path=wh)
     tbl = get_or_create_table(cat)
 
-    p    = H3Partitioner(resolution=2)
+    p = H3Partitioner(resolution=2)
     rows = fan_out(ITEMS, p)
     paths = []
     for (cell, year), group in group_by_partition(rows).items():
@@ -74,8 +78,8 @@ def populated_table(tmp_path):
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestDuckDBQuery:
 
+class TestDuckDBQuery:
     def test_iceberg_scan_returns_rows(self, populated_table):
         """DuckDB iceberg_scan must return at least one row."""
         tbl, con = populated_table
@@ -124,7 +128,7 @@ class TestDuckDBQuery:
         ).fetchone()[0]
 
         # Write a second chunk with the same items
-        p    = H3Partitioner(resolution=2)
+        p = H3Partitioner(resolution=2)
         rows = fan_out(ITEMS, p)
         paths = []
         for (cell, year), group in group_by_partition(rows).items():
@@ -144,8 +148,7 @@ class TestDuckDBQuery:
         """DuckDB must be able to filter by a string column (platform)."""
         tbl, con = populated_table
         rows = con.execute(
-            f"SELECT id FROM iceberg_scan('{tbl.metadata_location}') "
-            f"WHERE platform = 'sentinel-2'"
+            f"SELECT id FROM iceberg_scan('{tbl.metadata_location}') WHERE platform = 'sentinel-2'"
         ).fetchall()
         assert len(rows) > 0
 

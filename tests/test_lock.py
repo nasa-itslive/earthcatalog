@@ -30,6 +30,7 @@ class TestS3LockAcquireRelease:
         lock = S3Lock(owner="test")
         lock.acquire()
         import obstore
+
         # Lock file must exist after acquire
         result = obstore.get(memory_store, ".lock")
         data = json.loads(bytes(result.bytes()))
@@ -42,6 +43,7 @@ class TestS3LockAcquireRelease:
 
     def test_context_manager_releases_on_exit(self, memory_store):
         import obstore
+
         with S3Lock(owner="ctx"):
             pass
         with pytest.raises(FileNotFoundError):
@@ -49,6 +51,7 @@ class TestS3LockAcquireRelease:
 
     def test_context_manager_releases_on_exception(self, memory_store):
         import obstore
+
         with pytest.raises(ValueError):
             with S3Lock(owner="ctx"):
                 raise ValueError("boom")
@@ -68,6 +71,7 @@ class TestS3LockAcquireRelease:
 
     def test_payload_contains_expected_fields(self, memory_store):
         import obstore
+
         lock = S3Lock(owner="payload-test", ttl_hours=6)
         lock.acquire()
         data = json.loads(bytes(obstore.get(memory_store, ".lock").bytes()))
@@ -84,16 +88,16 @@ class TestS3LockStaleLockOverride:
         import obstore
 
         # Plant a stale lock manually
-        stale_time = (
-            datetime.now(UTC) - timedelta(hours=13)
-        ).isoformat()
-        stale_payload = json.dumps({
-            "owner": "old-job",
-            "pid": 9999,
-            "hostname": "old-host",
-            "acquired": stale_time,
-            "ttl_hours": 12,
-        }).encode()
+        stale_time = (datetime.now(UTC) - timedelta(hours=13)).isoformat()
+        stale_payload = json.dumps(
+            {
+                "owner": "old-job",
+                "pid": 9999,
+                "hostname": "old-host",
+                "acquired": stale_time,
+                "ttl_hours": 12,
+            }
+        ).encode()
         obstore.put(memory_store, ".lock", stale_payload)
 
         # New acquirer should override without raising
@@ -107,13 +111,15 @@ class TestS3LockStaleLockOverride:
         """A lock within TTL must block the second acquirer."""
         import obstore
 
-        fresh_payload = json.dumps({
-            "owner": "active-job",
-            "pid": 1,
-            "hostname": "host",
-            "acquired": datetime.now(UTC).isoformat(),
-            "ttl_hours": 12,
-        }).encode()
+        fresh_payload = json.dumps(
+            {
+                "owner": "active-job",
+                "pid": 1,
+                "hostname": "host",
+                "acquired": datetime.now(UTC).isoformat(),
+                "ttl_hours": 12,
+            }
+        ).encode()
         obstore.put(memory_store, ".lock", fresh_payload)
 
         with pytest.raises(CatalogLocked):

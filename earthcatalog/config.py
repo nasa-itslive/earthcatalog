@@ -43,15 +43,15 @@ class CatalogConfig:
 @dataclass
 class GridConfig:
     type: Literal["h3", "s2", "geojson"] = "h3"
-    resolution: int | None = None           # H3 / S2 resolution level
-    boundaries_path: str | None = None      # GeoJSON partitioner: path to boundaries file
-    id_field: str | None = None             # GeoJSON partitioner: property to use as key
+    resolution: int | None = None  # H3 / S2 resolution level
+    boundaries_path: str | None = None  # GeoJSON partitioner: path to boundaries file
+    id_field: str | None = None  # GeoJSON partitioner: property to use as key
 
 
 @dataclass
 class IngestConfig:
-    chunk_size:      int  = 500
-    max_workers:     int  = 16
+    chunk_size: int = 500
+    max_workers: int = 16
     batch_add_files: bool = False
     """
     When False (default): ``table.add_files()`` is called after every chunk.
@@ -79,8 +79,8 @@ def load_config(path: str) -> AppConfig:
         raw = yaml.safe_load(fh) or {}
 
     catalog_raw = raw.get("catalog", {})
-    grid_raw    = raw.get("grid", {})
-    ingest_raw  = raw.get("ingest", {})
+    grid_raw = raw.get("grid", {})
+    ingest_raw = raw.get("ingest", {})
 
     return AppConfig(
         catalog=CatalogConfig(**catalog_raw),

@@ -25,9 +25,9 @@ ITEMS = [
         "stac_version": "1.0.0",
         "geometry": {
             "type": "Polygon",
-            "coordinates": [[
-                [-10 + i, 60], [10 + i, 60], [10 + i, 70], [-10 + i, 70], [-10 + i, 60]
-            ]],
+            "coordinates": [
+                [[-10 + i, 60], [10 + i, 60], [10 + i, 70], [-10 + i, 70], [-10 + i, 60]]
+            ],
         },
         "properties": {
             "datetime": f"202{i % 4 + 1}-0{i % 9 + 1}-15T00:00:00Z",
@@ -46,18 +46,18 @@ ITEMS = [
 
 @pytest.fixture()
 def iceberg_table(tmp_path):
-    db        = str(tmp_path / "catalog.db")
+    db = str(tmp_path / "catalog.db")
     warehouse = str(tmp_path / "warehouse")
-    catalog   = open_catalog(db_path=db, warehouse_path=warehouse)
+    catalog = open_catalog(db_path=db, warehouse_path=warehouse)
     return get_or_create_table(catalog), tmp_path
 
 
 def _write_and_add(iceberg_table_fixture, items, resolution=2):
     """Helper: fan_out → group_by_partition → write one file per group → add_files."""
     table, tmp_path = iceberg_table_fixture
-    p      = H3Partitioner(resolution=resolution)
-    rows   = fan_out(items, p)
-    paths  = []
+    p = H3Partitioner(resolution=resolution)
+    rows = fan_out(items, p)
+    paths = []
     for (cell, year), group in group_by_partition(rows).items():
         year_str = str(year) if year is not None else "unknown"
         out = str(tmp_path / f"part_{cell[:12]}_{year_str}.parquet")
@@ -71,11 +71,12 @@ def _write_and_add(iceberg_table_fixture, items, resolution=2):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestRoundTrip:
     def test_append_and_scan_row_count(self, iceberg_table, tmp_path):
         """Rows written must be readable back via PyIceberg scan."""
         table, _ = iceberg_table
-        p    = H3Partitioner(resolution=2)
+        p = H3Partitioner(resolution=2)
         rows = fan_out(ITEMS, p)
         total_n = 0
         paths = []
@@ -99,7 +100,7 @@ class TestRoundTrip:
 
     def test_schema_preserved(self, iceberg_table, tmp_path):
         """Key column types must survive the write/read cycle."""
-        table  = _write_and_add(iceberg_table, ITEMS)
+        table = _write_and_add(iceberg_table, ITEMS)
         result = table.scan().to_arrow()
         assert result.schema.field("id").type == pa.string()
         assert result.schema.field("percent_valid_pixels").type == pa.int32()
@@ -109,7 +110,7 @@ class TestRoundTrip:
 
     def test_int_fields_not_float(self, iceberg_table, tmp_path):
         """percent_valid_pixels and date_dt must be integers, not floats."""
-        table  = _write_and_add(iceberg_table, ITEMS)
+        table = _write_and_add(iceberg_table, ITEMS)
         result = table.scan().to_arrow()
         for val in result.column("percent_valid_pixels").to_pylist():
             if val is not None:
@@ -135,7 +136,7 @@ class TestRoundTrip:
             return paths, total
 
         paths1, n = _write_chunk("chunk1")
-        paths2, _  = _write_chunk("chunk2")
+        paths2, _ = _write_chunk("chunk2")
         table.add_files(paths1)
         table.add_files(paths2)
 
@@ -145,7 +146,7 @@ class TestRoundTrip:
 
     def test_raw_stac_recoverable(self, iceberg_table, tmp_path):
         """raw_stac must deserialise back to the original item dict."""
-        table  = _write_and_add(iceberg_table, [ITEMS[0]])
+        table = _write_and_add(iceberg_table, [ITEMS[0]])
         result = table.scan().to_arrow()
         raw = json.loads(result.column("raw_stac")[0].as_py())
         assert raw["id"] == ITEMS[0]["id"]
@@ -153,7 +154,7 @@ class TestRoundTrip:
 
     def test_grid_partition_column_populated(self, iceberg_table, tmp_path):
         """Every row must have a non-null, non-empty grid_partition."""
-        table  = _write_and_add(iceberg_table, ITEMS)
+        table = _write_and_add(iceberg_table, ITEMS)
         result = table.scan().to_arrow()
         partitions = result.column("grid_partition").to_pylist()
         assert all(p and isinstance(p, str) for p in partitions)
@@ -164,7 +165,7 @@ class TestRoundTrip:
         # Confirm truly empty before insert
         assert table.scan().to_arrow().num_rows == 0
 
-        p    = H3Partitioner(resolution=2)
+        p = H3Partitioner(resolution=2)
         rows = fan_out([ITEMS[0]], p)
         paths = []
         n = 0
@@ -182,9 +183,9 @@ class TestRoundTrip:
 
     def test_geoparquet_file_has_geo_metadata(self, tmp_path):
         """The written Parquet file must carry the ``geo`` key from rustac."""
-        p    = H3Partitioner(resolution=2)
+        p = H3Partitioner(resolution=2)
         rows = fan_out(ITEMS, p)
-        out  = str(tmp_path / "chunk.parquet")
+        out = str(tmp_path / "chunk.parquet")
         write_geoparquet(rows, out)
         pf = pq.ParquetFile(out)
         assert b"geo" in pf.metadata.metadata

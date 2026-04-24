@@ -1,4 +1,4 @@
-name: itslive-ingest
+name: earthcatalog
 channels:
   - conda-forge
 dependencies:

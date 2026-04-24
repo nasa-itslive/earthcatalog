@@ -62,7 +62,7 @@ class CatalogInfo:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_table(cls, table) -> "CatalogInfo":
+    def from_table(cls, table) -> CatalogInfo:
         """Build a CatalogInfo from an open PyIceberg Table.
 
         Falls back to sensible defaults for catalogs that predate table-property

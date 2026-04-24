@@ -71,10 +71,15 @@ _STAC_ITEMS = [
         "stac_version": "1.0.0",
         "geometry": {
             "type": "Polygon",
-            "coordinates": [[
-                [-10 + i, 60], [10 + i, 60], [10 + i, 70],
-                [-10 + i, 70], [-10 + i, 60],
-            ]],
+            "coordinates": [
+                [
+                    [-10 + i, 60],
+                    [10 + i, 60],
+                    [10 + i, 70],
+                    [-10 + i, 70],
+                    [-10 + i, 60],
+                ]
+            ],
         },
         "properties": {
             "datetime": f"202{i % 4 + 1}-0{i % 9 + 1}-15T00:00:00Z",
@@ -99,8 +104,7 @@ _STAC_ITEMS = [
 
 # Map (bucket, key) → item dict — used by the mock fetcher.
 _ITEM_MAP: dict[tuple[str, str], dict] = {
-    ("mock-bucket", f"stac/item-{i:04d}.stac.json"): item
-    for i, item in enumerate(_STAC_ITEMS)
+    ("mock-bucket", f"stac/item-{i:04d}.stac.json"): item for i, item in enumerate(_STAC_ITEMS)
 }
 
 
@@ -116,6 +120,7 @@ _PARTITIONER = H3Partitioner(resolution=2)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _read_from_store(store, key: str) -> pa.Table:
     """Read a Parquet file stored in an obstore store into an Arrow table."""
@@ -142,13 +147,17 @@ def _write_parquet_to_store(store, key: str, items: list[dict]) -> FileMetadata:
 # TestIngestChunkImpl
 # ---------------------------------------------------------------------------
 
+
 class TestIngestChunkImpl:
     """Unit tests for _ingest_chunk_impl() — no Dask, MemoryStore warehouse."""
 
     def test_returns_file_metadata_list(self):
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         assert isinstance(metas, list)
@@ -158,7 +167,10 @@ class TestIngestChunkImpl:
     def test_row_count_at_least_one_per_item(self):
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         total_rows = sum(m.row_count for m in metas)
@@ -168,7 +180,10 @@ class TestIngestChunkImpl:
         """Every file must contain rows for exactly one grid_partition value."""
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         for fm in metas:
@@ -181,7 +196,10 @@ class TestIngestChunkImpl:
     def test_file_size_matches_actual_bytes(self):
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         for fm in metas:
@@ -192,7 +210,10 @@ class TestIngestChunkImpl:
         """Keys must follow grid_partition=<cell>/year=<year>/part_...parquet."""
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=5,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=5,
             item_fetcher=_mock_fetcher,
         )
         for fm in metas:
@@ -205,7 +226,10 @@ class TestIngestChunkImpl:
     def test_chunk_id_in_filename(self):
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=42,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=42,
             item_fetcher=_mock_fetcher,
         )
         assert all("part_000042_" in fm.s3_key for fm in metas)
@@ -214,7 +238,10 @@ class TestIngestChunkImpl:
         """If all fetches return None, no files should be written."""
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=lambda b, k: None,
         )
         assert metas == []
@@ -222,7 +249,10 @@ class TestIngestChunkImpl:
     def test_geo_metadata_in_written_files(self):
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         for fm in metas:
@@ -233,7 +263,10 @@ class TestIngestChunkImpl:
     def test_int_fields_are_int32(self):
         store = MemoryStore()
         metas, _ = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         for fm in metas:
@@ -246,15 +279,22 @@ class TestIngestChunkImpl:
         store = MemoryStore()
         with dask.config.set(scheduler="synchronous"):
             metas_delayed, counter_delayed = ingest_chunk(
-                _ALL_PAIRS, _PARTITIONER, store, 0, _mock_fetcher,
+                _ALL_PAIRS,
+                _PARTITIONER,
+                store,
+                0,
+                _mock_fetcher,
             ).compute()
         metas_direct, counter_direct = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, MemoryStore(), 0, _mock_fetcher,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            MemoryStore(),
+            0,
+            _mock_fetcher,
         )
         # Same number of files and same total row count (stores are independent).
         assert len(metas_delayed) == len(metas_direct)
-        assert (sum(m.row_count for m in metas_delayed)
-                == sum(m.row_count for m in metas_direct))
+        assert sum(m.row_count for m in metas_delayed) == sum(m.row_count for m in metas_direct)
         # Both counters must cover the same total item count.
         assert sum(counter_delayed.values()) == sum(counter_direct.values())
 
@@ -262,6 +302,7 @@ class TestIngestChunkImpl:
 # ---------------------------------------------------------------------------
 # TestCompactGroupImpl
 # ---------------------------------------------------------------------------
+
 
 class TestCompactGroupImpl:
     """Unit tests for _compact_group_impl() — no Dask, MemoryStore."""
@@ -282,17 +323,18 @@ class TestCompactGroupImpl:
         metas = []
         for i in range(n_parts):
             key = (
-                f"grid_partition={cell}/year={year_str}/"
-                f"part_{i:06d}_{uuid.uuid4().hex[:8]}.parquet"
+                f"grid_partition={cell}/year={year_str}/part_{i:06d}_{uuid.uuid4().hex[:8]}.parquet"
             )
             n_rows, n_bytes = write_geoparquet_s3(group_items, store, key)
-            metas.append(FileMetadata(
-                s3_key=key,
-                grid_partition=cell,
-                year=year,
-                row_count=n_rows,
-                file_size_bytes=n_bytes,
-            ))
+            metas.append(
+                FileMetadata(
+                    s3_key=key,
+                    grid_partition=cell,
+                    year=year,
+                    row_count=n_rows,
+                    file_size_bytes=n_bytes,
+                )
+            )
         return metas
 
     def test_single_file_passthrough(self):
@@ -316,10 +358,7 @@ class TestCompactGroupImpl:
     def test_returns_correct_metadata(self):
         store = MemoryStore()
         metas = self._make_part_files(store, n_parts=2)
-        out_key = (
-            f"grid_partition={metas[0].grid_partition}/"
-            f"year={metas[0].year}/compacted.parquet"
-        )
+        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
         result = _compact_group_impl(metas, out_key, store)
         assert result.s3_key == out_key
         assert result.grid_partition == metas[0].grid_partition
@@ -333,10 +372,7 @@ class TestCompactGroupImpl:
     def test_deletes_input_part_files(self):
         store = MemoryStore()
         metas = self._make_part_files(store, n_parts=3)
-        out_key = (
-            f"grid_partition={metas[0].grid_partition}/"
-            f"year={metas[0].year}/compacted.parquet"
-        )
+        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
         _compact_group_impl(metas, out_key, store)
         for fm in metas:
             with pytest.raises(Exception):
@@ -345,10 +381,7 @@ class TestCompactGroupImpl:
     def test_compacted_file_has_geo_metadata(self):
         store = MemoryStore()
         metas = self._make_part_files(store, n_parts=2)
-        out_key = (
-            f"grid_partition={metas[0].grid_partition}/"
-            f"year={metas[0].year}/compacted.parquet"
-        )
+        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
         _compact_group_impl(metas, out_key, store)
         raw = bytes(obstore.get(store, out_key).bytes())
         pf = pq.ParquetFile(io.BytesIO(raw))
@@ -358,18 +391,17 @@ class TestCompactGroupImpl:
         """Rows in the compacted file must be sorted by (platform, datetime)."""
         store = MemoryStore()
         metas = self._make_part_files(store, n_parts=2)
-        out_key = (
-            f"grid_partition={metas[0].grid_partition}/"
-            f"year={metas[0].year}/compacted.parquet"
-        )
+        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
         _compact_group_impl(metas, out_key, store)
         tbl = _read_from_store(store, out_key)
         platforms = tbl.column("platform").to_pylist()
         datetimes = tbl.column("datetime").to_pylist()
-        keys = list(zip(
-            [p or "" for p in platforms],
-            [str(d) if d is not None else "" for d in datetimes],
-        ))
+        keys = list(
+            zip(
+                [p or "" for p in platforms],
+                [str(d) if d is not None else "" for d in datetimes],
+            )
+        )
         assert keys == sorted(keys)
 
     def test_dask_delayed_version_matches_impl(self):
@@ -388,6 +420,7 @@ class TestCompactGroupImpl:
 # ---------------------------------------------------------------------------
 # TestRunBackfillUnit
 # ---------------------------------------------------------------------------
+
 
 class TestRunBackfillUnit:
     """
@@ -408,6 +441,7 @@ class TestRunBackfillUnit:
     @pytest.fixture()
     def inventory_csv(self, tmp_path) -> Path:
         import csv
+
         inv = tmp_path / "inventory.csv"
         with open(inv, "w", newline="") as fh:
             writer = csv.writer(fh)
@@ -438,6 +472,7 @@ class TestRunBackfillUnit:
                 **kwargs,
             )
         from earthcatalog.core.catalog import get_or_create_table, open_catalog
+
         catalog = open_catalog(db_path=catalog_path, warehouse_path=wh_root)
         return get_or_create_table(catalog)
 
@@ -500,12 +535,19 @@ class TestRunBackfillUnit:
 
         # Row counts must be equal.
         from earthcatalog.core.catalog import get_or_create_table, open_catalog
-        t1 = get_or_create_table(open_catalog(
-            str(Path(wh_root).parent / "catalog_no.db"), wh_root,
-        ))
-        t2 = get_or_create_table(open_catalog(
-            str(Path(wh_root).parent / "catalog_yes.db"), str(wh2),
-        ))
+
+        t1 = get_or_create_table(
+            open_catalog(
+                str(Path(wh_root).parent / "catalog_no.db"),
+                wh_root,
+            )
+        )
+        t2 = get_or_create_table(
+            open_catalog(
+                str(Path(wh_root).parent / "catalog_yes.db"),
+                str(wh2),
+            )
+        )
         assert t1.scan().to_arrow().num_rows == t2.scan().to_arrow().num_rows
 
         # Compaction should not increase file count.
@@ -570,7 +612,7 @@ class TestRunBackfillDask:
                 catalog_path=catalog_path,
                 warehouse_store=wh_store,
                 warehouse_root=wh_root,
-                item_fetcher=None,   # real S3 fetcher
+                item_fetcher=None,  # real S3 fetcher
                 h3_resolution=1,
                 chunk_size=50,
                 max_workers_per_task=8,
@@ -578,6 +620,7 @@ class TestRunBackfillDask:
                 **kwargs,
             )
         from earthcatalog.core.catalog import get_or_create_table, open_catalog
+
         catalog = open_catalog(db_path=catalog_path, warehouse_path=wh_root)
         return get_or_create_table(catalog)
 
@@ -646,14 +689,13 @@ class TestRunBackfillDask:
             )
         n_yes = len(list(wh_yes.glob("**/*.parquet")))
 
-        assert n_yes <= n_no, (
-            f"compaction increased file count: {n_yes} > {n_no}"
-        )
+        assert n_yes <= n_no, f"compaction increased file count: {n_yes} > {n_no}"
 
 
 # ---------------------------------------------------------------------------
 # TestCompactGroupImplDedup  — deduplication and orphan cleanup
 # ---------------------------------------------------------------------------
+
 
 class TestCompactGroupImplDedup:
     """
@@ -673,6 +715,7 @@ class TestCompactGroupImplDedup:
     ) -> FileMetadata:
         """Write a single STAC item (with property overrides) to store."""
         import copy
+
         item = copy.deepcopy(_STAC_ITEMS[0])
         item["properties"].update(item_overrides)
         if "id" in item_overrides:
@@ -698,11 +741,13 @@ class TestCompactGroupImplDedup:
 
         # Write the same item twice with different `updated` timestamps.
         fm1 = self._write_item_to_store(
-            store, f"{prefix}/part_000000_aaa.parquet",
+            store,
+            f"{prefix}/part_000000_aaa.parquet",
             {"id": "dup-item", "updated": "2026-01-01T00:00:00Z"},
         )
         fm2 = self._write_item_to_store(
-            store, f"{prefix}/part_000001_bbb.parquet",
+            store,
+            f"{prefix}/part_000001_bbb.parquet",
             {"id": "dup-item", "updated": "2026-04-01T00:00:00Z"},
         )
         out_key = f"{prefix}/compacted.parquet"
@@ -722,14 +767,14 @@ class TestCompactGroupImplDedup:
         prefix = f"grid_partition={cell}/year={year_str}"
 
         fm_old = self._write_item_to_store(
-            store, f"{prefix}/part_old.parquet",
-            {"id": "versioned-item", "updated": "2026-01-01T00:00:00Z",
-             "version": "001"},
+            store,
+            f"{prefix}/part_old.parquet",
+            {"id": "versioned-item", "updated": "2026-01-01T00:00:00Z", "version": "001"},
         )
         fm_new = self._write_item_to_store(
-            store, f"{prefix}/part_new.parquet",
-            {"id": "versioned-item", "updated": "2026-04-01T00:00:00Z",
-             "version": "002"},
+            store,
+            f"{prefix}/part_new.parquet",
+            {"id": "versioned-item", "updated": "2026-04-01T00:00:00Z", "version": "002"},
         )
         out_key = f"{prefix}/compacted.parquet"
         _compact_group_impl([fm_old, fm_new], out_key, store)
@@ -741,9 +786,7 @@ class TestCompactGroupImplDedup:
         versions = tbl.column("version").to_pylist()
         for i, id_val in enumerate(ids):
             if id_val == "versioned-item":
-                assert versions[i] == "002", (
-                    f"expected version '002' but got '{versions[i]}'"
-                )
+                assert versions[i] == "002", f"expected version '002' but got '{versions[i]}'"
 
     def test_orphan_files_are_deleted(self):
         """Files present in the prefix but absent from file_metas are deleted."""
@@ -754,10 +797,14 @@ class TestCompactGroupImplDedup:
 
         # Two known part files.
         fm1 = self._write_item_to_store(
-            store, f"{prefix}/part_known_1.parquet", {},
+            store,
+            f"{prefix}/part_known_1.parquet",
+            {},
         )
         fm2 = self._write_item_to_store(
-            store, f"{prefix}/part_known_2.parquet", {},
+            store,
+            f"{prefix}/part_known_2.parquet",
+            {},
         )
         # One orphan — exists on disk but NOT in file_metas.
         orphan_key = f"{prefix}/part_orphan.parquet"
@@ -782,7 +829,9 @@ class TestCompactGroupImplDedup:
         prefix = f"grid_partition={cell}/year={year_str}"
 
         fm = self._write_item_to_store(
-            store, f"{prefix}/part_only.parquet", {},
+            store,
+            f"{prefix}/part_only.parquet",
+            {},
         )
         orphan_key = f"{prefix}/part_stale.parquet"
         self._write_item_to_store(store, orphan_key, {})
@@ -801,6 +850,7 @@ class TestCompactGroupImplDedup:
 # TestIngestStats
 # ---------------------------------------------------------------------------
 
+
 class TestIngestStats:
     """
     Unit tests for _write_ingest_stats() and fan-out counter propagation
@@ -810,12 +860,20 @@ class TestIngestStats:
     def _make_final_metas(self, cell="81007ffffffffff"):
         """Return two minimal FileMetadata entries for testing."""
         return [
-            FileMetadata(s3_key=f"grid_partition={cell}/year=2019/compacted_a.parquet",
-                         grid_partition=cell, year=2019,
-                         row_count=1000, file_size_bytes=500_000),
-            FileMetadata(s3_key=f"grid_partition={cell}/year=2020/compacted_b.parquet",
-                         grid_partition=cell, year=2020,
-                         row_count=200, file_size_bytes=100_000),
+            FileMetadata(
+                s3_key=f"grid_partition={cell}/year=2019/compacted_a.parquet",
+                grid_partition=cell,
+                year=2019,
+                row_count=1000,
+                file_size_bytes=500_000,
+            ),
+            FileMetadata(
+                s3_key=f"grid_partition={cell}/year=2020/compacted_b.parquet",
+                grid_partition=cell,
+                year=2020,
+                row_count=200,
+                file_size_bytes=100_000,
+            ),
         ]
 
     # ------------------------------------------------------------------
@@ -842,6 +900,7 @@ class TestIngestStats:
     def test_stats_values_correct(self, tmp_path):
         """Written record contains correct computed fields."""
         from collections import Counter
+
         catalog = tmp_path / "catalog.db"
         catalog.touch()
         _write_ingest_stats(
@@ -857,20 +916,21 @@ class TestIngestStats:
         records = json.loads((tmp_path / "ingest_stats.json").read_text())
         assert len(records) == 1
         r = records[0]
-        assert r["source_items"]  == 1000
-        assert r["total_rows"]    == 2800
-        assert r["avg_fan_out"]   == 2.8
-        assert r["overhead_pct"]  == 180.0
-        assert r["unique_cells"]  == 1
-        assert r["unique_years"]  == 2
+        assert r["source_items"] == 1000
+        assert r["total_rows"] == 2800
+        assert r["avg_fan_out"] == 2.8
+        assert r["overhead_pct"] == 180.0
+        assert r["unique_cells"] == 1
+        assert r["unique_years"] == 2
         assert r["files_written"] == 2
         assert r["h3_resolution"] == 1
-        assert r["since"]         is None
+        assert r["since"] is None
         assert r["fan_out_distribution"] == {"1": 50, "2": 400, "3": 550}
 
     def test_appends_across_runs(self, tmp_path):
         """Each call appends a new record; existing records are preserved."""
         from collections import Counter
+
         catalog = tmp_path / "catalog.db"
         catalog.touch()
         for i in range(3):
@@ -894,6 +954,7 @@ class TestIngestStats:
         """When since is set, it is written as an ISO string."""
         from collections import Counter
         from datetime import datetime
+
         catalog = tmp_path / "catalog.db"
         catalog.touch()
         since = datetime(2026, 4, 1, tzinfo=UTC)
@@ -917,9 +978,13 @@ class TestIngestStats:
     def test_ingest_chunk_returns_counter(self):
         """_ingest_chunk_impl must return a Counter alongside file metas."""
         from collections import Counter
+
         store = MemoryStore()
         metas, counter = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         assert isinstance(counter, Counter)
@@ -932,19 +997,26 @@ class TestIngestStats:
         """sum(k * v for k, v in counter) == total rows written."""
         store = MemoryStore()
         metas, counter = _ingest_chunk_impl(
-            _ALL_PAIRS, _PARTITIONER, store, chunk_id=0,
+            _ALL_PAIRS,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
-        total_rows_from_metas   = sum(m.row_count for m in metas)
+        total_rows_from_metas = sum(m.row_count for m in metas)
         total_rows_from_counter = sum(k * v for k, v in counter.items())
         assert total_rows_from_counter == total_rows_from_metas
 
     def test_empty_chunk_returns_empty_counter(self):
         """An empty bucket-key list returns an empty Counter, not an error."""
         from collections import Counter
+
         store = MemoryStore()
         metas, counter = _ingest_chunk_impl(
-            [], _PARTITIONER, store, chunk_id=0,
+            [],
+            _PARTITIONER,
+            store,
+            chunk_id=0,
             item_fetcher=_mock_fetcher,
         )
         assert metas == []
@@ -990,8 +1062,8 @@ class TestIngestStats:
         assert len(records) == 1
         r = records[0]
         assert r["h3_resolution"] == 2
-        assert r["source_items"]  == 0
-        assert r["total_rows"]    == 0
+        assert r["source_items"] == 0
+        assert r["total_rows"] == 0
 
     def test_run_backfill_stats_with_items(self, tmp_path):
         """Stats record reflects correct counts when items are actually ingested."""
@@ -1032,10 +1104,8 @@ class TestIngestStats:
         records = json.loads((tmp_path / "ingest_stats.json").read_text())
         r = records[0]
         assert r["source_items"] == len(_STAC_ITEMS)
-        assert r["total_rows"]   == sum(
-            int(k) * v for k, v in r["fan_out_distribution"].items()
-        )
-        assert r["avg_fan_out"]  > 0
+        assert r["total_rows"] == sum(int(k) * v for k, v in r["fan_out_distribution"].items())
+        assert r["avg_fan_out"] > 0
         assert r["files_written"] > 0
         assert isinstance(r["fan_out_distribution"], dict)
 
@@ -1044,16 +1114,19 @@ class TestIngestStats:
 # TestLoadProcessedFiles
 # ---------------------------------------------------------------------------
 
+
 class TestLoadProcessedFiles:
     """Unit tests for _load_processed_files()."""
 
     def test_returns_empty_set_when_file_missing(self, tmp_path):
         from earthcatalog.pipelines.backfill import _load_processed_files
+
         result = _load_processed_files(str(tmp_path / "nonexistent.json"))
         assert result == set()
 
     def test_returns_empty_set_on_corrupt_file(self, tmp_path):
         from earthcatalog.pipelines.backfill import _load_processed_files
+
         p = tmp_path / "stats.json"
         p.write_text("not valid json{{")
         result = _load_processed_files(str(p))
@@ -1061,10 +1134,17 @@ class TestLoadProcessedFiles:
 
     def test_returns_inventory_file_keys(self, tmp_path):
         from earthcatalog.pipelines.backfill import _load_processed_files
+
         p = tmp_path / "stats.json"
         records = [
-            {"inventory_file": "inventory/data/file1.parquet", "run_id": "2026-01-01T00:00:00+00:00"},
-            {"inventory_file": "inventory/data/file2.parquet", "run_id": "2026-01-01T00:01:00+00:00"},
+            {
+                "inventory_file": "inventory/data/file1.parquet",
+                "run_id": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "inventory_file": "inventory/data/file2.parquet",
+                "run_id": "2026-01-01T00:01:00+00:00",
+            },
             {"inventory_file": None, "run_id": "2026-01-01T00:02:00+00:00"},  # null → excluded
         ]
         p.write_text(json.dumps(records))
@@ -1073,6 +1153,7 @@ class TestLoadProcessedFiles:
 
     def test_records_without_inventory_file_field_excluded(self, tmp_path):
         from earthcatalog.pipelines.backfill import _load_processed_files
+
         p = tmp_path / "stats.json"
         # Old-format records (before this field was added) have no inventory_file key.
         records = [{"run_id": "2026-01-01T00:00:00+00:00", "source_items": 100}]
@@ -1084,6 +1165,7 @@ class TestLoadProcessedFiles:
 # ---------------------------------------------------------------------------
 # TestPerFileMiniRuns
 # ---------------------------------------------------------------------------
+
 
 class TestPerFileMiniRuns:
     """
@@ -1125,19 +1207,25 @@ class TestPerFileMiniRuns:
         import pyarrow.parquet as pq
 
         def _make_parquet_bytes(pairs):
-            tbl = pa.table({
-                "bucket": [b for b, _ in pairs],
-                "key":    [k for _, k in pairs],
-            })
+            tbl = pa.table(
+                {
+                    "bucket": [b for b, _ in pairs],
+                    "key": [k for _, k in pairs],
+                }
+            )
             buf = io.BytesIO()
             pq.write_table(tbl, buf)
             buf.seek(0)
             return buf.read()
 
-        file_a_pairs = [("mock-bucket", "stac/item-0000.stac.json"),
-                        ("mock-bucket", "stac/item-0001.stac.json")]
-        file_b_pairs = [("mock-bucket", "stac/item-0002.stac.json"),
-                        ("mock-bucket", "stac/item-0003.stac.json")]
+        file_a_pairs = [
+            ("mock-bucket", "stac/item-0000.stac.json"),
+            ("mock-bucket", "stac/item-0001.stac.json"),
+        ]
+        file_b_pairs = [
+            ("mock-bucket", "stac/item-0002.stac.json"),
+            ("mock-bucket", "stac/item-0003.stac.json"),
+        ]
 
         fake_dest_store = object()  # dummy — never used directly
         fake_data_keys = ["inv/data/fileA.parquet", "inv/data/fileB.parquet"]
@@ -1156,10 +1244,14 @@ class TestPerFileMiniRuns:
         manifest_uri = "s3://fake-log-bucket/inv/manifest.json"
 
         with (
-            patch("earthcatalog.pipelines.backfill._list_manifest_files",
-                  side_effect=fake_list_manifest),
-            patch("earthcatalog.pipelines.backfill._iter_inventory_file_from_store",
-                  side_effect=fake_iter_file),
+            patch(
+                "earthcatalog.pipelines.backfill._list_manifest_files",
+                side_effect=fake_list_manifest,
+            ),
+            patch(
+                "earthcatalog.pipelines.backfill._iter_inventory_file_from_store",
+                side_effect=fake_iter_file,
+            ),
             dask.config.set(scheduler="synchronous"),
         ):
             run_backfill(
@@ -1190,13 +1282,17 @@ class TestPerFileMiniRuns:
         catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
 
         # Pre-seed stats with fileA already done.
-        stats_path.write_text(json.dumps([
-            {
-                "inventory_file": "inv/data/fileA.parquet",
-                "run_id": "2026-01-01T00:00:00+00:00",
-                "source_items": 2,
-            }
-        ]))
+        stats_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "inventory_file": "inv/data/fileA.parquet",
+                        "run_id": "2026-01-01T00:00:00+00:00",
+                        "source_items": 2,
+                    }
+                ]
+            )
+        )
 
         file_b_pairs = [("mock-bucket", "stac/item-0002.stac.json")]
         fake_data_keys = ["inv/data/fileA.parquet", "inv/data/fileB.parquet"]
@@ -1211,10 +1307,14 @@ class TestPerFileMiniRuns:
             yield from pairs_by_key.get(data_key, [])
 
         with (
-            patch("earthcatalog.pipelines.backfill._list_manifest_files",
-                  side_effect=fake_list_manifest),
-            patch("earthcatalog.pipelines.backfill._iter_inventory_file_from_store",
-                  side_effect=fake_iter_file),
+            patch(
+                "earthcatalog.pipelines.backfill._list_manifest_files",
+                side_effect=fake_list_manifest,
+            ),
+            patch(
+                "earthcatalog.pipelines.backfill._iter_inventory_file_from_store",
+                side_effect=fake_iter_file,
+            ),
             dask.config.set(scheduler="synchronous"),
         ):
             run_backfill(
@@ -1231,8 +1331,9 @@ class TestPerFileMiniRuns:
             )
 
         # Only fileB should have been iterated.
-        assert processed == ["inv/data/fileB.parquet"], \
+        assert processed == ["inv/data/fileB.parquet"], (
             f"fileA should be skipped; processed={processed}"
+        )
 
         records = json.loads(stats_path.read_text())
         # One pre-existing record + one new record for fileB.
@@ -1266,8 +1367,10 @@ class TestPerFileMiniRuns:
             return "mock-bucket", object(), []
 
         with (
-            patch("earthcatalog.pipelines.backfill._list_manifest_files",
-                  side_effect=fake_list_manifest),
+            patch(
+                "earthcatalog.pipelines.backfill._list_manifest_files",
+                side_effect=fake_list_manifest,
+            ),
             dask.config.set(scheduler="synchronous"),
         ):
             run_backfill(
@@ -1282,8 +1385,9 @@ class TestPerFileMiniRuns:
                 per_file_mini_runs=False,
             )
 
-        assert list_manifest_called == [], \
+        assert list_manifest_called == [], (
             "_list_manifest_files should not be called in monolithic mode"
+        )
 
     def test_inventory_file_field_is_null_for_monolithic_run(self, tmp_path):
         """

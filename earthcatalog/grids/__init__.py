@@ -19,10 +19,12 @@ def build_partitioner(cfg: GridConfig) -> AbstractPartitioner:
     """Instantiate the correct partitioner from a GridConfig."""
     if cfg.type == "h3":
         from earthcatalog.grids.h3_partitioner import H3Partitioner
+
         return H3Partitioner(resolution=cfg.resolution or 1)
 
     if cfg.type == "geojson":
         from earthcatalog.grids.geojson_partitioner import GeoJSONPartitioner
+
         if not cfg.boundaries_path:
             raise ValueError("GridConfig.boundaries_path is required for type='geojson'")
         return GeoJSONPartitioner(

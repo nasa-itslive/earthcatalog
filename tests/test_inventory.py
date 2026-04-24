@@ -35,8 +35,8 @@ ROWS = [
     ("other-bucket", "path/c.stac.json"),
 ]
 
-_OLD  = "2026-01-01T00:00:00.000Z"
-_NEW  = "2026-04-20T00:00:00.000Z"
+_OLD = "2026-01-01T00:00:00.000Z"
+_NEW = "2026-04-20T00:00:00.000Z"
 _SINCE = datetime(2026, 4, 1, tzinfo=UTC)
 
 
@@ -67,7 +67,7 @@ def _write_csv_gz(path: Path, rows, with_header: bool = True):
 def _write_parquet(path: Path, rows, lm_dates=None):
     data = {
         "bucket": pa.array([r[0] for r in rows], type=pa.string()),
-        "key":    pa.array([r[1] for r in rows], type=pa.string()),
+        "key": pa.array([r[1] for r in rows], type=pa.string()),
     }
     if lm_dates is not None:
         data["last_modified_date"] = pa.array(lm_dates, type=pa.string())
@@ -78,6 +78,7 @@ def _write_parquet(path: Path, rows, lm_dates=None):
 # ---------------------------------------------------------------------------
 # CSV tests
 # ---------------------------------------------------------------------------
+
 
 class TestIterInventoryCsv:
     def test_csv_with_header(self, tmp_path):
@@ -134,6 +135,7 @@ class TestIterInventoryCsv:
 # Parquet tests
 # ---------------------------------------------------------------------------
 
+
 class TestIterInventoryParquet:
     def test_parquet_basic(self, tmp_path):
         p = tmp_path / "inv.parquet"
@@ -159,12 +161,14 @@ class TestIterInventoryParquet:
 
     def test_parquet_extra_columns_ignored(self, tmp_path):
         """Parquet files with extra AWS inventory columns must still work."""
-        table = pa.table({
-            "bucket":        pa.array(["b"], type=pa.string()),
-            "key":           pa.array(["k.stac.json"], type=pa.string()),
-            "size":          pa.array([1234], type=pa.int64()),
-            "storage_class": pa.array(["STANDARD"], type=pa.string()),
-        })
+        table = pa.table(
+            {
+                "bucket": pa.array(["b"], type=pa.string()),
+                "key": pa.array(["k.stac.json"], type=pa.string()),
+                "size": pa.array([1234], type=pa.int64()),
+                "storage_class": pa.array(["STANDARD"], type=pa.string()),
+            }
+        )
         p = tmp_path / "inv.parquet"
         pq.write_table(table, str(p))
         result = list(_iter_inventory_parquet(str(p)))
@@ -186,6 +190,7 @@ class TestIterInventoryParquet:
 # ---------------------------------------------------------------------------
 # S3 CSV path tests (mocked obstore download)
 # ---------------------------------------------------------------------------
+
 
 def _make_csv_bytes(rows, with_header=True) -> bytes:
     buf = io.StringIO()
@@ -235,12 +240,14 @@ class TestS3CsvPath:
         """Verify that the S3 plain-CSV path does NOT call bytes.decode() —
         i.e. it uses TextIOWrapper, not StringIO(raw.decode())."""
         raw = _make_csv_bytes(ROWS, with_header=True)
+
         # Wrap the bytes object so we can detect .decode() calls
         class _Spy(bytes):
             def __new__(cls, data):
                 obj = super().__new__(cls, data)
                 obj.decode_called = False
                 return obj
+
             def decode(self, *args, **kwargs):  # type: ignore[override]
                 self.decode_called = True
                 return super().decode(*args, **kwargs)
@@ -253,14 +260,14 @@ class TestS3CsvPath:
         ):
             list(_iter_inventory_csv(fake_path))
         assert not spy.decode_called, (
-            "_iter_inventory_csv called bytes.decode() — "
-            "should use TextIOWrapper(BytesIO) instead"
+            "_iter_inventory_csv called bytes.decode() — should use TextIOWrapper(BytesIO) instead"
         )
 
 
 # ---------------------------------------------------------------------------
 # since filter — Parquet
 # ---------------------------------------------------------------------------
+
 
 class TestSinceFilterParquet:
     """_iter_inventory_parquet with a since= cutoff date."""
@@ -283,7 +290,7 @@ class TestSinceFilterParquet:
     def test_keeps_all_when_no_lm_column(self, tmp_path):
         """Graceful degradation: no last_modified_date column → all rows kept."""
         p = tmp_path / "inv.parquet"
-        _write_parquet(p, ROWS)   # no lm_dates
+        _write_parquet(p, ROWS)  # no lm_dates
         result = list(_iter_inventory_parquet(str(p), since=_SINCE))
         assert result == ROWS
 
@@ -313,6 +320,7 @@ class TestSinceFilterParquet:
 # since filter — CSV
 # ---------------------------------------------------------------------------
 
+
 class TestSinceFilterCsv:
     """_iter_inventory_csv with a since= cutoff date."""
 
@@ -326,7 +334,7 @@ class TestSinceFilterCsv:
     def test_keeps_all_when_no_lm_column_in_header(self, tmp_path):
         """Graceful degradation: header without last_modified_date → all rows."""
         p = tmp_path / "inv.csv"
-        _write_csv(p, ROWS, with_header=True)   # only bucket, key header
+        _write_csv(p, ROWS, with_header=True)  # only bucket, key header
         result = list(_iter_inventory_csv(str(p), since=_SINCE))
         assert result == ROWS
 
@@ -355,6 +363,7 @@ class TestSinceFilterCsv:
 # ---------------------------------------------------------------------------
 # _coerce_last_modified — datetime vs string
 # ---------------------------------------------------------------------------
+
 
 class TestCoerceLastModified:
     """Unit tests for _coerce_last_modified."""
@@ -387,11 +396,12 @@ class TestCoerceLastModified:
 # since filter — Parquet with TIMESTAMP column (datetime objects)
 # ---------------------------------------------------------------------------
 
+
 def _write_parquet_timestamp(path, rows, lm_datetimes=None):
     """Write a Parquet file with last_modified_date as TIMESTAMP(us, UTC)."""
     data = {
         "bucket": pa.array([r[0] for r in rows], type=pa.string()),
-        "key":    pa.array([r[1] for r in rows], type=pa.string()),
+        "key": pa.array([r[1] for r in rows], type=pa.string()),
     }
     if lm_datetimes is not None:
         data["last_modified_date"] = pa.array(
@@ -433,6 +443,7 @@ class TestSinceFilterParquetTimestamp:
 # _iter_inventory_manifest — mocked obstore
 # ---------------------------------------------------------------------------
 
+
 def _make_manifest_json(dest_bucket: str, data_keys: list[str]) -> bytes:
     """Build a minimal manifest.json bytes blob."""
     manifest = {
@@ -448,7 +459,7 @@ def _make_parquet_bytes(rows, lm_dates=None) -> bytes:
     """Write rows to an in-memory Parquet buffer and return bytes."""
     data = {
         "bucket": pa.array([r[0] for r in rows], type=pa.string()),
-        "key":    pa.array([r[1] for r in rows], type=pa.string()),
+        "key": pa.array([r[1] for r in rows], type=pa.string()),
     }
     if lm_dates is not None:
         data["last_modified_date"] = pa.array(lm_dates, type=pa.string())
@@ -468,10 +479,9 @@ class TestIterInventoryManifest:
         """
 
         manifest_bucket = "fake-log-bucket"
-        manifest_key    = "inventory/manifest.json"
-        data_keys       = [f"inventory/data/part_{i}.parquet"
-                           for i in range(len(data_files_bytes))]
-        manifest_blob   = _make_manifest_json(manifest_bucket, data_keys)
+        manifest_key = "inventory/manifest.json"
+        data_keys = [f"inventory/data/part_{i}.parquet" for i in range(len(data_files_bytes))]
+        manifest_blob = _make_manifest_json(manifest_bucket, data_keys)
 
         def fake_get(store, key):
             class _FakeResult:
@@ -481,15 +491,22 @@ class TestIterInventoryManifest:
                     # data file — look up by key suffix
                     idx = int(key.split("part_")[1].split(".")[0])
                     return data_files_bytes[idx]
+
             return _FakeResult()
 
-        with patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get), \
-             patch("earthcatalog.pipelines.incremental._get_authenticated_store",
-                   return_value="fake-store"):
-            return list(_iter_inventory_manifest(
-                f"s3://{manifest_bucket}/{manifest_key}",
-                since=since,
-            ))
+        with (
+            patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get),
+            patch(
+                "earthcatalog.pipelines.incremental._get_authenticated_store",
+                return_value="fake-store",
+            ),
+        ):
+            return list(
+                _iter_inventory_manifest(
+                    f"s3://{manifest_bucket}/{manifest_key}",
+                    since=since,
+                )
+            )
 
     def test_single_data_file(self):
         """Single Parquet data file: all rows yielded."""
@@ -518,13 +535,19 @@ class TestIterInventoryManifest:
             class _R:
                 def bytes(self_):
                     if key.endswith("manifest.json"):
-                        return _make_manifest_json("fake-log-bucket",
-                                                   ["inventory/data/part_0.parquet"])
+                        return _make_manifest_json(
+                            "fake-log-bucket", ["inventory/data/part_0.parquet"]
+                        )
                     return data
+
             return _R()
 
-        with patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get), \
-             patch("earthcatalog.pipelines.incremental._get_authenticated_store",
-                   return_value="fake-store"):
+        with (
+            patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get),
+            patch(
+                "earthcatalog.pipelines.incremental._get_authenticated_store",
+                return_value="fake-store",
+            ),
+        ):
             result = list(_iter_inventory("s3://fake-log-bucket/inventory/manifest.json"))
         assert result == ROWS

@@ -3,7 +3,7 @@ Tests for CatalogInfo — grid metadata discovery from Iceberg table properties.
 """
 
 import pytest
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import Point, box
 
 from earthcatalog.config import GridConfig
 from earthcatalog.core.catalog import (
@@ -13,7 +13,6 @@ from earthcatalog.core.catalog import (
     open_catalog,
 )
 from earthcatalog.core.catalog_info import CatalogInfo
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
