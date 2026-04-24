@@ -7,13 +7,6 @@ name = "earthcatalog"
 version = "0.1.0"
 description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
 requires-python = ">=3.12"
-
-[project.urls]
-Homepage = "https://github.com/nasa-itslive/earthcatalog"
-Repository = "https://github.com/nasa-itslive/earthcatalog"
-Documentation = "https://nasa-itslive.github.io/earthcatalog/"
-"Bug Tracker" = "https://github.com/nasa-itslive/earthcatalog/issues"
-Changelog = "https://github.com/nasa-itslive/earthcatalog/blob/main/CHANGELOG.md"
 dependencies = [
     "pyarrow",
     "pyiceberg[pyiceberg-core]",
@@ -24,6 +17,13 @@ dependencies = [
     "pyyaml",
     "typer",
 ]
+
+[project.urls]
+Homepage = "https://github.com/nasa-itslive/earthcatalog"
+Repository = "https://github.com/nasa-itslive/earthcatalog"
+Documentation = "https://nasa-itslive.github.io/earthcatalog/"
+"Bug Tracker" = "https://github.com/nasa-itslive/earthcatalog/issues"
+Changelog = "https://github.com/nasa-itslive/earthcatalog/blob/main/CHANGELOG.md"
 
 [project.scripts]
 earthcatalog-ingest = "earthcatalog.pipelines.incremental:main"
