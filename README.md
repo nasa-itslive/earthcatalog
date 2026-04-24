@@ -86,16 +86,18 @@ catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse
 table   = get_or_create_table(catalog)
 
 con = duckdb.connect()
-con.execute("INSTALL iceberg; LOAD iceberg;")
+con.execute("INSTALL iceberg; LOAD iceberg; INSTALL spatial; LOAD spatial;")
 
 df = con.execute(f"""
     SELECT id, platform, datetime, geometry
     FROM iceberg_scan('{table.metadata_location}')
     WHERE grid_partition IN ({cell_list})
       AND datetime >= '2022-01-01'
+      AND ST_Intersects(ST_GeomFromWKB(geometry), ST_GeomFromText('{bbox.wkt}'))
     ORDER BY datetime
 """).df()
-# Only files whose grid_partition matches are opened — all others are skipped.
+# grid_partition prunes to candidate files (zero I/O on the rest);
+# ST_Intersects then does exact geometry intersection within those files.
 ```
 
 ---
