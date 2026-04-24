@@ -9,13 +9,15 @@ description = "Spatially-partitioned STAC ingest pipeline backed by Apache Icebe
 requires-python = ">=3.12"
 dependencies = [
     "pyarrow",
-    "pyiceberg[pyiceberg-core]",
+    "pyiceberg[pyiceberg-core,sql-sqlite]",
     "obstore",
+    "rustac",
     "h3",
     "shapely",
     "numpy",
     "pyyaml",
     "typer",
+    "duckdb",
 ]
 
 [project.urls]

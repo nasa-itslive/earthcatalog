@@ -1,8 +1,8 @@
 [project]
 site_name        = "earthcatalog"
-site_url         = "https://nsidc.github.io/earthcatalog/"
+site_url         = "https://nasa-itslive.github.io/earthcatalog/"
 site_description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
-site_author      = "NSIDC / ITS_LIVE"
+site_author      = "NASA ITS_LIVE"
 docs_dir         = "docs/site"
 
 [theme]
@@ -26,8 +26,8 @@ features = [
 ]
 
 [repository]
-url  = "https://github.com/nsidc/earthcatalog"
-name = "nsidc/earthcatalog"
+url  = "https://github.com/nasa-itslive/earthcatalog"
+name = "nasa-itslive/earthcatalog"
 
 [[plugins]]
 name = "search"
