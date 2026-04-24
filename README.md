@@ -36,16 +36,51 @@ mamba activate itslive-ingest
 pip install -e .
 ```
 
+### 1. Initial bulk ingest
+
+Use the backfill pipeline for a first-time full ingest from an S3 Inventory manifest.
+This fans out across Dask workers — each worker fetches STAC items from S3, writes
+GeoParquet files directly to the warehouse, and returns only lightweight metadata to
+the head node. Expect ~1M items/hour on a modest Dask cluster.
+
+```bash
+earthcatalog backfill \
+    --inventory  s3://my-bucket/inventory/manifest.json \
+    --catalog    s3://my-bucket/catalog/catalog.db \
+    --warehouse  s3://my-bucket/warehouse \
+    --workers    32
+```
+
+### 2. Incremental updates
+
+After the initial ingest, run the incremental pipeline whenever a new S3 Inventory
+is available. It fetches only keys modified since the last run (`--since`), writes
+new GeoParquet files, and appends a new Iceberg snapshot. Typical runs complete in
+minutes for daily deltas.
+
 ```bash
 earthcatalog incremental \
     --inventory  /tmp/s3_inventory.csv \
     --catalog    /tmp/catalog.db \
-    --warehouse  /tmp/warehouse
+    --warehouse  /tmp/warehouse \
+    --since      2024-01-01
 ```
 
+### 3. Spatial query
+
+EarthCatalog partitions data by H3 cell and year. Pass the H3 cells that cover your
+region of interest to `WHERE grid_partition IN (...)` — Iceberg skips every file
+outside those cells with zero I/O.
+
 ```python
-import duckdb
+import duckdb, h3
+from shapely.geometry import box, mapping
 from earthcatalog.core.catalog import open_catalog, get_or_create_table
+
+# Convert a bounding box to H3 cells at the catalog's resolution (default 1)
+bbox = box(-60, 60, -30, 80)  # Greenland
+cells = h3.geo_to_cells(mapping(bbox), res=1)
+cell_list = ", ".join(f"'{c}'" for c in cells)
 
 catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
 table   = get_or_create_table(catalog)
@@ -54,11 +89,13 @@ con = duckdb.connect()
 con.execute("INSTALL iceberg; LOAD iceberg;")
 
 df = con.execute(f"""
-    SELECT id, platform, grid_partition, datetime
+    SELECT id, platform, datetime, geometry
     FROM iceberg_scan('{table.metadata_location}')
-    WHERE platform = 'sentinel-2'
-    LIMIT 20
+    WHERE grid_partition IN ({cell_list})
+      AND datetime >= '2022-01-01'
+    ORDER BY datetime
 """).df()
+# Only files whose grid_partition matches are opened — all others are skipped.
 ```
 
 ---
