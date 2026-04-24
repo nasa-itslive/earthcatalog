@@ -594,6 +594,7 @@ def run_backfill(
     since: datetime | None = None,
     report_location: str | None = None,
     per_file_mini_runs: bool = True,
+    grid_config=None,
 ) -> None:
     """
     Three-level Dask distributed backfill pipeline.
@@ -721,7 +722,7 @@ def run_backfill(
             db_path=catalog_path,
             warehouse_path=warehouse_root,
         )
-        table = get_or_create_table(catalog)
+        table = get_or_create_table(catalog, grid_config=grid_config)
 
         # Level 0 ─ dispatch ingest_chunk tasks
         level0_tasks = []

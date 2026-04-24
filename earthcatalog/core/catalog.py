@@ -29,6 +29,14 @@ NAMESPACE = "earthcatalog"
 TABLE_NAME = "stac_items"
 FULL_NAME = f"{NAMESPACE}.{TABLE_NAME}"
 
+# Iceberg table property keys for grid metadata.
+# Written at table-creation time so downstream readers don't need a priori
+# knowledge of the grid system or resolution used during ingest.
+PROP_GRID_TYPE = "earthcatalog.grid.type"
+PROP_GRID_RESOLUTION = "earthcatalog.grid.resolution"
+PROP_GRID_BOUNDARIES_PATH = "earthcatalog.grid.boundaries_path"
+PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
+
 # PyIceberg schema — mirrors earthcatalog/schema.py (PyArrow)
 # Field IDs must be stable; never reorder or reuse them.
 ICEBERG_SCHEMA = Schema(
@@ -145,18 +153,46 @@ def upload_catalog(local_path: str) -> None:
     print(f"Catalog uploaded: {local_path} → {key}")
 
 
-def get_or_create_table(catalog: SqlCatalog) -> object:
-    """Return the stac_items table, creating it (and the namespace) if needed."""
+def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
+    """Return the stac_items table, creating it (and the namespace) if needed.
+
+    Parameters
+    ----------
+    catalog:
+        Open SqlCatalog instance.
+    grid_config:
+        Optional :class:`earthcatalog.config.GridConfig`.  When provided, grid
+        metadata (type, resolution, boundaries_path, id_field) is stored as
+        Iceberg table properties so that :class:`~earthcatalog.core.catalog_info.CatalogInfo`
+        can reconstruct the grid system without any external configuration.
+    """
     try:
         catalog.create_namespace(NAMESPACE)
     except NamespaceAlreadyExistsError:
         pass
 
+    props: dict[str, str] = {}
+    if grid_config is not None:
+        props[PROP_GRID_TYPE] = str(grid_config.type)
+        if grid_config.resolution is not None:
+            props[PROP_GRID_RESOLUTION] = str(grid_config.resolution)
+        if grid_config.boundaries_path is not None:
+            props[PROP_GRID_BOUNDARIES_PATH] = str(grid_config.boundaries_path)
+        if grid_config.id_field is not None:
+            props[PROP_GRID_ID_FIELD] = str(grid_config.id_field)
+
     try:
-        return catalog.load_table(FULL_NAME)
+        table = catalog.load_table(FULL_NAME)
+        # Backfill properties on existing tables that predate this feature.
+        missing = {k: v for k, v in props.items() if k not in table.properties}
+        if missing:
+            with table.transaction() as tx:
+                tx.set_properties(**missing)
+        return table
     except NoSuchTableError:
         return catalog.create_table(
             identifier=FULL_NAME,
             schema=ICEBERG_SCHEMA,
             partition_spec=PARTITION_SPEC,
+            properties=props,
         )

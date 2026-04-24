@@ -518,6 +518,7 @@ def run(
     use_lock: bool = True,
     batch_add_files: bool = False,
     since: datetime | None = None,
+    grid_config=None,
 ) -> None:
     """
     Read inventory → fetch STAC JSON from S3 in parallel →
@@ -560,7 +561,7 @@ def run(
         download_catalog(catalog_path)
 
         catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
-        table = get_or_create_table(catalog)
+        table = get_or_create_table(catalog, grid_config=grid_config)
         print(f"Catalog  : {catalog_path}")
         print(f"Table    : {table.name()}")
 
@@ -675,6 +676,7 @@ def run_from_config(inventory_path: str, config: object, limit: int | None = Non
         batch_add_files=config.ingest.batch_add_files,
         limit=limit,
         partitioner=partitioner,
+        grid_config=config.grid,
     )
 
 

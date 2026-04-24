@@ -68,22 +68,25 @@ earthcatalog incremental \
 
 ### 3. Spatial query
 
-EarthCatalog partitions data by H3 cell and year. Pass the H3 cells that cover your
-region of interest to `WHERE grid_partition IN (...)` — Iceberg skips every file
-outside those cells with zero I/O.
+EarthCatalog stores grid metadata (type and resolution) as Iceberg table
+properties at ingest time. Use `CatalogInfo` to discover the grid system and
+convert any geometry to the correct partition keys — no prior knowledge required.
 
 ```python
-import duckdb, h3
-from shapely.geometry import box, mapping
+import duckdb
+from shapely.geometry import box
 from earthcatalog.core.catalog import open_catalog, get_or_create_table
-
-# Convert a bounding box to H3 cells at the catalog's resolution (default 1)
-bbox = box(-60, 60, -30, 80)  # Greenland
-cells = h3.geo_to_cells(mapping(bbox), res=1)
-cell_list = ", ".join(f"'{c}'" for c in cells)
+from earthcatalog.core.catalog_info import CatalogInfo
 
 catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
 table   = get_or_create_table(catalog)
+
+# Discover grid type and resolution from the table — no config needed.
+info = CatalogInfo.from_table(table)
+# CatalogInfo(grid_type='h3', resolution=1)
+
+bbox = box(-60, 60, -30, 80)           # Greenland
+sql  = info.cell_list_sql(bbox)        # "grid_partition IN ('8001fff...', ...)"
 
 con = duckdb.connect()
 con.execute("INSTALL iceberg; LOAD iceberg; INSTALL spatial; LOAD spatial;")
@@ -91,13 +94,14 @@ con.execute("INSTALL iceberg; LOAD iceberg; INSTALL spatial; LOAD spatial;")
 df = con.execute(f"""
     SELECT id, platform, datetime, geometry
     FROM iceberg_scan('{table.metadata_location}')
-    WHERE grid_partition IN ({cell_list})
+    WHERE {sql}
       AND datetime >= '2022-01-01'
       AND ST_Intersects(ST_GeomFromWKB(geometry), ST_GeomFromText('{bbox.wkt}'))
     ORDER BY datetime
 """).df()
 # grid_partition prunes to candidate files (zero I/O on the rest);
 # ST_Intersects then does exact geometry intersection within those files.
+```
 ```
 
 ---
