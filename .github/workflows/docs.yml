@@ -19,6 +19,8 @@ jobs:
 
     steps:
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - uses: actions/checkout@v4
 
