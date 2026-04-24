@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml",
     "typer",
     "duckdb",
+    "dask[distributed]",
 ]
 
 [project.urls]
