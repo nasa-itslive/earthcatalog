@@ -24,6 +24,7 @@ dependencies:
   - python-duckdb
   - dask
   - distributed
+  - coiled
   - pyiceberg # Moved to Conda! Automatically uses boto3/s3fs
 
   # Geospatial Core

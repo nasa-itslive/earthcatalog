@@ -19,6 +19,7 @@ dependencies = [
   "typer",
   "duckdb",
   "dask[distributed]",
+  "coiled",
 ]
 
 [project.urls]
