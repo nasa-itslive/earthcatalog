@@ -102,9 +102,6 @@ df = con.execute(f"""
 # grid_partition prunes to candidate files (zero I/O on the rest);
 # ST_Intersects then does exact geometry intersection within those files.
 ```
-```
-
----
 
 ## Documentation
 
