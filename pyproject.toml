@@ -40,7 +40,7 @@ where = ["."]
 include = ["earthcatalog*"]
 
 [dependency-groups]
-dev = ["pytest", "ruff", "mypy", "zensical", "mkdocstrings[python]"]
+dev = ["pytest", "ruff", "mypy", "pre-commit", "zensical", "mkdocstrings[python]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
