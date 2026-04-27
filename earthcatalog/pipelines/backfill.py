@@ -1,24 +1,24 @@
 """
 Dask distributed backfill pipeline for earthcatalog.
 
-Architecture (three levels)
----------------------------
+Architecture (three phases)
+--------------------------
 
-Level 0 — ``ingest_chunk`` (one Dask task per inventory chunk)
+Phase 1 — ``ingest_chunk`` (one Dask task per inventory chunk)
     Each worker fetches STAC JSON from S3, fans out through the H3 partitioner,
     groups by ``(grid_partition, year)``, and writes one GeoParquet file per
     group directly to the warehouse store via ``write_geoparquet_s3``.
     Returns a list of ``FileMetadata`` dicts (~200 B each) — no Parquet data
     crosses the network to the head node.
 
-Level 1 — ``compact_group`` (one Dask task per (cell, year) bucket)
+Phase 2 — ``compact_group`` (one Dask task per (cell, year) bucket)
     Each worker downloads all part files for its bucket from the warehouse store,
     merges them into one Arrow table, sorts by ``(platform, datetime)``, writes
     one consolidated GeoParquet file back to the store, and deletes the originals.
     Returns a single ``FileMetadata``.
     If a bucket already has only one file, the task is a no-op passthrough.
 
-Level 2 — catalog registration (head node only)
+Phase 3 — catalog registration (head node only)
     ``table.add_files(final_paths)`` registers all compacted files in exactly
     one Iceberg snapshot.  The catalog is then uploaded to the configured store.
 
@@ -60,6 +60,7 @@ CLI
 import concurrent.futures
 import io
 import json
+import sys
 import tempfile
 import uuid
 from collections import Counter, defaultdict
@@ -94,36 +95,110 @@ from earthcatalog.pipelines.incremental import (
 )
 
 # ---------------------------------------------------------------------------
-# Default S3 item fetcher (production)
+# Default S3 item fetcher (production) — async via rustac
 # ---------------------------------------------------------------------------
 
-_S3_STORES: dict[str, object] = {}
+_S3_FETCH_RETRIES = 3
+_S3_FETCH_BACKOFF_BASE = 0.5
+_FETCH_CONCURRENCY = 256
 
 
-def _get_s3_store(bucket: str) -> object:
+async def _fetch_item_async(bucket: str, key: str) -> dict | None:
+    """Fetch one STAC JSON item from S3 via rustac with retry and backoff.
+
+    Error handling
+    --------------
+    * ``404 Not Found`` / ``NoSuchKey`` → return ``None`` (graceful skip — the
+      inventory may be stale).
+    * ``403 Forbidden`` / ``AccessDenied`` → raise immediately (auth failure,
+      will crash the task — fails loud).
+    * All other errors (network, 5xx, etc.) → retry 3×, then **raise** (fails
+      loud rather than silently producing empty results).
+    """
+    import asyncio
+
+    import rustac
     from obstore.store import S3Store
 
-    if bucket not in _S3_STORES:
-        _S3_STORES[bucket] = S3Store(
-            bucket=bucket,
-            region="us-west-2",
-            skip_signature=True,
-        )
-    return _S3_STORES[bucket]
+    store = S3Store(bucket=bucket, region="us-west-2", skip_signature=True)
+    href = f"s3://{bucket}/{key}"
+    last_exc = None
+    for attempt in range(_S3_FETCH_RETRIES + 1):
+        try:
+            return await rustac.read(href, store=store)
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "404 Not Found" in msg or "NoSuchKey" in msg:
+                print(f"WARN: {href} not found in S3 — skipping", file=sys.stderr)
+                return None
+            if "403 Forbidden" in msg or "AccessDenied" in msg:
+                raise
+            if attempt < _S3_FETCH_RETRIES:
+                delay = _S3_FETCH_BACKOFF_BASE * (2**attempt)
+                print(
+                    f"RETRY {attempt + 1}/{_S3_FETCH_RETRIES} {href}: {exc} — waiting {delay:.1f}s",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(delay)
+
+    print(
+        f"FATAL: failed to fetch {href} after {_S3_FETCH_RETRIES} retries: {last_exc}",
+        file=sys.stderr,
+    )
+    raise RuntimeError(
+        f"Failed to fetch {href} after {_S3_FETCH_RETRIES} retries: {last_exc}"
+    ) from last_exc
+
+
+async def _fetch_items_async(
+    pairs: list[tuple[str, str]],
+    concurrency: int = _FETCH_CONCURRENCY,
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Fetch multiple STAC items concurrently via rustac.
+
+    Returns (items, failed_pairs) where items are successfully fetched dicts
+    and failed_pairs are the (bucket, key) pairs that failed after retries.
+    """
+    from asyncio import Semaphore, TaskGroup
+
+    sem = Semaphore(concurrency)
+    results: dict[int, dict | None] = {}
+
+    async def _fetch(index: int, bucket: str, key: str) -> None:
+        async with sem:
+            try:
+                results[index] = await _fetch_item_async(bucket, key)
+            except Exception as exc:
+                print(
+                    f"ERROR: failed to fetch s3://{bucket}/{key}: {exc}",
+                    file=sys.stderr,
+                )
+                results[index] = None
+
+    async with TaskGroup() as tg:
+        for i, (bucket, key) in enumerate(pairs):
+            tg.create_task(_fetch(i, bucket, key))
+
+    items: list[dict] = []
+    failed: list[tuple[str, str]] = []
+    for i, (bucket, key) in enumerate(pairs):
+        if results[i] is not None:
+            items.append(results[i])
+        else:
+            failed.append((bucket, key))
+    return items, failed
 
 
 def _s3_fetcher(bucket: str, key: str) -> dict | None:
-    """Fetch one STAC JSON item from a public S3 bucket via obstore."""
-    try:
-        raw = obstore.get(_get_s3_store(bucket), key).bytes()
-        return json.loads(bytes(raw))
-    except Exception as exc:
-        print(f"WARN: failed to fetch s3://{bucket}/{key}: {exc}")
-        return None
+    """Sync wrapper for tests — fetches a single item (no concurrency)."""
+    import asyncio
+
+    return asyncio.get_event_loop().run_until_complete(_fetch_item_async(bucket, key))
 
 
 # ---------------------------------------------------------------------------
-# Level 0 — ingest_chunk
+# Phase 1 — ingest_chunk
 # ---------------------------------------------------------------------------
 
 
@@ -134,9 +209,10 @@ def _ingest_chunk_impl(
     chunk_id: int,
     item_fetcher: object = None,
     max_workers: int = 16,
-) -> tuple[list[FileMetadata], Counter]:
+    fetch_concurrency: int = 256,
+) -> tuple[list[FileMetadata], Counter, int]:
     """
-    Level 0 worker: fetch STAC items → fan_out → group_by_partition → write.
+    Phase 1 worker: fetch STAC items → fan_out → group_by_partition → write.
 
     Parameters
     ----------
@@ -152,10 +228,12 @@ def _ingest_chunk_impl(
     chunk_id:
         Integer chunk identifier used in the output filename.
     item_fetcher:
-        Callable ``(bucket, key) -> dict | None``.  When ``None``, the default
-        public S3 fetcher is used.  Pass a custom callable for tests.
+        Callable ``(bucket, key) -> dict | None``.  When ``None``, the async
+        rustac-based fetcher is used (ignores *max_workers* — concurrency is
+        controlled by ``_FETCH_CONCURRENCY``).  Pass a custom callable for tests.
     max_workers:
-        Number of threads for parallel item fetching.
+        Ignored when *item_fetcher* is ``None`` (async path).  When a custom
+        *item_fetcher* is provided, this is the thread-pool size.
 
     Returns
     -------
@@ -167,24 +245,27 @@ def _ingest_chunk_impl(
     - ``Counter[int]`` — fan-out distribution: maps number-of-cells (1, 2, 3,
       …) to count-of-source-items that landed in that many cells.  Used by the
       driver to compute overlap statistics without a post-hoc warehouse scan.
+    - ``int`` — number of items that failed to fetch (returned ``None``).
     """
-    if item_fetcher is None:
-        item_fetcher = _s3_fetcher
+    import asyncio
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        items = list(
-            filter(
-                None,
-                pool.map(lambda bc: item_fetcher(*bc), bucket_key_pairs),
-            )
+    if item_fetcher is None:
+        items, failed = asyncio.run(
+            _fetch_items_async(bucket_key_pairs, concurrency=fetch_concurrency)
         )
+        fetch_failures = len(failed)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(lambda bc: item_fetcher(*bc), bucket_key_pairs))
+        items = [r for r in results if r is not None]
+        fetch_failures = len(results) - len(items)
 
     if not items:
-        return [], Counter()
+        return [], Counter(), len(bucket_key_pairs)
 
     fan_out_items = fan_out(items, partitioner)
     if not fan_out_items:
-        return [], Counter()
+        return [], Counter(), fetch_failures
 
     # Compute fan-out distribution: how many distinct cells did each item land in?
     cells_per_id: dict[str, set[str]] = defaultdict(set)
@@ -215,16 +296,127 @@ def _ingest_chunk_impl(
                 )
             )
 
-    return file_metas, fan_out_counter
+    return file_metas, fan_out_counter, fetch_failures
 
 
 #: Dask-delayed version of :func:`_ingest_chunk_impl`.
-#: Call ``ingest_chunk(...).compute()`` or pass to ``dask.compute()``.
 ingest_chunk = dask.delayed(_ingest_chunk_impl)
 
 
 # ---------------------------------------------------------------------------
-# Level 1 — compact_group
+# Phase 1 (file-level) — ingest_file
+# ---------------------------------------------------------------------------
+
+
+def _ingest_file_impl(
+    inv_data_key: str,
+    inv_store: object,
+    partitioner: object,
+    warehouse_store: object,
+    chunk_size: int,
+    max_workers: int,
+    since: datetime | None,
+    item_fetcher: object = None,
+    fetch_concurrency: int = 256,
+) -> tuple[list[FileMetadata], Counter, int, int]:
+    """
+    Phase 1 worker (file-level): fetch one inventory Parquet file, process all
+    STAC items it references, and write GeoParquet part files to the warehouse.
+
+    Unlike :func:`_ingest_chunk_impl`, this function receives only a tiny S3
+    key reference — the inventory Parquet is downloaded by the worker itself.
+    This keeps the Dask graph small regardless of inventory file size.
+
+    Internally the items are processed in batches of *chunk_size* using a
+    thread pool (same parallelism model as :func:`_ingest_chunk_impl`).
+
+    Parameters
+    ----------
+    inv_data_key:
+        Object key of the inventory Parquet file within *inv_store*.
+    inv_store:
+        Authenticated ``obstore``-compatible store for the inventory bucket.
+        Credentials are embedded in the store object so no credential lookup
+        is required on the remote worker.
+    partitioner:
+        An :class:`~earthcatalog.core.partitioner.AbstractPartitioner` instance.
+    warehouse_store:
+        An ``obstore``-compatible store for GeoParquet output.
+    chunk_size:
+        Number of STAC items per internal processing batch.
+    max_workers:
+        Thread-pool size for parallel STAC item fetching within each batch.
+    since:
+        When set, only inventory rows modified on or after this timestamp
+        are processed.
+
+    Returns
+    -------
+    A tuple of:
+
+    - ``list[FileMetadata]`` — one entry per ``(grid_partition, year)`` group
+      written across all batches.
+    - ``Counter[int]`` — fan-out distribution across all batches.
+    - ``int`` — total number of ``.stac.json`` source items processed.
+    - ``int`` — total number of items that failed to fetch across all batches.
+    """
+    import io as _io
+
+    # Import here so the function is self-contained on the remote worker.
+    from earthcatalog.pipelines.incremental import _iter_inventory_parquet
+
+    raw_bytes = bytes(obstore.get(inv_store, inv_data_key).bytes())
+    pairs = [
+        (b, k)
+        for b, k in _iter_inventory_parquet(_io.BytesIO(raw_bytes), since=since)
+        if k.endswith(".stac.json")
+    ]
+
+    n_pairs = len(pairs)
+    n_chunks = (n_pairs + chunk_size - 1) // chunk_size if n_pairs else 0
+    file_label = inv_data_key.rsplit("/", 1)[-1]
+    print(f"[{file_label}] {n_pairs:,} items → {n_chunks} chunks")
+
+    all_metas: list[FileMetadata] = []
+    all_fan_out: Counter = Counter()
+    source_items = 0
+    total_fetch_failures = 0
+    chunk_id = 0
+
+    for i in range(0, len(pairs), chunk_size):
+        batch = pairs[i : i + chunk_size]
+        if not batch:
+            continue
+        metas, fan_out_ctr, fetch_failures = _ingest_chunk_impl(
+            batch,
+            partitioner,
+            warehouse_store,
+            chunk_id,
+            item_fetcher,
+            max_workers=max_workers,
+            fetch_concurrency=fetch_concurrency,
+        )
+        all_metas.extend(metas)
+        all_fan_out += fan_out_ctr
+        source_items += len(batch)
+        total_fetch_failures += fetch_failures
+        chunk_id += 1
+        print(
+            f"[{file_label}] chunk {chunk_id}/{n_chunks} done"
+            f" — {source_items:,}/{n_pairs:,} items"
+            f", {len(all_metas)} part files so far"
+            f", {total_fetch_failures} fetch failures"
+        )
+
+    return all_metas, all_fan_out, source_items, total_fetch_failures
+
+
+#: Dask-delayed version of :func:`_ingest_file_impl`.
+ingest_file = dask.delayed(_ingest_file_impl)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — compact_group
 # ---------------------------------------------------------------------------
 
 
@@ -234,27 +426,31 @@ def _compact_group_impl(
     store: object,
 ) -> FileMetadata:
     """
-    Level 1 worker: merge all part files for one ``(cell, year)`` bucket,
-    deduplicate rows by ``id``, and remove orphan Parquet files from the
-    bucket's prefix.
+    Phase 2 worker: merge all part files for one ``(cell, year)`` bucket,
+    deduplicate rows by ``id``, sort, and write one consolidated GeoParquet
+    file to *store*.
 
-    If the bucket has only one file **and** there are no orphan files in the
-    prefix, the file is returned as-is (no I/O).
+    If the bucket has only one file the file is returned as-is (no I/O).
 
-    Steps for multi-file buckets (or buckets with orphans):
+    Steps for multi-file buckets:
 
-    1. **Orphan sweep** — list all ``.parquet`` files under
-       ``grid_partition=<cell>/year=<year>/``; delete any that are neither in
-       *file_metas* nor the *out_key*.
-    2. **Download** all part files from *store*.
-    3. **Concatenate** Arrow tables (schema metadata including ``geo`` and
+    1. **Download** all part files from *store*.
+    2. **Concatenate** Arrow tables (schema metadata including ``geo`` and
        ``ARROW:extension:name: geoarrow.wkb`` is preserved from the first
        table).
-    4. **Deduplicate** on ``id``: sort by ``(id ASC, updated DESC NULLS LAST)``
+    3. **Deduplicate** on ``id``: sort by ``(id ASC, updated DESC NULLS LAST)``
        and keep the first (most-recent) occurrence of each id.
-    5. **Sort** by ``(platform, datetime)`` for Parquet locality.
-    6. **Write** one consolidated GeoParquet file to *store* at *out_key*.
-    7. **Delete** all input part files.
+    4. **Sort** by ``(platform, datetime)`` for Parquet locality.
+    5. **Write** one consolidated GeoParquet file to *store* at *out_key*.
+    6. **Delete** all input part files.
+
+    .. note::
+        The orphan sweep (deleting ``part_`` files not in this run) was
+        intentionally removed from this function.  It is only safe when one
+        writer owns a given ``(cell, year)`` prefix at a time, which is
+        guaranteed only in ``final_compact.py``.  Running it here during
+        concurrent ingest caused workers to delete each other's registered
+        part files (race condition).
 
     Parameters
     ----------
@@ -273,30 +469,9 @@ def _compact_group_impl(
     """
     cell = file_metas[0].grid_partition
     year = file_metas[0].year
-    year_str = str(year) if year is not None else "unknown"
-    prefix = f"grid_partition={cell}/year={year_str}/"
-    known_keys = {fm.s3_key for fm in file_metas} | {out_key}
 
     # ------------------------------------------------------------------
-    # Orphan sweep — delete any .parquet files in the prefix that are not
-    # among the known part files or the output key.
-    # obstore.list() returns a list of batches; each batch is a list of dicts.
-    # ------------------------------------------------------------------
-    try:
-        for batch in obstore.list(store, prefix=prefix):
-            for obj in batch:
-                key = obj["path"]
-                if key.endswith(".parquet") and key not in known_keys:
-                    try:
-                        obstore.delete(store, key)
-                        print(f"INFO: deleted orphan {key}")
-                    except Exception as exc:
-                        print(f"WARN: could not delete orphan {key}: {exc}")
-    except Exception as exc:
-        print(f"WARN: orphan sweep failed for {prefix}: {exc}")
-
-    # ------------------------------------------------------------------
-    # Single-file passthrough — only after orphan sweep.
+    # Single-file passthrough.
     # ------------------------------------------------------------------
     if len(file_metas) == 1:
         return file_metas[0]
@@ -455,6 +630,7 @@ def _write_ingest_stats(
     h3_resolution: int,
     report_location: str | None = None,
     inventory_file: str | None = None,
+    fetch_failures: int = 0,
 ) -> None:
     """
     Append one run record to the ingest stats JSON file and, if the target is
@@ -482,6 +658,7 @@ def _write_ingest_stats(
     h3_resolution       H3 resolution used for spatial partitioning
     source_items        number of STAC items read from the inventory
     total_rows          total rows written (source_items × avg_fan_out)
+    fetch_failures      number of items that failed to fetch after retries
     unique_cells        number of distinct H3 cells with data
     unique_years        number of distinct acquisition years with data
     files_written       number of Parquet files registered in Iceberg
@@ -497,6 +674,7 @@ def _write_ingest_stats(
         "h3_resolution": h3_resolution,
         "source_items": source_items,
         "total_rows": total_rows,
+        "fetch_failures": fetch_failures,
         "unique_cells": len({fm.grid_partition for fm in final_metas}),
         "unique_years": len({fm.year for fm in final_metas}),
         "files_written": len(final_metas),
@@ -515,35 +693,15 @@ def _write_ingest_stats(
 
     # Always write to a local staging file first
     if target_s3:
+        import configparser
+        import os
         import tempfile
 
-        _tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        local_stats_path = Path(_tmp.name)
-        _tmp.close()
-    else:
-        local_stats_path = Path(effective)
-        local_stats_path.parent.mkdir(parents=True, exist_ok=True)
-
-    records: list[dict] = []
-    if local_stats_path.exists():
-        try:
-            records = json.loads(local_stats_path.read_text())
-        except Exception:
-            records = []  # corrupt file — start fresh
-
-    records.append(record)
-    local_stats_path.write_text(json.dumps(records, indent=2))
-
-    if target_s3:
-        # Upload to S3: derive bucket + key from the s3:// URI
-        import obstore
+        import obstore as _obstore
+        from obstore.store import S3Store
 
         no_scheme = effective.removeprefix("s3://")
         s3_bucket, s3_key = no_scheme.split("/", 1)
-        import configparser
-        import os
-
-        from obstore.store import S3Store
 
         key_id = os.environ.get("AWS_ACCESS_KEY_ID")
         secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
@@ -565,7 +723,34 @@ def _write_ingest_stats(
         if token:
             sk["aws_session_token"] = token
         rpt_store = S3Store(**sk)
-        obstore.put(rpt_store, s3_key, local_stats_path.read_bytes())
+
+        _tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        local_stats_path = Path(_tmp.name)
+        _tmp.close()
+
+        # Download existing stats from S3 before appending so we don't lose
+        # records from previous mini-runs (Bug 1 fix).
+        try:
+            existing_bytes = bytes(_obstore.get(rpt_store, s3_key).bytes())
+            local_stats_path.write_bytes(existing_bytes)
+        except Exception:
+            pass  # file doesn't exist yet — start fresh
+    else:
+        local_stats_path = Path(effective)
+        local_stats_path.parent.mkdir(parents=True, exist_ok=True)
+
+    records: list[dict] = []
+    if local_stats_path.exists():
+        try:
+            records = json.loads(local_stats_path.read_text())
+        except Exception:
+            records = []  # corrupt file — start fresh
+
+    records.append(record)
+    local_stats_path.write_text(json.dumps(records, indent=2))
+
+    if target_s3:
+        _obstore.put(rpt_store, s3_key, local_stats_path.read_bytes())
         local_stats_path.unlink(missing_ok=True)
         print(f"Ingest stats: {effective}")
     else:
@@ -587,6 +772,7 @@ def run_backfill(
     h3_resolution: int = 1,
     chunk_size: int = 20_000,
     max_workers_per_task: int = 16,
+    fetch_concurrency: int = 256,
     compact: bool = True,
     compact_threshold: int = 2,
     limit: int | None = None,
@@ -594,21 +780,22 @@ def run_backfill(
     since: datetime | None = None,
     report_location: str | None = None,
     per_file_mini_runs: bool = True,
+    files_per_batch: int = 1,
     grid_config=None,
 ) -> None:
     """
-    Three-level Dask distributed backfill pipeline.
+    Three-phase Dask distributed backfill pipeline.
 
-    Level 0 — ``ingest_chunk`` tasks (one per *chunk_size* items):
+    Phase 1 — ``ingest_chunk`` tasks (one per *chunk_size* items):
         Each Dask worker fetches STAC items, fans them out, and writes
         GeoParquet files to *warehouse_store*.  Returns ``FileMetadata`` only.
 
-    Level 1 — ``compact_group`` tasks (one per ``(cell, year)`` bucket):
+    Phase 2 — ``compact_group`` tasks (one per ``(cell, year)`` bucket):
         Only dispatched when *compact* is ``True`` and a bucket has ≥
         *compact_threshold* part files.  Merges part files into one
         consolidated file.
 
-    Level 2 — catalog registration (head node):
+    Phase 3 — catalog registration (head node):
         ``table.add_files()`` is called once with all final file paths →
         exactly one Iceberg snapshot regardless of chunk count.
 
@@ -624,9 +811,9 @@ def run_backfill(
 
        a. Acquire the S3 lock.
        b. Download the catalog → open the Iceberg table.
-       c. Level 0: ingest the file's items.
-       d. Level 1: compact the file's buckets.
-       e. Level 2: ``table.add_files()`` + ``upload_catalog()``.
+       c. Ingest: fetch items, fan-out, write GeoParquet.
+       d. Compact: merge part files per (cell, year) bucket.
+       e. Register: ``table.add_files()`` + ``upload_catalog()``.
        f. Append one record to ``ingest_stats.json`` (with
           ``inventory_file`` set to the data-file key).
        g. Release the lock.
@@ -663,12 +850,12 @@ def run_backfill(
     h3_resolution:
         H3 grid resolution used when *partitioner* is ``None``.
     chunk_size:
-        Number of inventory items per Level 0 task.
+        Number of inventory items per ingest task.
     max_workers_per_task:
         Thread-pool size used inside each ``ingest_chunk`` worker for
         parallel item fetching.
     compact:
-        When ``True`` (default), dispatch Level 1 compact tasks for any
+        When ``True`` (default), dispatch compact tasks for any
         bucket with ≥ *compact_threshold* part files.
     compact_threshold:
         Minimum part-file count for a bucket to be compacted.
@@ -689,6 +876,15 @@ def run_backfill(
         each manifest data file as a separate mini-run with its own lock
         cycle and catalog upload.  Set to ``False`` to use the original
         monolithic behaviour regardless of inventory type.
+    files_per_batch:
+        Number of manifest data files to read before submitting tasks to
+        Dask.  Increasing this saturates the worker pool when individual
+        inventory files are small (few chunks each).  Checkpoint granularity
+        stays per-file — one ``ingest_stats.json`` record is written for
+        every inventory file in the batch after the batch completes.
+        Default ``1`` preserves the original one-file-at-a-time behaviour.
+        Recommended: set to ``ceil(n_workers / expected_chunks_per_file)``
+        so the Dask graph always has at least ``n_workers`` tasks ready.
     """
     if partitioner is None:
         partitioner = H3Partitioner(resolution=h3_resolution)
@@ -697,6 +893,63 @@ def run_backfill(
         if root.startswith("s3://"):
             return root.rstrip("/") + "/" + key
         return str(Path(root) / key)
+
+    def _build_ingest_tasks(
+        item_pairs: list[tuple[str, str]],
+        chunk_id_start: int,
+    ) -> tuple[list, int, int]:
+        """
+        Build Dask delayed ingest tasks for *item_pairs*.
+
+        Returns
+        -------
+        tasks:
+            List of ``dask.delayed`` ingest_chunk calls.
+        source_items:
+            Number of ``.stac.json`` items found in *item_pairs*.
+        next_chunk_id:
+            Chunk-id counter after the last task — pass as *chunk_id_start*
+            for the next call within the same batch to avoid name collisions.
+        """
+        tasks: list = []
+        chunk: list[tuple[str, str]] = []
+        chunk_id = chunk_id_start
+        source_items = 0
+        for bucket, key in item_pairs:
+            if not key.endswith(".stac.json"):
+                continue
+            chunk.append((bucket, key))
+            source_items += 1
+            if len(chunk) >= chunk_size:
+                tasks.append(
+                    ingest_chunk(
+                        list(chunk),
+                        partitioner,
+                        warehouse_store,
+                        chunk_id,
+                        item_fetcher,
+                        max_workers_per_task,
+                        fetch_concurrency,
+                    )
+                )
+                chunk.clear()
+                chunk_id += 1
+            if limit and source_items >= limit:
+                break
+        if chunk:
+            tasks.append(
+                ingest_chunk(
+                    list(chunk),
+                    partitioner,
+                    warehouse_store,
+                    chunk_id,
+                    item_fetcher,
+                    max_workers_per_task,
+                    fetch_concurrency,
+                )
+            )
+            chunk_id += 1
+        return tasks, source_items, chunk_id
 
     def _run_one(
         item_pairs: list[tuple[str, str]],
@@ -724,46 +977,10 @@ def run_backfill(
         )
         table = get_or_create_table(catalog, grid_config=grid_config)
 
-        # Level 0 ─ dispatch ingest_chunk tasks
-        level0_tasks = []
-        chunk: list[tuple[str, str]] = []
-        chunk_id = 0
-        total_items = 0
+        # Ingest ─ dispatch ingest_chunk tasks
+        ingest_tasks, total_items, _ = _build_ingest_tasks(item_pairs, chunk_id_start=0)
 
-        for bucket, key in item_pairs:
-            if not key.endswith(".stac.json"):
-                continue
-            chunk.append((bucket, key))
-            total_items += 1
-            if len(chunk) >= chunk_size:
-                level0_tasks.append(
-                    ingest_chunk(
-                        list(chunk),
-                        partitioner,
-                        warehouse_store,
-                        chunk_id,
-                        item_fetcher,
-                        max_workers_per_task,
-                    )
-                )
-                chunk.clear()
-                chunk_id += 1
-            if limit and total_items >= limit:
-                break
-
-        if chunk:
-            level0_tasks.append(
-                ingest_chunk(
-                    list(chunk),
-                    partitioner,
-                    warehouse_store,
-                    chunk_id,
-                    item_fetcher,
-                    max_workers_per_task,
-                )
-            )
-
-        if not level0_tasks:
+        if not ingest_tasks:
             print(f"  no .stac.json items found in {inv_file_key or 'chunk'}")
             # Still write stats so the caller knows this file was processed.
             _write_ingest_stats(
@@ -780,14 +997,16 @@ def run_backfill(
             )
             return
 
-        print(f"Level 0: {len(level0_tasks)} ingest_chunk tasks ({total_items} items)")
-        all_nested: tuple[tuple[list[FileMetadata], Counter], ...] = dask.compute(*level0_tasks)
-        all_metas: list[FileMetadata] = [fm for file_metas, _ in all_nested for fm in file_metas]
-        fan_out_counter: Counter[int] = sum((counter for _, counter in all_nested), Counter())
+        print(f"Ingest: {len(ingest_tasks)} chunks ({total_items} items)")
+        all_nested: tuple[tuple[list[FileMetadata], Counter, int], ...] = dask.compute(
+            *ingest_tasks
+        )
+        all_metas: list[FileMetadata] = [fm for file_metas, _, _ in all_nested for fm in file_metas]
+        fan_out_counter: Counter[int] = sum((counter for _, counter, _ in all_nested), Counter())
         total_rows = sum(fm.row_count for fm in all_metas)
-        print(f"Level 0 done: {len(all_metas)} files, {total_rows} rows")
+        print(f"Ingest done: {len(all_metas)} files, {total_rows} rows")
 
-        # Level 1 ─ compact_group tasks
+        # Compact ─ merge part files within each (cell, year) bucket
         final_metas: list[FileMetadata] = []
 
         if compact:
@@ -795,8 +1014,8 @@ def run_backfill(
             for fm in all_metas:
                 buckets[(fm.grid_partition, fm.year)].append(fm)
 
-            level1_tasks = []
-            level1_pass_through: list[FileMetadata] = []
+            compact_tasks = []
+            compact_pass_through: list[FileMetadata] = []
 
             for (cell, year), fms in buckets.items():
                 if len(fms) >= compact_threshold:
@@ -805,28 +1024,28 @@ def run_backfill(
                         f"grid_partition={cell}/year={year_str}/"
                         f"compacted_{uuid.uuid4().hex[:8]}.parquet"
                     )
-                    level1_tasks.append(compact_group(fms, out_key, warehouse_store))
+                    compact_tasks.append(compact_group(fms, out_key, warehouse_store))
                 else:
-                    level1_pass_through.extend(fms)
+                    compact_pass_through.extend(fms)
 
             print(
-                f"Level 1: {len(level1_tasks)} compact tasks, "
-                f"{len(level1_pass_through)} files passed through"
+                f"Compact: {len(compact_tasks)} merge tasks, "
+                f"{len(compact_pass_through)} files passed through"
             )
 
-            if level1_tasks:
-                compacted: tuple[FileMetadata, ...] = dask.compute(*level1_tasks)
+            if compact_tasks:
+                compacted: tuple[FileMetadata, ...] = dask.compute(*compact_tasks)
                 final_metas.extend(compacted)
 
-            final_metas.extend(level1_pass_through)
+            final_metas.extend(compact_pass_through)
         else:
             final_metas = all_metas
 
-        # Level 2 ─ register all files in one Iceberg snapshot
+        # Register ─ add all files to the Iceberg catalog in one snapshot
         final_paths = [_join_path(warehouse_root, fm.s3_key) for fm in final_metas]
 
         if final_paths:
-            print(f"Level 2: registering {len(final_paths)} files in one snapshot")
+            print(f"Register: {len(final_paths)} files in one Iceberg snapshot")
             table.add_files(final_paths)
 
         upload_catalog(catalog_path)
@@ -856,10 +1075,21 @@ def run_backfill(
     is_manifest = inventory_path.endswith("manifest.json")
 
     if per_file_mini_runs and is_manifest:
-        # ── Spot-resilient path: one mini-run per manifest data file ──────
+        # ── Spot-resilient path: one Dask task per manifest data file ─────
+        #
+        # Each worker receives only the S3 key of its inventory Parquet file
+        # (~100 bytes) — the actual (bucket, key) pairs are never serialised
+        # into the Dask graph, so graph size stays near zero regardless of
+        # file size.
+        #
+        # All pending files are submitted at once.  When a dask.distributed
+        # Client is active (Coiled / LocalCluster), as_completed() is used so
+        # each file is checkpointed the moment it finishes, maximising both
+        # worker utilisation and checkpoint granularity.  When no distributed
+        # client is available (synchronous scheduler / tests), files are
+        # processed one at a time via the original _run_one path.
         effective_report = report_location
         if effective_report is None:
-            # Auto-derive sibling of catalog (same logic as _write_ingest_stats)
             if catalog_path.startswith("s3://"):
                 cat_dir = catalog_path.rsplit("/", 1)[0]
                 effective_report = f"{cat_dir}/ingest_stats.json"
@@ -870,7 +1100,7 @@ def run_backfill(
         if already_done:
             print(f"Checkpoint: {len(already_done)} data file(s) already processed — will skip")
 
-        _source_bucket, dest_store, data_keys = _list_manifest_files(inventory_path)
+        _source_bucket, _dest_store, data_keys = _list_manifest_files(inventory_path)
         pending = [k for k in data_keys if k not in already_done]
         skipped = len(data_keys) - len(pending)
         print(
@@ -878,24 +1108,130 @@ def run_backfill(
             f"{skipped} already processed, {len(pending)} to go"
         )
 
-        for file_idx, data_key in enumerate(pending):
-            print(f"\n── File {file_idx + 1}/{len(pending)}: {data_key}")
-            # Collect (bucket, key) pairs from this one inventory file
-            item_pairs = [
-                (bkt, k)
-                for bkt, k in _iter_inventory_file_from_store(dest_store, data_key, since=since)
-            ]
+        def _finish_file(
+            inv_key: str,
+            file_metas: list[FileMetadata],
+            fan_out_ctr: Counter,
+            source_items: int,
+            _table: object,
+            fetch_failures: int = 0,
+        ) -> list[FileMetadata]:
+            """
+            Register and checkpoint one completed inventory file.
+            Compaction is intentionally omitted here — it is unsafe when multiple
+            workers share the same warehouse prefix, because each worker's orphan
+            sweep would delete part files written by other workers.
+            Compaction must be done as a separate phase via final_compact.py, where
+            exactly one task owns each (cell, year) prefix at a time.
+            Returns the final FileMetadata list for this file.
+            """
+            total_rows = sum(fm.row_count for fm in file_metas)
+            final_metas: list[FileMetadata] = file_metas
 
-            def _mini_run(
-                pairs: list[tuple[str, str]] = item_pairs, key: str | None = data_key
-            ) -> None:
-                _run_one(pairs, inv_file_key=key, total_items_hint=len(pairs))
+            final_paths = [_join_path(warehouse_root, fm.s3_key) for fm in final_metas]
+            if final_paths:
+                print(f"  Register: {len(final_paths)} files")
+                _table.add_files(final_paths)
 
-            if use_lock:
-                with S3Lock(owner="backfill"):
+            upload_catalog(catalog_path)
+
+            _write_ingest_stats(
+                catalog_path=catalog_path,
+                inventory_path=inventory_path,
+                since=since,
+                source_items=source_items,
+                total_rows=total_rows,
+                final_metas=final_metas,
+                fan_out_counter=fan_out_ctr,
+                h3_resolution=h3_resolution,
+                report_location=report_location,
+                inventory_file=inv_key,
+                fetch_failures=fetch_failures,
+            )
+            print(
+                f"  Done: {source_items:,} items → {total_rows:,} rows "
+                f"across {len(final_paths)} files  [{inv_key.rsplit('/', 1)[-1]}]"
+            )
+            if fetch_failures:
+                print(
+                    f"  WARNING: {fetch_failures:,} items failed to fetch "
+                    f"({100 * fetch_failures / source_items:.1f}% of chunk)"
+                )
+            return final_metas
+
+        # Try to use dask.distributed as_completed for parallel execution
+        try:
+            from dask.distributed import as_completed as _as_completed
+            from dask.distributed import get_client as _get_client
+
+            _client = _get_client()
+            _use_distributed = True
+        except Exception:
+            _use_distributed = False
+
+        if _use_distributed:
+            # Submit all pending files at once — workers pull tasks as they
+            # become free, keeping all N workers busy throughout.
+            print(f"Submitting {len(pending)} ingest tasks to distributed cluster …")
+            future_to_key = {
+                _client.submit(
+                    _ingest_file_impl,
+                    inv_key,
+                    _dest_store,
+                    partitioner,
+                    warehouse_store,
+                    chunk_size,
+                    max_workers_per_task,
+                    since,
+                ): inv_key
+                for inv_key in pending
+            }
+
+            completed = 0
+            for future in _as_completed(future_to_key):
+                inv_key = future_to_key[future]
+                completed += 1
+                print(f"\n── Completed {completed}/{len(pending)}: {inv_key.rsplit('/', 1)[-1]}")
+                file_metas, fan_out_ctr, source_items, fetch_failures = future.result()
+
+                def _finish(
+                    _key: str = inv_key,
+                    _metas: list = file_metas,
+                    _ctr: Counter = fan_out_ctr,
+                    _si: int = source_items,
+                    _ff: int = fetch_failures,
+                ) -> None:
+                    download_catalog(catalog_path)
+                    _cat = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+                    _tbl = get_or_create_table(_cat, grid_config=grid_config)
+                    _finish_file(_key, _metas, _ctr, _si, _tbl, _ff)
+                    print(f"Snapshots in catalog: {len(_tbl.history())}")
+
+                if use_lock:
+                    with S3Lock(owner="backfill"):
+                        _finish()
+                else:
+                    _finish()
+
+        else:
+            # ── Fallback: sequential (synchronous scheduler / tests) ───────
+            for file_idx, inv_key in enumerate(pending):
+                print(f"\n── File {file_idx + 1}/{len(pending)}: {inv_key}")
+                item_pairs = list(
+                    _iter_inventory_file_from_store(_dest_store, inv_key, since=since)
+                )
+
+                def _mini_run(
+                    pairs: list[tuple[str, str]] = item_pairs,
+                    key: str | None = inv_key,
+                ) -> None:
+                    _run_one(pairs, inv_file_key=key, total_items_hint=len(pairs))
+
+                if use_lock:
+                    with S3Lock(owner="backfill"):
+                        _mini_run()
+                else:
                     _mini_run()
-            else:
-                _mini_run()
 
     else:
         # ── Monolithic path: original behaviour ───────────────────────────
@@ -951,7 +1287,9 @@ def _local_cluster_context(n_workers: int, threads_per_worker: int = 1) -> objec
     return _ctx()
 
 
-def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs: object) -> object:
+def _coiled_context(
+    n_workers: int, worker_vm_types: list[str] | None = None, **extra_kwargs: object
+) -> object:
     """
     Return a context manager that starts a Coiled cloud cluster.
 
@@ -963,9 +1301,9 @@ def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs: 
     ----------
     n_workers:
         Number of Coiled cloud workers.
-    vm_type:
-        Cloud VM instance type (e.g. ``m6i.xlarge``).  Passed to
-        ``coiled.Cluster(vm_type=...)``.
+    worker_vm_types:
+        Cloud VM instance types for workers (e.g. ``["m7i.xlarge"]``).
+        Passed to ``coiled.Cluster(worker_vm_types=...)``.
     **extra_kwargs:
         Any additional keyword arguments forwarded verbatim to
         ``coiled.Cluster()``.  For example ``software="my-env"``,
@@ -981,8 +1319,8 @@ def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs: 
             raise ImportError("coiled is not installed.  Run: pip install coiled") from None
 
         kwargs: dict = {"n_workers": n_workers, **extra_kwargs}
-        if vm_type is not None:
-            kwargs["vm_type"] = vm_type
+        if worker_vm_types is not None:
+            kwargs["worker_vm_types"] = worker_vm_types
 
         from dask.distributed import Client
 
@@ -1153,6 +1491,13 @@ examples
         help="Thread-pool size inside each ingest_chunk worker (default: 16).",
     )
     parser.add_argument(
+        "--fetch-concurrency",
+        type=int,
+        default=256,
+        metavar="N",
+        help="Max concurrent async item fetches per worker (default: 256).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -1239,6 +1584,18 @@ examples
         metavar="N",
         help="Threads per worker for --scheduler local (default: 1).",
     )
+    parser.add_argument(
+        "--files-per-batch",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of manifest data files to read before submitting tasks to Dask. "
+            "Increase to saturate the worker pool when inventory files are small "
+            "(rule of thumb: ceil(n_workers / chunks_per_file), e.g. 4 with 20 workers "
+            "and ~5-chunk files). Default 1 preserves original one-file-at-a-time behaviour."
+        ),
+    )
 
     # Explicit coiled options (take precedence over pass-through kwargs)
     coiled_group = parser.add_argument_group(
@@ -1257,10 +1614,11 @@ examples
         help="Number of Coiled cloud workers (default: 10).",
     )
     coiled_group.add_argument(
-        "--coiled-vm-type",
+        "--coiled-worker-vm-types",
+        nargs="+",
         default=None,
         metavar="INSTANCE_TYPE",
-        help="Cloud VM instance type (e.g. m6i.xlarge).",
+        help="Cloud VM instance types for workers (e.g. m7i.xlarge).",
     )
 
     args, unknown = parser.parse_known_args()
@@ -1273,9 +1631,9 @@ examples
     # Build coiled kwargs: pass-through extras merged with explicit flags
     # ------------------------------------------------------------------
     coiled_extra = _parse_coiled_extra(unknown)
-    # Explicit --coiled-n-workers / --coiled-vm-type take precedence
+    # Explicit --coiled-n-workers / --coiled-worker-vm-types take precedence
     coiled_extra.pop("n_workers", None)
-    coiled_extra.pop("vm_type", None)
+    coiled_extra.pop("worker_vm_types", None)
 
     # ------------------------------------------------------------------
     # Build stores from --catalog and --warehouse URIs
@@ -1369,7 +1727,7 @@ examples
     else:  # coiled
         ctx = _coiled_context(
             n_workers=args.coiled_n_workers,
-            vm_type=args.coiled_vm_type,
+            worker_vm_types=args.coiled_worker_vm_types,
             **coiled_extra,
         )
 
@@ -1385,6 +1743,7 @@ examples
             h3_resolution=args.h3_resolution,
             chunk_size=args.chunk_size,
             max_workers_per_task=args.fetch_workers,
+            fetch_concurrency=args.fetch_concurrency,
             compact=not args.no_compact,
             compact_threshold=args.compact_threshold,
             limit=args.limit,
@@ -1392,6 +1751,7 @@ examples
             since=since,
             report_location=report_location,
             per_file_mini_runs=not args.no_per_file_mini_runs,
+            files_per_batch=args.files_per_batch,
         )
 
 

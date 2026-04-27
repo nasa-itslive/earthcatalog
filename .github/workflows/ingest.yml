@@ -1,0 +1,137 @@
+name: Ingest
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # 04:00 UTC every Monday
+  workflow_dispatch:
+    inputs:
+      delta_date:
+        description: "Date of the delta to ingest (YYYY-MM-DD). Defaults to today."
+        required: false
+        default: ""
+      scheduler:
+        description: "Scheduler (local for GitHub runner, coiled for spot cluster)"
+        type: choice
+        options:
+          - local
+          - coiled
+          - synchronous
+        default: local
+      workers:
+        description: "Number of Dask workers (local scheduler)"
+        required: false
+        default: "4"
+      coiled_n_workers:
+        description: "Number of Coiled workers"
+        required: false
+        default: "10"
+      coiled_vm_type:
+        description: "Coiled VM type"
+        required: false
+        default: "c6i.xlarge"
+      chunk_size:
+        description: "Items per chunk"
+        required: false
+        default: "10000"
+      consolidate:
+        description: "Run consolidation after ingest"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  WAREHOUSE_HASH: s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
+  DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
+  WAREHOUSE: s3://its-live-data/test-space/stac/catalog/warehouse
+
+jobs:
+  ingest:
+    name: Ingest delta
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine delta path
+        id: delta
+        run: |
+          if [ -n "${{ github.event.inputs.delta_date }}" ]; then
+            DATE="${{ github.event.inputs.delta_date }}"
+          else
+            DATE=$(date -u +%Y-%m-%d)
+          fi
+          DELTA_PATH="${{ env.DELTA_PREFIX }}/pending/delta_${DATE}.parquet"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "delta_path=$DELTA_PATH" >> "$GITHUB_OUTPUT"
+          echo "Checking $DELTA_PATH ..."
+          aws s3 ls "$DELTA_PATH" || {
+            echo "::error::Delta file not found: $DELTA_PATH"
+            exit 1
+          }
+
+      - name: Run delta ingest
+        run: |
+          SCHEDULER="${{ github.event.inputs.scheduler || 'local' }}"
+          EXTRA_ARGS=""
+
+          if [ "$SCHEDULER" = "local" ]; then
+            EXTRA_ARGS="--workers ${{ github.event.inputs.workers || '4' }}"
+          elif [ "$SCHEDULER" = "coiled" ]; then
+            EXTRA_ARGS="--coiled-n-workers ${{ github.event.inputs.coiled_n_workers || '10' }} --coiled-vm-type ${{ github.event.inputs.coiled_vm_type || 'c6i.xlarge' }}"
+          fi
+
+          uv run python scripts/run_backfill_v2.py \
+            --inventory "${{ steps.delta.outputs.delta_path }}" \
+            --delta \
+            --scheduler "$SCHEDULER" \
+            --chunk-size "${{ github.event.inputs.chunk_size || '10000' }}" \
+            $EXTRA_ARGS
+
+      - name: Update warehouse hash index
+        run: |
+          uv run python scripts/update_hash_index.py \
+            "${{ steps.delta.outputs.delta_path }}" \
+            --warehouse-hash ${{ env.WAREHOUSE_HASH }}
+
+      - name: Move delta to ingested
+        if: success()
+        run: |
+          INGESTED="${{ env.DELTA_PREFIX }}/ingested/delta_${{ steps.delta.outputs.date }}.done"
+          aws s3 mv "${{ steps.delta.outputs.delta_path }}" "$INGESTED"
+
+      - name: Consolidate small parquet files
+        if: success() && github.event.inputs.consolidate != 'false'
+        run: |
+          uv run python scripts/consolidate.py \
+            --warehouse ${{ env.WAREHOUSE }} \
+            --catalog /tmp/earthcatalog.db \
+            --threshold 2 \
+            --use-lock
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Ingest Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Date: ${{ steps.delta.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Delta: \`${{ steps.delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Consolidate: ${{ github.event.inputs.consolidate || 'true' }}" >> "$GITHUB_STEP_SUMMARY"

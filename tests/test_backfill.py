@@ -16,7 +16,7 @@ TestCompactGroupImpl
 TestRunBackfillUnit
     Integration tests for ``run_backfill()`` using the *synchronous* Dask
     scheduler, a ``LocalStore`` warehouse, and a fully mocked item fetcher.
-    Exercises the full three-level pipeline (Level 0 → Level 1 → Level 2)
+    Exercises the full three-phase pipeline (Ingest → Compact → Register)
     without any real S3 traffic.
 
 TestRunBackfillDask
@@ -34,13 +34,14 @@ import json
 import uuid
 from datetime import UTC
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import dask
 import obstore
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import rustac
 from obstore.store import LocalStore, MemoryStore
 
 from earthcatalog.core import store_config
@@ -54,9 +55,11 @@ from earthcatalog.grids.h3_partitioner import H3Partitioner
 from earthcatalog.pipelines.backfill import (
     _compact_group_impl,
     _ingest_chunk_impl,
+    _ingest_file_impl,
     _write_ingest_stats,
     compact_group,
     ingest_chunk,
+    ingest_file,
     run_backfill,
 )
 
@@ -153,7 +156,7 @@ class TestIngestChunkImpl:
 
     def test_returns_file_metadata_list(self):
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -166,7 +169,7 @@ class TestIngestChunkImpl:
 
     def test_row_count_at_least_one_per_item(self):
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -179,7 +182,7 @@ class TestIngestChunkImpl:
     def test_each_file_has_single_grid_partition(self):
         """Every file must contain rows for exactly one grid_partition value."""
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -195,7 +198,7 @@ class TestIngestChunkImpl:
 
     def test_file_size_matches_actual_bytes(self):
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -209,7 +212,7 @@ class TestIngestChunkImpl:
     def test_hive_key_format(self):
         """Keys must follow grid_partition=<cell>/year=<year>/part_...parquet."""
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -225,7 +228,7 @@ class TestIngestChunkImpl:
 
     def test_chunk_id_in_filename(self):
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -237,7 +240,7 @@ class TestIngestChunkImpl:
     def test_empty_fetch_returns_empty_list(self):
         """If all fetches return None, no files should be written."""
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -248,7 +251,7 @@ class TestIngestChunkImpl:
 
     def test_geo_metadata_in_written_files(self):
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -262,7 +265,7 @@ class TestIngestChunkImpl:
 
     def test_int_fields_are_int32(self):
         store = MemoryStore()
-        metas, _ = _ingest_chunk_impl(
+        metas, _, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -278,14 +281,14 @@ class TestIngestChunkImpl:
         """ingest_chunk(...).compute() must return the same result as _impl()."""
         store = MemoryStore()
         with dask.config.set(scheduler="synchronous"):
-            metas_delayed, counter_delayed = ingest_chunk(
+            metas_delayed, counter_delayed, _ = ingest_chunk(
                 _ALL_PAIRS,
                 _PARTITIONER,
                 store,
                 0,
                 _mock_fetcher,
             ).compute()
-        metas_direct, counter_direct = _ingest_chunk_impl(
+        metas_direct, counter_direct, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             MemoryStore(),
@@ -297,6 +300,308 @@ class TestIngestChunkImpl:
         assert sum(m.row_count for m in metas_delayed) == sum(m.row_count for m in metas_direct)
         # Both counters must cover the same total item count.
         assert sum(counter_delayed.values()) == sum(counter_direct.values())
+
+    def test_fetch_failures_counted(self):
+        """_ingest_chunk_impl returns correct fetch_failures count when some items fail."""
+        good_pairs = _ALL_PAIRS[:4]
+        bad_pairs = [("missing-bucket", f"stac/ghost-{i}.stac.json") for i in range(3)]
+        all_pairs = good_pairs + bad_pairs
+
+        store = MemoryStore()
+        metas, counter, fetch_failures = _ingest_chunk_impl(
+            all_pairs,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
+            item_fetcher=_mock_fetcher,
+        )
+
+        assert fetch_failures == 3
+        assert sum(counter.values()) == len(good_pairs)
+        total_rows = sum(fm.row_count for fm in metas)
+        assert total_rows > 0
+
+    def test_all_fetch_failures_returns_empty_with_count(self):
+        """When all fetches fail, returns empty metas but correct failure count."""
+        bad_pairs = [("missing-bucket", f"stac/ghost-{i}.stac.json") for i in range(5)]
+
+        store = MemoryStore()
+        metas, counter, fetch_failures = _ingest_chunk_impl(
+            bad_pairs,
+            _PARTITIONER,
+            store,
+            chunk_id=0,
+            item_fetcher=_mock_fetcher,
+        )
+
+        assert metas == []
+        from collections import Counter as _Counter
+
+        assert counter == _Counter()
+        assert fetch_failures == 5
+
+    def test_retry_on_transient_failures(self):
+        """_fetch_item_async retries transient errors and succeeds on retry."""
+        import asyncio
+
+        from earthcatalog.pipelines.backfill import _fetch_item_async, _S3_FETCH_RETRIES
+
+        call_count = 0
+
+        async def _flaky_read(href, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise ConnectionError("transient network error")
+            return _STAC_ITEMS[0]
+
+        with patch.object(rustac, "read", side_effect=_flaky_read):
+            result = asyncio.run(_fetch_item_async("mock-bucket", "stac/item-0000.stac.json"))
+
+        assert result is not None
+        assert result["id"] == "backfill-item-0000"
+        assert call_count == 3
+
+    def test_retry_exhausted_raises(self):
+        """_fetch_item_async raises after exhausting all retries (fails loud)."""
+        import asyncio
+
+        from earthcatalog.pipelines.backfill import _fetch_item_async, _S3_FETCH_RETRIES
+
+        call_count = 0
+
+        async def _always_fail(href, **kw):
+            nonlocal call_count
+            call_count += 1
+            raise ConnectionError("persistent error")
+
+        with patch.object(rustac, "read", side_effect=_always_fail):
+            with patch.object(asyncio, "sleep", new_callable=AsyncMock):
+                with pytest.raises(RuntimeError, match="Failed to fetch"):
+                    asyncio.run(_fetch_item_async("mock-bucket", "stac/item-0000.stac.json"))
+
+        assert call_count == _S3_FETCH_RETRIES + 1
+
+    def test_fetch_items_async_handles_exceptions(self):
+        """_fetch_items_async catches task exceptions and returns them as failed."""
+        import asyncio
+        from unittest.mock import patch
+
+        import rustac
+
+        from earthcatalog.pipelines.backfill import _fetch_items_async
+
+        pairs = [
+            ("bucket", "works.stac.json"),
+            ("bucket", "bad.stac.json"),
+        ]
+
+        call_count = 0
+
+        async def _mock_read(href, **kw):
+            nonlocal call_count
+            call_count += 1
+            if "bad" in href:
+                raise ValueError("malformed key")
+            return {"id": "good-item", "type": "Feature"}
+
+        with patch.object(rustac, "read", side_effect=_mock_read):
+            items, failed = asyncio.run(_fetch_items_async(pairs, concurrency=2))
+
+        assert len(items) == 1
+        assert items[0]["id"] == "good-item"
+        assert len(failed) == 1
+        assert failed[0] == ("bucket", "bad.stac.json")
+
+
+# ---------------------------------------------------------------------------
+# TestIngestFileImpl
+# ---------------------------------------------------------------------------
+
+
+class TestIngestFileImpl:
+    """
+    Unit tests for ``_ingest_file_impl()`` — no real S3 traffic.
+
+    Strategy
+    --------
+    * A tiny inventory Parquet file is written to a ``MemoryStore``.
+    * ``earthcatalog.pipelines.incremental._get_authenticated_store`` is
+      patched to return that ``MemoryStore`` so the worker never hits AWS.
+    * The warehouse target is also a fresh ``MemoryStore``.
+    """
+
+    _INV_KEY = "inventory/data/fileA.parquet"
+    _INV_BUCKET = "mock-inv-bucket"
+
+    def _make_inventory_parquet_bytes(
+        self,
+        pairs: list[tuple[str, str]],
+        lm_dates: list[str] | None = None,
+    ) -> bytes:
+        """Return raw Parquet bytes for an inventory file."""
+        data: dict = {
+            "bucket": [b for b, _ in pairs],
+            "key": [k for _, k in pairs],
+        }
+        if lm_dates is not None:
+            data["last_modified_date"] = lm_dates
+        buf = io.BytesIO()
+        pq.write_table(pa.table(data), buf)
+        return buf.getvalue()
+
+    def _make_inv_store(self, parquet_bytes: bytes) -> MemoryStore:
+        """Seed a ``MemoryStore`` with inventory Parquet at ``_INV_KEY``."""
+        store = MemoryStore()
+        obstore.put(store, self._INV_KEY, parquet_bytes)
+        return store
+
+    def _run(
+        self,
+        pairs: list[tuple[str, str]],
+        chunk_size: int = 100,
+        lm_dates: list[str] | None = None,
+        since=None,
+    ) -> tuple:
+        """Call ``_ingest_file_impl`` with a pre-seeded MemoryStore as inv_store."""
+        raw = self._make_inventory_parquet_bytes(pairs, lm_dates=lm_dates)
+        inv_store = self._make_inv_store(raw)
+        warehouse_store = MemoryStore()
+
+        return _ingest_file_impl(
+            inv_data_key=self._INV_KEY,
+            inv_store=inv_store,
+            partitioner=_PARTITIONER,
+            warehouse_store=warehouse_store,
+            chunk_size=chunk_size,
+            max_workers=2,
+            since=since,
+            item_fetcher=_mock_fetcher,
+        )
+
+    # ------------------------------------------------------------------
+    # Return type & shape
+    # ------------------------------------------------------------------
+
+    def test_returns_four_tuple(self):
+        metas, counter, source_items, fetch_failures = self._run(_ALL_PAIRS)
+        assert isinstance(metas, list)
+        from collections import Counter as _Counter
+
+        assert isinstance(counter, _Counter)
+        assert isinstance(source_items, int)
+        assert isinstance(fetch_failures, int)
+
+    def test_source_items_count_equals_stac_pairs(self):
+        """source_items must equal the number of .stac.json pairs in inventory."""
+        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
+        assert source_items == len(_ALL_PAIRS)
+
+    def test_row_count_at_least_source_items(self):
+        """Total rows written ≥ source items (H3 fan-out inflates row count)."""
+        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
+        total_rows = sum(m.row_count for m in metas)
+        assert total_rows >= source_items
+
+    def test_returns_file_metadata_list(self):
+        from earthcatalog.core.transform import FileMetadata
+
+        metas, _, _, _ = self._run(_ALL_PAIRS)
+        assert len(metas) > 0
+        assert all(isinstance(m, FileMetadata) for m in metas)
+
+    def test_fan_out_counter_sums_to_source_items(self):
+        """sum(counter.values()) == source_items — every item is counted once."""
+        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
+        assert sum(counter.values()) == source_items
+
+    def test_fan_out_counter_times_count_equals_total_rows(self):
+        """sum(k * v) == total rows written."""
+        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
+        total_rows_metas = sum(m.row_count for m in metas)
+        total_rows_counter = sum(k * v for k, v in counter.items())
+        assert total_rows_counter == total_rows_metas
+
+    # ------------------------------------------------------------------
+    # Empty and filtered inventories
+    # ------------------------------------------------------------------
+
+    def test_empty_inventory_returns_zeros(self):
+        metas, counter, source_items, _ = self._run([])
+        assert metas == []
+        assert source_items == 0
+        assert sum(counter.values()) == 0
+
+    def test_non_stac_keys_excluded(self):
+        """Keys not ending in ``.stac.json`` must not be fetched or counted."""
+        non_stac_pairs = [("mock-bucket", "some/file.parquet"), ("mock-bucket", "other.json")]
+        metas, counter, source_items, _ = self._run(non_stac_pairs)
+        assert source_items == 0
+        assert metas == []
+
+    def test_mixed_stac_and_non_stac_keys(self):
+        """Only ``.stac.json`` entries contribute to source_items."""
+        stac_pairs = _ALL_PAIRS[:3]
+        non_stac = [("mock-bucket", "meta/file.parquet")]
+        mixed = stac_pairs + non_stac
+        _, _, source_items, _ = self._run(mixed)
+        assert source_items == len(stac_pairs)
+
+    # ------------------------------------------------------------------
+    # Chunking
+    # ------------------------------------------------------------------
+
+    def test_chunking_with_small_chunk_size(self):
+        """
+        chunk_size=2 with 8 items → 4 batches; total output must equal
+        a single-batch run with chunk_size=100.
+        """
+        metas_small, _, si_small, _ = self._run(_ALL_PAIRS, chunk_size=2)
+        metas_large, _, si_large, _ = self._run(_ALL_PAIRS, chunk_size=100)
+        assert si_small == si_large
+        assert sum(m.row_count for m in metas_small) == sum(m.row_count for m in metas_large)
+
+    # ------------------------------------------------------------------
+    # Dask delayed wrapper
+    # ------------------------------------------------------------------
+
+    def test_dask_delayed_matches_impl(self):
+        """``ingest_file(...).compute()`` must return the same counts as the impl."""
+        raw = self._make_inventory_parquet_bytes(_ALL_PAIRS)
+        inv_store = self._make_inv_store(raw)
+        wh_store_delayed = MemoryStore()
+        wh_store_direct = MemoryStore()
+
+        inv_store = self._make_inv_store(raw)
+        with dask.config.set(scheduler="synchronous"):
+            metas_d, counter_d, si_d, _ = ingest_file(
+                inv_data_key=self._INV_KEY,
+                inv_store=inv_store,
+                partitioner=_PARTITIONER,
+                warehouse_store=wh_store_delayed,
+                chunk_size=100,
+                max_workers=2,
+                since=None,
+                item_fetcher=_mock_fetcher,
+            ).compute()
+
+        # Direct call using a fresh inv_store.
+        inv_store2 = self._make_inv_store(raw)
+        metas_i, counter_i, si_i, _ = _ingest_file_impl(
+            inv_data_key=self._INV_KEY,
+            inv_store=inv_store2,
+            partitioner=_PARTITIONER,
+            warehouse_store=wh_store_direct,
+            chunk_size=100,
+            max_workers=2,
+            since=None,
+            item_fetcher=_mock_fetcher,
+        )
+
+        assert si_d == si_i
+        assert len(metas_d) == len(metas_i)
+        assert sum(m.row_count for m in metas_d) == sum(m.row_count for m in metas_i)
+        assert sum(counter_d.values()) == sum(counter_i.values())
 
 
 # ---------------------------------------------------------------------------
@@ -788,8 +1093,16 @@ class TestCompactGroupImplDedup:
             if id_val == "versioned-item":
                 assert versions[i] == "002", f"expected version '002' but got '{versions[i]}'"
 
-    def test_orphan_files_are_deleted(self):
-        """Files present in the prefix but absent from file_metas are deleted."""
+    def test_orphan_files_are_not_deleted(self):
+        """
+        Orphan sweep has been removed from _compact_group_impl.
+
+        Files present in the prefix but absent from file_metas must NOT be
+        touched here — the sweep is only safe in final_compact.py where one
+        task owns each (cell, year) prefix exclusively.  Deleting here during
+        concurrent ingest caused workers to remove each other's registered
+        part files.
+        """
         store = MemoryStore()
         cell, year = self._cell_year()
         year_str = str(year) if year is not None else "unknown"
@@ -813,16 +1126,16 @@ class TestCompactGroupImplDedup:
         out_key = f"{prefix}/compacted.parquet"
         _compact_group_impl([fm1, fm2], out_key, store)
 
-        # Orphan must be gone.
-        with pytest.raises(Exception):
-            obstore.get(store, orphan_key)
+        # Orphan must still be present — no sweep.
+        raw = bytes(obstore.get(store, orphan_key).bytes())
+        assert len(raw) > 0
 
-        # Compacted output must still be present.
+        # Compacted output must also be present.
         raw = bytes(obstore.get(store, out_key).bytes())
         assert len(raw) > 0
 
-    def test_orphan_sweep_on_single_file_bucket(self):
-        """Even a single-file bucket triggers orphan sweep before passthrough."""
+    def test_single_file_passthrough_leaves_orphan_intact(self):
+        """Single-file passthrough returns fm unchanged; orphan files are not deleted."""
         store = MemoryStore()
         cell, year = self._cell_year()
         year_str = str(year) if year is not None else "unknown"
@@ -841,9 +1154,9 @@ class TestCompactGroupImplDedup:
 
         # Single-file passthrough: result is the original fm.
         assert result is fm
-        # Orphan must be gone.
-        with pytest.raises(Exception):
-            obstore.get(store, orphan_key)
+        # Orphan must still be present — no sweep.
+        raw = bytes(obstore.get(store, orphan_key).bytes())
+        assert len(raw) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -980,7 +1293,7 @@ class TestIngestStats:
         from collections import Counter
 
         store = MemoryStore()
-        metas, counter = _ingest_chunk_impl(
+        metas, counter, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -996,7 +1309,7 @@ class TestIngestStats:
     def test_ingest_chunk_counter_sums_to_total_rows(self):
         """sum(k * v for k, v in counter) == total rows written."""
         store = MemoryStore()
-        metas, counter = _ingest_chunk_impl(
+        metas, counter, _ = _ingest_chunk_impl(
             _ALL_PAIRS,
             _PARTITIONER,
             store,
@@ -1012,7 +1325,7 @@ class TestIngestStats:
         from collections import Counter
 
         store = MemoryStore()
-        metas, counter = _ingest_chunk_impl(
+        metas, counter, _ = _ingest_chunk_impl(
             [],
             _PARTITIONER,
             store,

@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import obstore
+import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 import rustac
@@ -248,7 +249,7 @@ def fan_out(
             "scene_2_id": props.get("scene_2_id"),
             "scene_1_frame": props.get("scene_1_frame"),
             "scene_2_frame": props.get("scene_2_frame"),
-            "raw_stac": json.dumps(item),
+            "raw_stac": orjson.dumps(item).decode(),
         }
 
         for key in keys:
