@@ -34,7 +34,7 @@ import argparse
 import io
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -292,7 +292,7 @@ def run_daily_delta(
     date_str: str | None = None,
 ) -> dict[str, Any]:
     if date_str is None:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_str = datetime.now(UTC).strftime("%Y-%m-%d")
 
     local_delta = _is_local(delta_prefix)
     local_wh = _is_local(warehouse_hash_uri)

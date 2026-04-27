@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry point for backfill_v2 staging pipeline."""
+"""CLI entry point for backfill staging pipeline."""
 
 import argparse
 import configparser
@@ -181,19 +181,20 @@ def main() -> None:
                 [sys.executable, "-m", "pip", "install", "--no-deps",
                  path, "--quiet"]
             )
-            import importlib
 
             for mod in list(sys.modules):
                 if "earthcatalog" in mod:
                     del sys.modules[mod]
 
         def _verify():
-            from earthcatalog.pipelines import backfill_v2
             import inspect
-            src = inspect.getsource(backfill_v2._fetch_item_async)
+
+            from earthcatalog.pipelines import backfill
+
+            src = inspect.getsource(backfill._fetch_item_async)
             if "memoryview" not in src:
-                raise RuntimeError(f"WRONG CODE: {backfill_v2.__file__}")
-            print(f"VERIFIED: {backfill_v2.__file__}")
+                raise RuntimeError(f"WRONG CODE: {backfill.__file__}")
+            print(f"VERIFIED: {backfill.__file__}")
 
         def _create_cluster():
             print("Starting Coiled cluster (spot with fallback) …")
@@ -214,7 +215,7 @@ def main() -> None:
             client.run(_verify)
             return client
 
-        from earthcatalog.pipelines.backfill_v2 import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill_v2
 
         run_backfill_v2(
             inventory_path=args.inventory,
@@ -242,7 +243,7 @@ def main() -> None:
         cluster = LocalCluster(n_workers=args.workers, threads_per_worker=args.threads_per_worker)
         client = Client(cluster)
 
-        from earthcatalog.pipelines.backfill_v2 import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill_v2
 
         with client:
             run_backfill_v2(
@@ -265,7 +266,7 @@ def main() -> None:
                 delta=args.delta,
             )
     else:
-        from earthcatalog.pipelines.backfill_v2 import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill_v2
 
         with dask.config.set(scheduler="synchronous"):
             run_backfill_v2(

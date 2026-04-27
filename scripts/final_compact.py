@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """
 Final global compaction pass for earthcatalog.
 
@@ -88,7 +89,6 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------------
 
 import dask
-import dask.bag as db
 import obstore
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -97,6 +97,8 @@ from obstore.store import S3Store
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from pyiceberg.exceptions import NamespaceAlreadyExistsError
+
 from earthcatalog.core.catalog import (
     FULL_NAME,
     ICEBERG_SCHEMA,
@@ -104,7 +106,6 @@ from earthcatalog.core.catalog import (
     PARTITION_SPEC,
     open_catalog,
 )
-from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
 # ---------------------------------------------------------------------------
 # S3 helpers
@@ -242,14 +243,9 @@ def _compact_cell_year(
     output.  We jump straight to pass 2, saving substantial S3 egress and
     CPU — important for re-runs after partial failures on heavy groups.
     """
-    import io
-    import tempfile
-    import uuid
 
     import obstore as _obs
     import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
     from obstore.store import S3Store as _S3
 
     sk: dict = dict(bucket=wh_bucket, region=aws_region)
@@ -324,7 +320,7 @@ def _compact_cell_year(
     # Helpers (inner scope so they close over _store)
     # ---------------------------------------------------------------------------
 
-    def _read_and_cast(key: str) -> "pa.Table | None":
+    def _read_and_cast(key: str) -> pa.Table | None:
         """Download one parquet file and cast string→large_string.  Returns None on 404."""
         try:
             raw = bytes(_obs.get(_store, key).bytes())
@@ -344,7 +340,7 @@ def _compact_cell_year(
             new_fields.append(field)
         return pa.table(new_cols, schema=pa.schema(new_fields, metadata=tbl.schema.metadata))
 
-    def _dedup(tbl: "pa.Table") -> "pa.Table":
+    def _dedup(tbl: pa.Table) -> pa.Table:
         """Keep most-recent updated per id."""
         sort_idx = pc.sort_indices(
             tbl,
@@ -361,7 +357,7 @@ def _compact_cell_year(
                 keep.append(i)
         return tbl.take(pa.array(keep, type=pa.int64()))
 
-    def _write_tmp(tbl: "pa.Table", key: str) -> None:
+    def _write_tmp(tbl: pa.Table, key: str) -> None:
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
             tmp_path = tmp.name
         try:

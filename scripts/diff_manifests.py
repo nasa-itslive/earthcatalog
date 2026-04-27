@@ -20,7 +20,6 @@ Usage
 
 import argparse
 import json
-import sys
 
 import obstore
 from obstore.store import S3Store

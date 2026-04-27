@@ -354,7 +354,6 @@ class TestLocalIO:
     def test_hash_index_local_roundtrip(self, tmp_path):
         from scripts.daily_delta import (
             _download_hash_index_local,
-            _write_delta_parquet_local,
         )
 
         hashes = sorted([_hash_id("item-1"), _hash_id("item-2")])

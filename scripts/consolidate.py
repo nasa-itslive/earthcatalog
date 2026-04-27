@@ -171,7 +171,6 @@ def consolidate_partition(
     if split_idx >= len(row_counts):
         return None
 
-    to_keep = row_counts[:split_idx]
     to_merge = row_counts[split_idx:]
 
     if not to_merge:

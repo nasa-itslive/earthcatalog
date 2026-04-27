@@ -46,7 +46,6 @@ rustac infers column types from the item dicts:
 """
 
 import asyncio
-import json
 import os
 import tempfile
 from dataclasses import dataclass

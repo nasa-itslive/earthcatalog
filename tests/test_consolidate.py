@@ -5,7 +5,6 @@ Uses MemoryStore — no real S3 traffic.
 """
 
 import io
-import json
 import tempfile
 from pathlib import Path
 

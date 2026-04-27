@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """
 Compact the small number of (cell, year) groups that failed during final_compact.py
 (typically due to OOM on the heaviest groups) and register them into the local catalog.
@@ -182,15 +183,10 @@ def compact_group(
     ``tmp_*`` + ``compacted_*`` files are already pass-1 output — we jump
     straight to pass 2 (merge-and-dedup), saving significant egress.
     """
-    import io
     import os
-    import tempfile
-    import uuid
 
     import obstore
     import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
     from obstore.store import S3Store
 
     sk: dict = dict(bucket=wh_bucket, region=region)
@@ -230,7 +226,7 @@ def compact_group(
     # Use the live list for all subsequent processing.
     keys = live_keys
 
-    def _read_and_cast(key: str) -> "pa.Table | None":
+    def _read_and_cast(key: str) -> pa.Table | None:
         try:
             raw = bytes(obstore.get(store, key).bytes())
         except Exception as exc:

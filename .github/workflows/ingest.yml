@@ -100,7 +100,7 @@ jobs:
             EXTRA_ARGS="--coiled-n-workers ${{ github.event.inputs.coiled_n_workers || '10' }} --coiled-vm-type ${{ github.event.inputs.coiled_vm_type || 'c6i.xlarge' }}"
           fi
 
-          uv run python scripts/run_backfill_v2.py \
+          uv run python scripts/run_backfill.py \
             --inventory "${{ steps.delta.outputs.delta_path }}" \
             --delta \
             --scheduler "$SCHEDULER" \

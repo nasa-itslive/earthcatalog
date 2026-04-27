@@ -1,75 +1,30 @@
 """
 Tests for earthcatalog.pipelines.backfill.
 
-Grouped by component
---------------------
-TestIngestChunkImpl
-    Unit tests for ``_ingest_chunk_impl()``.
-    All I/O is fully mocked: items come from an in-process dict, output is
-    written to a ``MemoryStore``.  No Dask scheduler is involved.
-
-TestCompactGroupImpl
-    Unit tests for ``_compact_group_impl()``.
-    Part files are pre-written to a ``MemoryStore``; compaction reads, merges,
-    and writes back into the same store.  No Dask scheduler is involved.
-
-TestRunBackfillUnit
-    Integration tests for ``run_backfill()`` using the *synchronous* Dask
-    scheduler, a ``LocalStore`` warehouse, and a fully mocked item fetcher.
-    Exercises the full three-phase pipeline (Ingest → Compact → Register)
-    without any real S3 traffic.
-
-TestRunBackfillDask
-    End-to-end integration tests that fetch **real** STAC items from the public
-    ITS_LIVE S3 bucket (no credentials required).  The warehouse is written to
-    a ``LocalStore`` backed by ``tmp_path``.  The Dask *synchronous* scheduler
-    is used for deterministic, single-process execution.
-
-    Marked ``pytest.mark.integration`` — skip with ``-m "not integration"``
-    when offline.
+Uses MemoryStore for unit tests — no real S3 traffic.
+Integration tests (marked ``pytest.mark.integration``) fetch from the
+public ITS_LIVE bucket and are skipped unless ``-m integration`` is passed.
 """
 
 import io
 import json
-import uuid
-from datetime import UTC
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 import dask
 import obstore
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-import rustac
-from obstore.store import LocalStore, MemoryStore
+from obstore.store import MemoryStore
 
 from earthcatalog.core import store_config
-from earthcatalog.core.transform import (
-    FileMetadata,
-    fan_out,
-    group_by_partition,
-    write_geoparquet_s3,
-)
+from earthcatalog.core.transform import write_geoparquet as _write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
-from earthcatalog.pipelines.backfill import (
-    _compact_group_impl,
-    _ingest_chunk_impl,
-    _ingest_file_impl,
-    _write_ingest_stats,
-    compact_group,
-    ingest_chunk,
-    ingest_file,
-    run_backfill,
-)
 
-# ---------------------------------------------------------------------------
-# Shared STAC item fixtures
-# ---------------------------------------------------------------------------
+_PARTITIONER = H3Partitioner(resolution=2)
 
 _STAC_ITEMS = [
     {
-        "id": f"backfill-item-{i:04d}",
+        "id": f"v2-item-{i:04d}",
         "type": "Feature",
         "stac_version": "1.0.0",
         "geometry": {
@@ -98,6 +53,7 @@ _STAC_ITEMS = [
             "version": "002",
             "start_datetime": f"202{i % 4 + 1}-0{i % 9 + 1}-10T00:00:00Z",
             "end_datetime": f"202{i % 4 + 1}-0{i % 9 + 1}-20T00:00:00Z",
+            "updated": f"202{i % 4 + 1}-06-01T00:00:00Z",
         },
         "links": [],
         "assets": {},
@@ -105,1628 +61,1190 @@ _STAC_ITEMS = [
     for i in range(8)
 ]
 
-# Map (bucket, key) → item dict — used by the mock fetcher.
-_ITEM_MAP: dict[tuple[str, str], dict] = {
+_ITEM_MAP = {
     ("mock-bucket", f"stac/item-{i:04d}.stac.json"): item for i, item in enumerate(_STAC_ITEMS)
 }
 
+_ALL_PAIRS = list(_ITEM_MAP.keys())
 
-def _mock_fetcher(bucket: str, key: str) -> dict | None:
+
+def _seed_item_store() -> MemoryStore:
+    """Create a MemoryStore pre-loaded with mock STAC JSON items."""
+    store = MemoryStore()
+    for (bucket, key), item in _ITEM_MAP.items():
+        full_key = f"{bucket}/{key}"
+        obstore.put(store, full_key, json.dumps(item).encode())
+    return store
+
+
+def _mock_fetch_item(bucket: str, key: str) -> dict | None:
     return _ITEM_MAP.get((bucket, key))
 
 
-_ALL_PAIRS = list(_ITEM_MAP.keys())
-
-_PARTITIONER = H3Partitioner(resolution=2)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _read_from_store(store, key: str) -> pa.Table:
-    """Read a Parquet file stored in an obstore store into an Arrow table."""
-    raw = bytes(obstore.get(store, key).bytes())
-    return pq.ParquetFile(io.BytesIO(raw)).read()
-
-
-def _write_parquet_to_store(store, key: str, items: list[dict]) -> FileMetadata:
-    """Write fan-out items to store and return FileMetadata."""
-    n_rows, n_bytes = write_geoparquet_s3(items, store, key)
-    cell = items[0]["properties"]["grid_partition"]
-    dt = items[0]["properties"].get("datetime", "")
-    year = int(dt[:4]) if dt else None
-    return FileMetadata(
-        s3_key=key,
-        grid_partition=cell,
-        year=year,
-        row_count=n_rows,
-        file_size_bytes=n_bytes,
-    )
+def _make_inventory_csv(pairs: list[tuple[str, str]]) -> str:
+    """Return CSV content for an inventory."""
+    lines = ["bucket,key"]
+    for b, k in pairs:
+        lines.append(f"{b},{k}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# TestIngestChunkImpl
+# Phase 1 — Scheduler tests
 # ---------------------------------------------------------------------------
 
 
-class TestIngestChunkImpl:
-    """Unit tests for _ingest_chunk_impl() — no Dask, MemoryStore warehouse."""
+class TestWriteChunks:
+    def test_writes_chunk_parquets(self, tmp_path):
+        from earthcatalog.pipelines.backfill import write_chunks
 
-    def test_returns_file_metadata_list(self):
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        assert isinstance(metas, list)
-        assert len(metas) > 0
-        assert all(isinstance(m, FileMetadata) for m in metas)
-
-    def test_row_count_at_least_one_per_item(self):
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        total_rows = sum(m.row_count for m in metas)
-        assert total_rows >= len(_STAC_ITEMS)
-
-    def test_each_file_has_single_grid_partition(self):
-        """Every file must contain rows for exactly one grid_partition value."""
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        for fm in metas:
-            tbl = _read_from_store(store, fm.s3_key)
-            unique_cells = set(tbl.column("grid_partition").to_pylist())
-            assert unique_cells == {fm.grid_partition}, (
-                f"file {fm.s3_key} has multiple grid_partition values: {unique_cells}"
-            )
-
-    def test_file_size_matches_actual_bytes(self):
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        for fm in metas:
-            raw = bytes(obstore.get(store, fm.s3_key).bytes())
-            assert len(raw) == fm.file_size_bytes
-
-    def test_hive_key_format(self):
-        """Keys must follow grid_partition=<cell>/year=<year>/part_...parquet."""
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=5,
-            item_fetcher=_mock_fetcher,
-        )
-        for fm in metas:
-            assert f"grid_partition={fm.grid_partition}" in fm.s3_key
-            year_str = str(fm.year) if fm.year is not None else "unknown"
-            assert f"year={year_str}" in fm.s3_key
-            assert "part_000005_" in fm.s3_key
-            assert fm.s3_key.endswith(".parquet")
-
-    def test_chunk_id_in_filename(self):
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=42,
-            item_fetcher=_mock_fetcher,
-        )
-        assert all("part_000042_" in fm.s3_key for fm in metas)
-
-    def test_empty_fetch_returns_empty_list(self):
-        """If all fetches return None, no files should be written."""
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=lambda b, k: None,
-        )
-        assert metas == []
-
-    def test_geo_metadata_in_written_files(self):
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        for fm in metas:
-            raw = bytes(obstore.get(store, fm.s3_key).bytes())
-            pf = pq.ParquetFile(io.BytesIO(raw))
-            assert b"geo" in pf.metadata.metadata
-
-    def test_int_fields_are_int32(self):
-        store = MemoryStore()
-        metas, _, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        for fm in metas:
-            tbl = _read_from_store(store, fm.s3_key)
-            assert tbl.schema.field("percent_valid_pixels").type == pa.int32()
-            assert tbl.schema.field("date_dt").type == pa.int32()
-
-    def test_dask_delayed_version_matches_impl(self):
-        """ingest_chunk(...).compute() must return the same result as _impl()."""
-        store = MemoryStore()
-        with dask.config.set(scheduler="synchronous"):
-            metas_delayed, counter_delayed, _ = ingest_chunk(
-                _ALL_PAIRS,
-                _PARTITIONER,
-                store,
-                0,
-                _mock_fetcher,
-            ).compute()
-        metas_direct, counter_direct, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            MemoryStore(),
-            0,
-            _mock_fetcher,
-        )
-        # Same number of files and same total row count (stores are independent).
-        assert len(metas_delayed) == len(metas_direct)
-        assert sum(m.row_count for m in metas_delayed) == sum(m.row_count for m in metas_direct)
-        # Both counters must cover the same total item count.
-        assert sum(counter_delayed.values()) == sum(counter_direct.values())
-
-    def test_fetch_failures_counted(self):
-        """_ingest_chunk_impl returns correct fetch_failures count when some items fail."""
-        good_pairs = _ALL_PAIRS[:4]
-        bad_pairs = [("missing-bucket", f"stac/ghost-{i}.stac.json") for i in range(3)]
-        all_pairs = good_pairs + bad_pairs
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(_ALL_PAIRS))
 
         store = MemoryStore()
-        metas, counter, fetch_failures = _ingest_chunk_impl(
-            all_pairs,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
+        keys = write_chunks(str(inv), store, "chunks", chunk_size=4)
 
-        assert fetch_failures == 3
-        assert sum(counter.values()) == len(good_pairs)
-        total_rows = sum(fm.row_count for fm in metas)
-        assert total_rows > 0
+        assert len(keys) == 2  # 8 items / 4 per chunk = 2 chunks
 
-    def test_all_fetch_failures_returns_empty_with_count(self):
-        """When all fetches fail, returns empty metas but correct failure count."""
-        bad_pairs = [("missing-bucket", f"stac/ghost-{i}.stac.json") for i in range(5)]
+        for key in keys:
+            raw = memoryview(obstore.get(store, key).bytes()).tobytes()
+            tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+            assert tbl.num_rows == 4
+            assert set(tbl.schema.names) == {"bucket", "key"}
+
+    def test_skips_already_written_chunks(self, tmp_path):
+        from earthcatalog.pipelines.backfill import write_chunks
+
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(_ALL_PAIRS))
 
         store = MemoryStore()
-        metas, counter, fetch_failures = _ingest_chunk_impl(
-            bad_pairs,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
+        keys1 = write_chunks(str(inv), store, "chunks", chunk_size=4)
+        keys2 = write_chunks(str(inv), store, "chunks", chunk_size=4)
 
-        assert metas == []
-        from collections import Counter as _Counter
+        assert keys1 == keys2
+        assert all(keys1)
 
-        assert counter == _Counter()
-        assert fetch_failures == 5
+    def test_limit_caps_items(self, tmp_path):
+        from earthcatalog.pipelines.backfill import write_chunks
 
-    def test_retry_on_transient_failures(self):
-        """_fetch_item_async retries transient errors and succeeds on retry."""
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(_ALL_PAIRS))
+
+        store = MemoryStore()
+        keys = write_chunks(str(inv), store, "chunks", chunk_size=100, limit=3)
+
+        assert len(keys) == 1
+        raw = memoryview(obstore.get(store, keys[0]).bytes()).tobytes()
+        tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+        assert tbl.num_rows == 3
+
+    def test_filters_non_stac_json(self, tmp_path):
+        from earthcatalog.pipelines.backfill import write_chunks
+
+        mixed_pairs = _ALL_PAIRS + [("mock-bucket", "data/file.parquet")]
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(mixed_pairs))
+
+        store = MemoryStore()
+        keys = write_chunks(str(inv), store, "chunks", chunk_size=100)
+
+        raw = memoryview(obstore.get(store, keys[0]).bytes()).tobytes()
+        tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+        all_keys = tbl.column("key").to_pylist()
+        assert all(k.endswith(".stac.json") for k in all_keys)
+        assert len(all_keys) == len(_ALL_PAIRS)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Ingest worker tests
+# ---------------------------------------------------------------------------
+
+
+class TestFetchItemAsync:
+    def test_fetches_from_real_memory_store(self):
         import asyncio
 
-        from earthcatalog.pipelines.backfill import _fetch_item_async, _S3_FETCH_RETRIES
+        from earthcatalog.pipelines.backfill import _fetch_item_async
 
-        call_count = 0
+        store = MemoryStore()
+        bucket, key = _ALL_PAIRS[0]
+        obstore.put(store, key, json.dumps(_ITEM_MAP[(bucket, key)]).encode())
 
-        async def _flaky_read(href, **kw):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                raise ConnectionError("transient network error")
-            return _STAC_ITEMS[0]
-
-        with patch.object(rustac, "read", side_effect=_flaky_read):
-            result = asyncio.run(_fetch_item_async("mock-bucket", "stac/item-0000.stac.json"))
-
+        result = asyncio.run(_fetch_item_async(store, bucket, key))
         assert result is not None
-        assert result["id"] == "backfill-item-0000"
-        assert call_count == 3
+        assert result["id"] == "v2-item-0000"
 
-    def test_retry_exhausted_raises(self):
-        """_fetch_item_async raises after exhausting all retries (fails loud)."""
+    def test_missing_key_returns_none(self):
         import asyncio
 
-        from earthcatalog.pipelines.backfill import _fetch_item_async, _S3_FETCH_RETRIES
+        from earthcatalog.pipelines.backfill import _fetch_item_async
 
-        call_count = 0
+        store = MemoryStore()
+        result = asyncio.run(_fetch_item_async(store, "bucket", "nonexistent.json"))
+        assert result is None
 
-        async def _always_fail(href, **kw):
-            nonlocal call_count
-            call_count += 1
-            raise ConnectionError("persistent error")
-
-        with patch.object(rustac, "read", side_effect=_always_fail):
-            with patch.object(asyncio, "sleep", new_callable=AsyncMock):
-                with pytest.raises(RuntimeError, match="Failed to fetch"):
-                    asyncio.run(_fetch_item_async("mock-bucket", "stac/item-0000.stac.json"))
-
-        assert call_count == _S3_FETCH_RETRIES + 1
-
-    def test_fetch_items_async_handles_exceptions(self):
-        """_fetch_items_async catches task exceptions and returns them as failed."""
+    def test_403_raises_immediately(self):
         import asyncio
         from unittest.mock import patch
 
-        import rustac
+        from earthcatalog.pipelines.backfill import _fetch_item_async
 
-        from earthcatalog.pipelines.backfill import _fetch_items_async
+        async def _raise_403(store, key):
+            raise PermissionError("403 Forbidden")
 
-        pairs = [
-            ("bucket", "works.stac.json"),
-            ("bucket", "bad.stac.json"),
-        ]
+        with patch("earthcatalog.pipelines.backfill.obstore.get_async", side_effect=_raise_403):
+            with pytest.raises(PermissionError):
+                asyncio.run(_fetch_item_async(object(), "bucket", "secret.json"))
 
-        call_count = 0
 
-        async def _mock_read(href, **kw):
-            nonlocal call_count
-            call_count += 1
-            if "bad" in href:
-                raise ValueError("malformed key")
-            return {"id": "good-item", "type": "Feature"}
+class TestFetchAllAsync:
+    def test_fetches_multiple_items(self):
+        import asyncio
 
-        with patch.object(rustac, "read", side_effect=_mock_read):
-            items, failed = asyncio.run(_fetch_items_async(pairs, concurrency=2))
+        from earthcatalog.pipelines.backfill import _fetch_all_async
+
+        store = MemoryStore()
+        pairs = _ALL_PAIRS[:4]
+        for bucket, key in pairs:
+            obstore.put(store, key, json.dumps(_ITEM_MAP[(bucket, key)]).encode())
+
+        items, failed = asyncio.run(
+            _fetch_all_async(pairs, concurrency=10, store=store)
+        )
+
+        assert len(items) == 4
+        assert len(failed) == 0
+
+    def test_tracks_failures(self):
+        import asyncio
+
+        from earthcatalog.pipelines.backfill import _fetch_all_async
+
+        store = MemoryStore()
+        bucket, key = _ALL_PAIRS[0]
+        obstore.put(store, key, json.dumps(_ITEM_MAP[(bucket, key)]).encode())
+
+        items, failed = asyncio.run(
+            _fetch_all_async(_ALL_PAIRS, concurrency=10, store=store)
+        )
 
         assert len(items) == 1
-        assert items[0]["id"] == "good-item"
-        assert len(failed) == 1
-        assert failed[0] == ("bucket", "bad.stac.json")
+        assert len(failed) == 7
 
 
-# ---------------------------------------------------------------------------
-# TestIngestFileImpl
-# ---------------------------------------------------------------------------
+class TestWriteNdjson:
+    def test_writes_ndjson_to_store(self):
+        from earthcatalog.pipelines.backfill import _write_ndjson
+
+        store = MemoryStore()
+        items = [{"id": "a"}, {"id": "b"}]
+        n = _write_ndjson(items, store, "test.ndjson")
+
+        assert n == 2
+        raw = memoryview(obstore.get(store, "test.ndjson").bytes()).tobytes().decode()
+        lines = [ln for ln in raw.split("\n") if ln.strip()]
+        assert len(lines) == 2
+        assert json.loads(lines[0])["id"] == "a"
+
+    def test_empty_list_returns_zero(self):
+        from earthcatalog.pipelines.backfill import _write_ndjson
+
+        store = MemoryStore()
+        n = _write_ndjson([], store, "test.ndjson")
+        assert n == 0
+
+    def test_appends_to_existing_ndjson(self):
+        import orjson
+
+        from earthcatalog.pipelines.backfill import _write_ndjson
+
+        store = MemoryStore()
+        _write_ndjson([{"id": "a"}, {"id": "b"}], store, "test.ndjson")
+        n = _write_ndjson([{"id": "c"}], store, "test.ndjson")
+        assert n == 1
+        raw = memoryview(obstore.get(store, "test.ndjson").bytes()).tobytes().decode()
+        lines = [ln for ln in raw.split("\n") if ln.strip()]
+        assert len(lines) == 3
+        assert orjson.loads(lines[2])["id"] == "c"
 
 
-class TestIngestFileImpl:
-    """
-    Unit tests for ``_ingest_file_impl()`` — no real S3 traffic.
+class TestListCompletedChunkIds:
+    def test_returns_empty_when_no_markers(self):
+        from earthcatalog.pipelines.backfill import _list_completed_chunk_ids
 
-    Strategy
-    --------
-    * A tiny inventory Parquet file is written to a ``MemoryStore``.
-    * ``earthcatalog.pipelines.incremental._get_authenticated_store`` is
-      patched to return that ``MemoryStore`` so the worker never hits AWS.
-    * The warehouse target is also a fresh ``MemoryStore``.
-    """
+        store = MemoryStore()
+        result = _list_completed_chunk_ids(store, "staging", "pending_chunks")
+        assert result == set()
 
-    _INV_KEY = "inventory/data/fileA.parquet"
-    _INV_BUCKET = "mock-inv-bucket"
+    def test_returns_ids_with_marker_and_no_pending(self):
+        from earthcatalog.pipelines.backfill import _list_completed_chunk_ids
 
-    def _make_inventory_parquet_bytes(
-        self,
-        pairs: list[tuple[str, str]],
-        lm_dates: list[str] | None = None,
-    ) -> bytes:
-        """Return raw Parquet bytes for an inventory file."""
-        data: dict = {
-            "bucket": [b for b, _ in pairs],
-            "key": [k for _, k in pairs],
-        }
-        if lm_dates is not None:
-            data["last_modified_date"] = lm_dates
+        store = MemoryStore()
+        obstore.put(store, "staging/_completed/chunk_000001.done", b"ok")
+        obstore.put(store, "staging/_completed/chunk_000002.done", b"ok")
+
+        result = _list_completed_chunk_ids(store, "staging", "pending_chunks")
+        assert result == {1, 2}
+
+    def test_excludes_ids_with_pending_file(self):
+        from earthcatalog.pipelines.backfill import _list_completed_chunk_ids
+
+        store = MemoryStore()
+        obstore.put(store, "staging/_completed/chunk_000001.done", b"ok")
+        obstore.put(store, "staging/_completed/chunk_000002.done", b"ok")
+        obstore.put(store, "pending_chunks/chunk_000002.parquet", b"pending")
+
+        result = _list_completed_chunk_ids(store, "staging", "pending_chunks")
+        assert result == {1}
+
+    def test_ndjson_without_marker_means_incomplete(self):
+        from earthcatalog.pipelines.backfill import _list_completed_chunk_ids
+
+        store = MemoryStore()
+        obstore.put(store, "staging/8001/2020/chunk_000005.ndjson", b'{"id":"a"}')
+
+        result = _list_completed_chunk_ids(store, "staging", "pending_chunks")
+        assert result == set()
+
+    def test_ignores_non_chunk_markers(self):
+        from earthcatalog.pipelines.backfill import _list_completed_chunk_ids
+
+        store = MemoryStore()
+        obstore.put(store, "staging/_completed/not_a_chunk.done", b"ok")
+        obstore.put(store, "staging/_completed/chunk_notanumber.done", b"ok")
+
+        result = _list_completed_chunk_ids(store, "staging", "pending_chunks")
+        assert result == set()
+
+
+class TestIngestChunk:
+    def test_reads_chunk_and_writes_ndjson(self, tmp_path):
+        from unittest.mock import patch
+
+        from earthcatalog.pipelines.backfill import ingest_chunk
+
+        store = MemoryStore()
+
+        # Write a chunk parquet
+        tbl = pa.table({"bucket": [b for b, _ in _ALL_PAIRS], "key": [k for _, k in _ALL_PAIRS]})
         buf = io.BytesIO()
-        pq.write_table(pa.table(data), buf)
-        return buf.getvalue()
+        pq.write_table(tbl, buf)
+        obstore.put(store, "chunks/chunk_000000.parquet", buf.getvalue())
 
-    def _make_inv_store(self, parquet_bytes: bytes) -> MemoryStore:
-        """Seed a ``MemoryStore`` with inventory Parquet at ``_INV_KEY``."""
-        store = MemoryStore()
-        obstore.put(store, self._INV_KEY, parquet_bytes)
-        return store
+        async def _mock(store, bucket, key):
+            return _ITEM_MAP.get((bucket, key))
 
-    def _run(
-        self,
-        pairs: list[tuple[str, str]],
-        chunk_size: int = 100,
-        lm_dates: list[str] | None = None,
-        since=None,
-    ) -> tuple:
-        """Call ``_ingest_file_impl`` with a pre-seeded MemoryStore as inv_store."""
-        raw = self._make_inventory_parquet_bytes(pairs, lm_dates=lm_dates)
-        inv_store = self._make_inv_store(raw)
-        warehouse_store = MemoryStore()
-
-        return _ingest_file_impl(
-            inv_data_key=self._INV_KEY,
-            inv_store=inv_store,
-            partitioner=_PARTITIONER,
-            warehouse_store=warehouse_store,
-            chunk_size=chunk_size,
-            max_workers=2,
-            since=since,
-            item_fetcher=_mock_fetcher,
-        )
-
-    # ------------------------------------------------------------------
-    # Return type & shape
-    # ------------------------------------------------------------------
-
-    def test_returns_four_tuple(self):
-        metas, counter, source_items, fetch_failures = self._run(_ALL_PAIRS)
-        assert isinstance(metas, list)
-        from collections import Counter as _Counter
-
-        assert isinstance(counter, _Counter)
-        assert isinstance(source_items, int)
-        assert isinstance(fetch_failures, int)
-
-    def test_source_items_count_equals_stac_pairs(self):
-        """source_items must equal the number of .stac.json pairs in inventory."""
-        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
-        assert source_items == len(_ALL_PAIRS)
-
-    def test_row_count_at_least_source_items(self):
-        """Total rows written ≥ source items (H3 fan-out inflates row count)."""
-        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
-        total_rows = sum(m.row_count for m in metas)
-        assert total_rows >= source_items
-
-    def test_returns_file_metadata_list(self):
-        from earthcatalog.core.transform import FileMetadata
-
-        metas, _, _, _ = self._run(_ALL_PAIRS)
-        assert len(metas) > 0
-        assert all(isinstance(m, FileMetadata) for m in metas)
-
-    def test_fan_out_counter_sums_to_source_items(self):
-        """sum(counter.values()) == source_items — every item is counted once."""
-        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
-        assert sum(counter.values()) == source_items
-
-    def test_fan_out_counter_times_count_equals_total_rows(self):
-        """sum(k * v) == total rows written."""
-        metas, counter, source_items, _ = self._run(_ALL_PAIRS)
-        total_rows_metas = sum(m.row_count for m in metas)
-        total_rows_counter = sum(k * v for k, v in counter.items())
-        assert total_rows_counter == total_rows_metas
-
-    # ------------------------------------------------------------------
-    # Empty and filtered inventories
-    # ------------------------------------------------------------------
-
-    def test_empty_inventory_returns_zeros(self):
-        metas, counter, source_items, _ = self._run([])
-        assert metas == []
-        assert source_items == 0
-        assert sum(counter.values()) == 0
-
-    def test_non_stac_keys_excluded(self):
-        """Keys not ending in ``.stac.json`` must not be fetched or counted."""
-        non_stac_pairs = [("mock-bucket", "some/file.parquet"), ("mock-bucket", "other.json")]
-        metas, counter, source_items, _ = self._run(non_stac_pairs)
-        assert source_items == 0
-        assert metas == []
-
-    def test_mixed_stac_and_non_stac_keys(self):
-        """Only ``.stac.json`` entries contribute to source_items."""
-        stac_pairs = _ALL_PAIRS[:3]
-        non_stac = [("mock-bucket", "meta/file.parquet")]
-        mixed = stac_pairs + non_stac
-        _, _, source_items, _ = self._run(mixed)
-        assert source_items == len(stac_pairs)
-
-    # ------------------------------------------------------------------
-    # Chunking
-    # ------------------------------------------------------------------
-
-    def test_chunking_with_small_chunk_size(self):
-        """
-        chunk_size=2 with 8 items → 4 batches; total output must equal
-        a single-batch run with chunk_size=100.
-        """
-        metas_small, _, si_small, _ = self._run(_ALL_PAIRS, chunk_size=2)
-        metas_large, _, si_large, _ = self._run(_ALL_PAIRS, chunk_size=100)
-        assert si_small == si_large
-        assert sum(m.row_count for m in metas_small) == sum(m.row_count for m in metas_large)
-
-    # ------------------------------------------------------------------
-    # Dask delayed wrapper
-    # ------------------------------------------------------------------
-
-    def test_dask_delayed_matches_impl(self):
-        """``ingest_file(...).compute()`` must return the same counts as the impl."""
-        raw = self._make_inventory_parquet_bytes(_ALL_PAIRS)
-        inv_store = self._make_inv_store(raw)
-        wh_store_delayed = MemoryStore()
-        wh_store_direct = MemoryStore()
-
-        inv_store = self._make_inv_store(raw)
-        with dask.config.set(scheduler="synchronous"):
-            metas_d, counter_d, si_d, _ = ingest_file(
-                inv_data_key=self._INV_KEY,
-                inv_store=inv_store,
+        with patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock):
+            report = ingest_chunk(
+                chunk_key="chunks/chunk_000000.parquet",
+                staging_store=store,
+                staging_prefix="staging",
+                pending_prefix="pending_chunks",
                 partitioner=_PARTITIONER,
-                warehouse_store=wh_store_delayed,
-                chunk_size=100,
-                max_workers=2,
-                since=None,
-                item_fetcher=_mock_fetcher,
-            ).compute()
+            )
 
-        # Direct call using a fresh inv_store.
-        inv_store2 = self._make_inv_store(raw)
-        metas_i, counter_i, si_i, _ = _ingest_file_impl(
-            inv_data_key=self._INV_KEY,
-            inv_store=inv_store2,
-            partitioner=_PARTITIONER,
-            warehouse_store=wh_store_direct,
-            chunk_size=100,
-            max_workers=2,
-            since=None,
-            item_fetcher=_mock_fetcher,
-        )
+        assert report["source_items"] == 8
+        assert report["fetched_items"] == 8
+        assert report["fetch_failures"] == 0
+        assert report["groups_written"] > 0
+        assert len(report["ndjson_keys"]) > 0
 
-        assert si_d == si_i
-        assert len(metas_d) == len(metas_i)
-        assert sum(m.row_count for m in metas_d) == sum(m.row_count for m in metas_i)
-        assert sum(counter_d.values()) == sum(counter_i.values())
+        for nk in report["ndjson_keys"]:
+            assert nk.startswith("staging/")
+            assert nk.endswith(".ndjson")
 
 
 # ---------------------------------------------------------------------------
-# TestCompactGroupImpl
+# Phase 3 — Compact tests
 # ---------------------------------------------------------------------------
 
 
-class TestCompactGroupImpl:
-    """Unit tests for _compact_group_impl() — no Dask, MemoryStore."""
+class TestReadNdjsonFiles:
+    def test_reads_multiple_files(self):
+        from earthcatalog.pipelines.backfill import _read_ndjson_files
 
-    def _make_part_files(
-        self,
-        store: MemoryStore,
-        n_parts: int = 3,
-    ) -> list[FileMetadata]:
-        """Write n_parts part files for the same (cell, year) bucket."""
-        # Use a single item to guarantee all parts land in the same cell.
-        item = _STAC_ITEMS[0]
-        fo = fan_out([item], _PARTITIONER)
+        store = MemoryStore()
+        items_a = [{"id": "1", "properties": {"updated": "2024-01-01T00:00:00Z"}}]
+        items_b = [{"id": "2", "properties": {"updated": "2024-01-01T00:00:00Z"}}]
+
+        obstore.put(store, "a.ndjson", "\n".join(json.dumps(i) for i in items_a).encode())
+        obstore.put(store, "b.ndjson", "\n".join(json.dumps(i) for i in items_b).encode())
+
+        result = _read_ndjson_files(store, ["a.ndjson", "b.ndjson"])
+        assert len(result) == 2
+
+    def test_skips_missing_files(self):
+        from earthcatalog.pipelines.backfill import _read_ndjson_files
+
+        store = MemoryStore()
+        result = _read_ndjson_files(store, ["nonexistent.ndjson"])
+        assert result == []
+
+
+class TestDedupItems:
+    def test_deduplicates_by_id(self):
+        from earthcatalog.pipelines.backfill import _dedup_items
+
+        items = [
+            {"id": "a", "properties": {"updated": "2024-01-01T00:00:00Z"}},
+            {"id": "a", "properties": {"updated": "2024-06-01T00:00:00Z"}},
+            {"id": "b", "properties": {"updated": "2024-01-01T00:00:00Z"}},
+        ]
+        result = _dedup_items(items)
+        assert len(result) == 2
+        by_id = {i["id"]: i for i in result}
+        assert by_id["a"]["properties"]["updated"] == "2024-06-01T00:00:00Z"
+
+    def test_keeps_all_unique(self):
+        from earthcatalog.pipelines.backfill import _dedup_items
+
+        items = [{"id": f"item-{i}", "properties": {}} for i in range(10)]
+        result = _dedup_items(items)
+        assert len(result) == 10
+
+
+class TestCompactCellYear:
+    def test_reads_ndjson_and_writes_parquet(self, tmp_path):
+        from earthcatalog.pipelines.backfill import compact_cell_year
+
+        store = MemoryStore()
+
+        from earthcatalog.core.transform import fan_out, group_by_partition
+
+        fo = fan_out(_STAC_ITEMS, _PARTITIONER)
         groups = group_by_partition(fo)
-        (cell, year), group_items = next(iter(groups.items()))
-        year_str = str(year) if year is not None else "unknown"
 
-        metas = []
-        for i in range(n_parts):
-            key = (
-                f"grid_partition={cell}/year={year_str}/part_{i:06d}_{uuid.uuid4().hex[:8]}.parquet"
-            )
-            n_rows, n_bytes = write_geoparquet_s3(group_items, store, key)
-            metas.append(
-                FileMetadata(
-                    s3_key=key,
-                    grid_partition=cell,
-                    year=year,
-                    row_count=n_rows,
-                    file_size_bytes=n_bytes,
-                )
-            )
-        return metas
+        (cell, year), items = list(groups.items())[0]
 
-    def test_single_file_passthrough(self):
-        """A single-file bucket must be returned unchanged (no I/O)."""
-        store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=1)
-        result = _compact_group_impl(metas, "ignored_key.parquet", store)
-        assert result is metas[0]
+        for item in items:
+            item["properties"]["updated"] = "2024-01-01T00:00:00Z"
 
-    def test_merges_multiple_files(self):
-        store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=3)
-        # After dedup, row count may be <= sum of parts (identical items deduped).
-        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
-        result = _compact_group_impl(metas, out_key, store)
-        tbl = _read_from_store(store, out_key)
-        assert tbl.num_rows == result.row_count
-        assert tbl.num_rows > 0
-        assert tbl.num_rows <= sum(m.row_count for m in metas)
+        ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
+        ndjson_key = f"staging/{cell}/{year}/worker_abc123.ndjson"
+        obstore.put(store, ndjson_key, ndjson_data)
 
-    def test_returns_correct_metadata(self):
-        store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=2)
-        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
-        result = _compact_group_impl(metas, out_key, store)
-        assert result.s3_key == out_key
-        assert result.grid_partition == metas[0].grid_partition
-        assert result.year == metas[0].year
-        # row_count may be less than sum due to dedup; must be > 0 and consistent.
-        assert 0 < result.row_count <= sum(m.row_count for m in metas)
-        tbl = _read_from_store(store, out_key)
-        assert tbl.num_rows == result.row_count
-        assert result.file_size_bytes > 0
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
 
-    def test_deletes_input_part_files(self):
-        store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=3)
-        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
-        _compact_group_impl(metas, out_key, store)
-        for fm in metas:
-            with pytest.raises(Exception):
-                obstore.get(store, fm.s3_key)
-
-    def test_compacted_file_has_geo_metadata(self):
-        store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=2)
-        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
-        _compact_group_impl(metas, out_key, store)
-        raw = bytes(obstore.get(store, out_key).bytes())
-        pf = pq.ParquetFile(io.BytesIO(raw))
-        assert b"geo" in pf.metadata.metadata
-
-    def test_compacted_file_sorted_by_platform_datetime(self):
-        """Rows in the compacted file must be sorted by (platform, datetime)."""
-        store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=2)
-        out_key = f"grid_partition={metas[0].grid_partition}/year={metas[0].year}/compacted.parquet"
-        _compact_group_impl(metas, out_key, store)
-        tbl = _read_from_store(store, out_key)
-        platforms = tbl.column("platform").to_pylist()
-        datetimes = tbl.column("datetime").to_pylist()
-        keys = list(
-            zip(
-                [p or "" for p in platforms],
-                [str(d) if d is not None else "" for d in datetimes],
-            )
+        report = compact_cell_year(
+            cell=cell,
+            year=str(year),
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_root=str(wh_root),
+            compact_rows=100_000,
         )
-        assert keys == sorted(keys)
 
-    def test_dask_delayed_version_matches_impl(self):
+        assert report["cell"] == cell
+        assert report["year"] == str(year)
+        assert report["input_files"] == 1
+        assert report["input_items"] == len(items)
+        assert report["unique_items"] == len(items)
+        assert report["output_rows"] > 0
+        assert len(report["output_files"]) == 1
+
+        parquet_path = report["output_files"][0]
+        assert parquet_path.startswith(str(wh_root))
+        tbl = pq.ParquetFile(parquet_path).read()
+        assert tbl.num_rows == len(items)
+
+    def test_empty_prefix_returns_empty_report(self, tmp_path):
+        from earthcatalog.pipelines.backfill import compact_cell_year
+
         store = MemoryStore()
-        metas = self._make_part_files(store, n_parts=2)
-        out_key = (
-            f"grid_partition={metas[0].grid_partition}/"
-            f"year={metas[0].year}/compacted_delayed.parquet"
+        report = compact_cell_year(
+            cell="nocell",
+            year="2024",
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_root=str(tmp_path),
         )
-        with dask.config.set(scheduler="synchronous"):
-            result = compact_group(metas, out_key, store).compute()
-        # Row count after dedup must be > 0 and ≤ sum of inputs.
-        assert 0 < result.row_count <= sum(m.row_count for m in metas)
+        assert report["input_files"] == 0
+        assert report["output_rows"] == 0
+
+    def test_splits_into_multiple_parts(self, tmp_path):
+        from earthcatalog.pipelines.backfill import compact_cell_year
+
+        store = MemoryStore()
+        cell = "testcell"
+        year = "2024"
+
+        items = [
+            {
+                "id": f"item-{i}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-01-01T00:00:00Z",
+                    "grid_partition": cell,
+                },
+                "links": [],
+                "assets": {},
+            }
+            for i in range(5)
+        ]
+
+        ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
+        obstore.put(store, f"staging/{cell}/{year}/worker_001.ndjson", ndjson_data)
+
+        report = compact_cell_year(
+            cell=cell,
+            year=year,
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_root=str(tmp_path),
+            compact_rows=2,
+        )
+
+        assert len(report["output_files"]) == 3  # 5 items / 2 per part = 3 parts
+        assert report["output_rows"] == 5
+
+
+class TestCompactCellYearS3:
+    def test_writes_parquet_to_store(self):
+        from earthcatalog.pipelines.backfill import compact_cell_year_s3
+
+        store = MemoryStore()
+        wh_store = MemoryStore()
+        cell = "tests3cell"
+        year = "2024"
+
+        items = [
+            {
+                "id": f"s3item-{i}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-01-01T00:00:00Z",
+                    "grid_partition": cell,
+                },
+                "links": [],
+                "assets": {},
+            }
+            for i in range(3)
+        ]
+
+        ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
+        obstore.put(store, f"staging/{cell}/{year}/worker_001.ndjson", ndjson_data)
+
+        report = compact_cell_year_s3(
+            cell=cell,
+            year=year,
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_store=wh_store,
+            compact_rows=100_000,
+        )
+
+        assert report["output_rows"] == 3
+        assert len(report["output_files"]) == 1
+
+        out_key = report["output_files"][0]
+        raw = memoryview(obstore.get(wh_store, out_key).bytes()).tobytes()
+        tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+        assert tbl.num_rows == 3
 
 
 # ---------------------------------------------------------------------------
-# TestRunBackfillUnit
+# Phase 4 — Register tests
 # ---------------------------------------------------------------------------
 
 
-class TestRunBackfillUnit:
-    """
-    Integration tests for run_backfill() with the synchronous Dask scheduler.
+class TestRegisterAndCleanup:
+    def test_registers_files_and_cleans_up(self, tmp_path):
+        from earthcatalog.pipelines.backfill import register_and_cleanup
 
-    Warehouse is a ``LocalStore``; item fetching uses the mock dict fetcher;
-    no real S3 traffic.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _use_memory_store_config(self, tmp_path):
-        """Point store_config at a MemoryStore so catalog up/download are in-proc."""
-        store = MemoryStore()
-        store_config.set_store(store)
+        store_config.set_store(MemoryStore())
         store_config.set_catalog_key("catalog.db")
-        yield store
 
-    @pytest.fixture()
-    def inventory_csv(self, tmp_path) -> Path:
-        import csv
+        staging_store = MemoryStore()
 
-        inv = tmp_path / "inventory.csv"
-        with open(inv, "w", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["bucket", "key"])
-            writer.writerows(_ALL_PAIRS)
-        return inv
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+        cell_dir = wh_root / "grid_partition=testcell" / "year=2024"
+        cell_dir.mkdir(parents=True)
 
-    @pytest.fixture()
-    def warehouse_dirs(self, tmp_path):
-        wh = tmp_path / "warehouse"
-        wh.mkdir()
-        return LocalStore(str(wh)), str(wh)
+        from earthcatalog.core.transform import fan_out as _fan_out
+        from earthcatalog.core.transform import write_geoparquet as _write_gp
 
-    def _run(self, inventory_csv, warehouse_dirs, **kwargs):
-        wh_store, wh_root = warehouse_dirs
-        catalog_path = str(Path(wh_root).parent / "catalog.db")
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=str(inventory_csv),
+        items = [_STAC_ITEMS[0]]
+        fo = _fan_out(items, _PARTITIONER)
+        if fo:
+            from earthcatalog.core.transform import group_by_partition as _gp
+
+            groups = _gp(fo)
+            for (_c, _y), group in groups.items():
+                d = wh_root / f"grid_partition={_c}" / f"year={_y}"
+                d.mkdir(parents=True, exist_ok=True)
+                _write_gp(group, str(d / "part_000000.parquet"))
+
+        # Put some staging files to verify cleanup
+        obstore.put(staging_store, "staging/chunks/chunk_000.parquet", b"data")
+        obstore.put(staging_store, "staging/testcell/2024/worker_001.ndjson", b"ndjson")
+
+        catalog_path = str(tmp_path / "catalog.db")
+
+        register_and_cleanup(
+            catalog_path=catalog_path,
+            warehouse_root=str(wh_root),
+            staging_store=staging_store,
+            staging_prefix="staging",
+            upload=False,
+        )
+
+        from earthcatalog.core.catalog import open_catalog
+
+        catalog = open_catalog(db_path=catalog_path, warehouse_path=str(wh_root))
+        table = catalog.load_table("earthcatalog.stac_items")
+        result = table.scan().to_arrow()
+        assert result.num_rows > 0
+
+        # Staging files should be deleted
+        remaining = []
+        for batch in obstore.list(staging_store, prefix="staging"):
+            for obj in batch:
+                remaining.append(obj["path"])
+        assert "staging/chunks/chunk_000.parquet" in remaining
+        assert "staging/testcell/2024/worker_001.ndjson" in remaining
+
+
+# ---------------------------------------------------------------------------
+# End-to-end — run_backfill_v2
+# ---------------------------------------------------------------------------
+
+
+class TestRunBackfillV2:
+    @pytest.fixture(autouse=True)
+    def _setup_store_config(self):
+        store_config.set_store(MemoryStore())
+        store_config.set_catalog_key("catalog.db")
+        yield
+
+    def test_end_to_end_with_mock_fetcher(self, tmp_path):
+        from earthcatalog.pipelines.backfill import run_backfill_v2
+
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(_ALL_PAIRS))
+
+        staging_store = MemoryStore()
+
+        # Seed item data into the staging store so _fetch_item_async can find it
+        for (bucket, key), item in _ITEM_MAP.items():
+            obstore.put(staging_store, f"{bucket}/{key}", json.dumps(item).encode())
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+        catalog_path = str(tmp_path / "catalog.db")
+
+        from unittest.mock import patch
+
+        async def _mock_fetch(store, bucket, key):
+            return _ITEM_MAP.get((bucket, key))
+
+        with (
+            patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
+            dask.config.set(scheduler="synchronous"),
+        ):
+            run_backfill_v2(
+                inventory_path=str(inv),
                 catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=_mock_fetcher,
+                staging_store=staging_store,
+                staging_prefix="ingest",
+                warehouse_store=MemoryStore(),
+                warehouse_root=str(wh_root),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
-                max_workers_per_task=2,
                 use_lock=False,
-                **kwargs,
             )
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
 
-        catalog = open_catalog(db_path=catalog_path, warehouse_path=wh_root)
-        return get_or_create_table(catalog)
+        from earthcatalog.core.catalog import open_catalog
 
-    def test_rows_written_to_iceberg(self, inventory_csv, warehouse_dirs):
-        table = self._run(inventory_csv, warehouse_dirs)
+        catalog = open_catalog(db_path=catalog_path, warehouse_path=str(wh_root))
+        table = catalog.load_table("earthcatalog.stac_items")
         result = table.scan().to_arrow()
         assert result.num_rows >= len(_STAC_ITEMS)
 
-    def test_single_snapshot(self, inventory_csv, warehouse_dirs):
-        """run_backfill must produce exactly one Iceberg snapshot."""
-        table = self._run(inventory_csv, warehouse_dirs)
-        assert len(table.history()) == 1
-
-    def test_all_item_ids_present(self, inventory_csv, warehouse_dirs):
-        table = self._run(inventory_csv, warehouse_dirs)
-        found = set(table.scan().to_arrow().column("id").to_pylist())
+        ids = set(result.column("id").to_pylist())
         for item in _STAC_ITEMS:
-            assert item["id"] in found
+            assert item["id"] in ids
 
-    def test_compact_reduces_file_count(self, inventory_csv, warehouse_dirs):
-        """With compact=True, buckets with >1 part file are merged."""
-        wh_store, wh_root = warehouse_dirs
+    def test_idempotent_re_run(self, tmp_path):
+        from earthcatalog.pipelines.backfill import run_backfill_v2
 
-        # Run without compaction — fresh catalog store.
-        store_config.set_store(MemoryStore())
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=str(inventory_csv),
-                catalog_path=str(Path(wh_root).parent / "catalog_no.db"),
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=_mock_fetcher,
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(_ALL_PAIRS))
+
+        staging_store = MemoryStore()
+        for (bucket, key), item in _ITEM_MAP.items():
+            obstore.put(staging_store, f"{bucket}/{key}", json.dumps(item).encode())
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+        catalog_path = str(tmp_path / "catalog.db")
+
+        from unittest.mock import patch
+
+        async def _mock_fetch(store, bucket, key):
+            return _ITEM_MAP.get((bucket, key))
+
+        with (
+            patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
+            dask.config.set(scheduler="synchronous"),
+        ):
+            run_backfill_v2(
+                inventory_path=str(inv),
+                catalog_path=catalog_path,
+                staging_store=staging_store,
+                staging_prefix="ingest",
+                warehouse_store=MemoryStore(),
+                warehouse_root=str(wh_root),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
-                max_workers_per_task=2,
-                compact=False,
                 use_lock=False,
             )
-        no_compact_files = len(list(Path(wh_root).glob("**/*.parquet")))
 
-        # Fresh warehouse + fresh catalog store for compacted run.
-        wh2 = Path(wh_root).parent / "wh2"
-        wh2.mkdir()
-        wh_store2 = LocalStore(str(wh2))
-        store_config.set_store(MemoryStore())
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=str(inventory_csv),
-                catalog_path=str(Path(wh_root).parent / "catalog_yes.db"),
-                warehouse_store=wh_store2,
-                warehouse_root=str(wh2),
-                item_fetcher=_mock_fetcher,
+        # Run again — same staging store, chunks and NDJSON from run 1 still there
+        wh_root2 = tmp_path / "warehouse2"
+        wh_root2.mkdir()
+        catalog_path2 = str(tmp_path / "catalog2.db")
+
+        with (
+            patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
+            dask.config.set(scheduler="synchronous"),
+        ):
+            run_backfill_v2(
+                inventory_path=str(inv),
+                catalog_path=catalog_path2,
+                staging_store=staging_store,
+                staging_prefix="ingest",
+                warehouse_store=MemoryStore(),
+                warehouse_root=str(wh_root2),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
-                max_workers_per_task=2,
-                compact=True,
                 use_lock=False,
+                skip_inventory=True,
             )
-        compact_files = len(list(wh2.glob("**/*.parquet")))
 
-        # Row counts must be equal.
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.core.catalog import open_catalog
 
-        t1 = get_or_create_table(
-            open_catalog(
-                str(Path(wh_root).parent / "catalog_no.db"),
-                wh_root,
-            )
-        )
-        t2 = get_or_create_table(
-            open_catalog(
-                str(Path(wh_root).parent / "catalog_yes.db"),
-                str(wh2),
-            )
-        )
-        assert t1.scan().to_arrow().num_rows == t2.scan().to_arrow().num_rows
-
-        # Compaction should not increase file count.
-        assert compact_files <= no_compact_files
-
-    def test_compact_false_skips_level1(self, inventory_csv, warehouse_dirs):
-        """With compact=False, all output files are the raw part files."""
-        table = self._run(inventory_csv, warehouse_dirs, compact=False)
+        catalog = open_catalog(db_path=catalog_path2, warehouse_path=str(wh_root2))
+        table = catalog.load_table("earthcatalog.stac_items")
         result = table.scan().to_arrow()
         assert result.num_rows >= len(_STAC_ITEMS)
 
-    def test_hive_layout_in_warehouse(self, inventory_csv, warehouse_dirs):
-        """All Parquet files must sit under grid_partition=.../year=... dirs."""
-        _, wh_root = warehouse_dirs
-        self._run(inventory_csv, warehouse_dirs)
-        for f in Path(wh_root).glob("**/*.parquet"):
-            parts = f.parts
-            assert any(p.startswith("grid_partition=") for p in parts)
-            assert any(p.startswith("year=") for p in parts)
+
+# ---------------------------------------------------------------------------
+# Delta mode tests
+# ---------------------------------------------------------------------------
+
+
+class TestNextPartIndexLocal:
+    def test_returns_zero_when_no_files(self, tmp_path):
+        from earthcatalog.pipelines.backfill import _next_part_index_local
+
+        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 0
+
+    def test_returns_next_after_existing(self, tmp_path):
+        from earthcatalog.pipelines.backfill import _next_part_index_local
+
+        d = tmp_path / "grid_partition=cell1" / "year=2024"
+        d.mkdir(parents=True)
+        (d / "part_000000.parquet").touch()
+        (d / "part_000001.parquet").touch()
+
+        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 2
+
+    def test_handles_gaps(self, tmp_path):
+        from earthcatalog.pipelines.backfill import _next_part_index_local
+
+        d = tmp_path / "grid_partition=cell1" / "year=2024"
+        d.mkdir(parents=True)
+        (d / "part_000000.parquet").touch()
+        (d / "part_000005.parquet").touch()
+
+        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 6
+
+    def test_ignores_non_parquet(self, tmp_path):
+        from earthcatalog.pipelines.backfill import _next_part_index_local
+
+        d = tmp_path / "grid_partition=cell1" / "year=2024"
+        d.mkdir(parents=True)
+        (d / "part_000000.parquet").touch()
+        (d / "notes.txt").touch()
+
+        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 1
+
+
+class TestNextPartIndexS3:
+    def test_returns_zero_when_empty(self):
+        from earthcatalog.pipelines.backfill import _next_part_index_s3
+
+        store = MemoryStore()
+        assert _next_part_index_s3(store, "cell1", "2024") == 0
+
+    def test_returns_next_after_existing(self):
+        from earthcatalog.pipelines.backfill import _next_part_index_s3
+
+        store = MemoryStore()
+        obstore.put(store, "grid_partition=cell1/year=2024/part_000000.parquet", b"data")
+        obstore.put(store, "grid_partition=cell1/year=2024/part_000001.parquet", b"data")
+
+        assert _next_part_index_s3(store, "cell1", "2024") == 2
+
+
+class TestCompactCellYearDelta:
+    def test_writes_new_files_without_overwriting(self, tmp_path):
+        from earthcatalog.pipelines.backfill import compact_cell_year_delta
+
+        store = MemoryStore()
+        cell = "deltacell"
+        year = "2024"
+
+        existing_items = [
+            {
+                "id": f"old-{i}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-01-01T00:00:00Z",
+                    "grid_partition": cell,
+                },
+                "links": [],
+                "assets": {},
+            }
+            for i in range(3)
+        ]
+
+        wh_root = tmp_path / "warehouse"
+        cell_dir = wh_root / f"grid_partition={cell}" / f"year={year}"
+        cell_dir.mkdir(parents=True)
+        _write_geoparquet(existing_items, str(cell_dir / "part_000000.parquet"))
+
+        new_items = [
+            {
+                "id": f"new-{i}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-06-01T00:00:00Z",
+                    "grid_partition": cell,
+                },
+                "links": [],
+                "assets": {},
+            }
+            for i in range(2)
+        ]
+        ndjson_data = "\n".join(json.dumps(i) for i in new_items).encode()
+        obstore.put(store, f"staging/{cell}/{year}/chunk_000.ndjson", ndjson_data)
+
+        report = compact_cell_year_delta(
+            cell=cell,
+            year=year,
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_root=str(wh_root),
+            compact_rows=100_000,
+        )
+
+        assert report["output_rows"] == 2
+        assert len(report["output_files"]) == 1
+
+        new_path = report["output_files"][0]
+        assert "part_000001.parquet" in new_path
+
+        existing_tbl = pq.ParquetFile(str(cell_dir / "part_000000.parquet")).read()
+        assert existing_tbl.num_rows == 3
+
+        new_tbl = pq.ParquetFile(new_path).read()
+        assert new_tbl.num_rows == 2
+
+
+class TestCompactCellYearDeltaS3:
+    def test_writes_new_files_with_offset(self):
+        from earthcatalog.pipelines.backfill import compact_cell_year_delta_s3
+
+        store = MemoryStore()
+        wh_store = MemoryStore()
+        cell = "s3delta"
+        year = "2024"
+
+        obstore.put(wh_store, f"grid_partition={cell}/year={year}/part_000000.parquet", b"old")
+        obstore.put(wh_store, f"grid_partition={cell}/year={year}/part_000001.parquet", b"old")
+
+        items = [
+            {
+                "id": f"delta-s3-{i}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-01-01T00:00:00Z",
+                    "grid_partition": cell,
+                },
+                "links": [],
+                "assets": {},
+            }
+            for i in range(2)
+        ]
+        ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
+        obstore.put(store, f"staging/{cell}/{year}/chunk_000.ndjson", ndjson_data)
+
+        report = compact_cell_year_delta_s3(
+            cell=cell,
+            year=year,
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_store=wh_store,
+            compact_rows=100_000,
+        )
+
+        assert report["output_rows"] == 2
+        assert len(report["output_files"]) == 1
+        assert "part_000002.parquet" in report["output_files"][0]
+
+        old_data = memoryview(obstore.get(wh_store, f"grid_partition={cell}/year={year}/part_000000.parquet").bytes()).tobytes()
+        assert old_data == b"old"
+
+
+class TestRegisterDelta:
+    def test_adds_files_to_existing_table(self, tmp_path):
+        from earthcatalog.pipelines.backfill import register_delta
+
+        store_config.set_store(MemoryStore())
+        store_config.set_catalog_key("catalog.db")
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+
+        from earthcatalog.core.catalog import (
+            FULL_NAME,
+            ICEBERG_SCHEMA,
+            NAMESPACE,
+            PARTITION_SPEC,
+            open_catalog,
+        )
+
+        catalog = open_catalog(db_path=str(tmp_path / "existing.db"), warehouse_path=str(wh_root))
+        from pyiceberg.exceptions import NamespaceAlreadyExistsError
+
+        try:
+            catalog.create_namespace(NAMESPACE)
+        except NamespaceAlreadyExistsError:
+            pass
+        catalog.create_table(
+            identifier=FULL_NAME,
+            schema=ICEBERG_SCHEMA,
+            partition_spec=PARTITION_SPEC,
+        )
+
+        cell_dir = wh_root / "grid_partition=testcell" / "year=2024"
+        cell_dir.mkdir(parents=True)
+
+        existing_items = [
+            {
+                "id": "existing-1",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-01-01T00:00:00Z",
+                    "grid_partition": "testcell",
+                },
+                "links": [],
+                "assets": {},
+            }
+        ]
+        existing_path = str(cell_dir / "part_000000.parquet")
+        _write_geoparquet(existing_items, existing_path)
+
+        catalog.load_table(FULL_NAME).add_files([existing_path])
+
+        new_items = [
+            {
+                "id": "delta-1",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+                "properties": {
+                    "datetime": "2024-01-15T00:00:00Z",
+                    "platform": "TEST",
+                    "updated": "2024-06-01T00:00:00Z",
+                    "grid_partition": "testcell",
+                },
+                "links": [],
+                "assets": {},
+            }
+        ]
+        new_path = str(cell_dir / "part_000001.parquet")
+        _write_geoparquet(new_items, new_path)
+
+        staging_store = MemoryStore()
+
+        register_delta(
+            catalog_path=str(tmp_path / "existing.db"),
+            warehouse_root=str(wh_root),
+            new_parquet_paths=[new_path],
+            staging_store=staging_store,
+            staging_prefix="staging",
+            upload=False,
+        )
+
+        result = catalog.load_table(FULL_NAME).scan().to_arrow()
+        assert result.num_rows == 2
+        ids = set(result.column("id").to_pylist())
+        assert "existing-1" in ids
+        assert "delta-1" in ids
+
+
+class TestRunBackfillV2Delta:
+    @pytest.fixture(autouse=True)
+    def _setup_store_config(self):
+        store_config.set_store(MemoryStore())
+        store_config.set_catalog_key("catalog.db")
+        yield
+
+    def test_delta_does_not_overwrite_existing_parquets(self, tmp_path):
+        from earthcatalog.pipelines.backfill import run_backfill_v2
+
+        inv = tmp_path / "inv.csv"
+        inv.write_text(_make_inventory_csv(_ALL_PAIRS))
+
+        staging_store = MemoryStore()
+        for (bucket, key), item in _ITEM_MAP.items():
+            obstore.put(staging_store, f"{bucket}/{key}", json.dumps(item).encode())
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+        catalog_path = str(tmp_path / "catalog.db")
+
+        from unittest.mock import patch
+
+        async def _mock_fetch(store, bucket, key):
+            return _ITEM_MAP.get((bucket, key))
+
+        with (
+            patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
+            dask.config.set(scheduler="synchronous"),
+        ):
+            run_backfill_v2(
+                inventory_path=str(inv),
+                catalog_path=catalog_path,
+                staging_store=staging_store,
+                staging_prefix="ingest",
+                warehouse_store=MemoryStore(),
+                warehouse_root=str(wh_root),
+                partitioner=_PARTITIONER,
+                chunk_size=4,
+                use_lock=False,
+            )
+
+        from earthcatalog.core.catalog import open_catalog
+
+        catalog = open_catalog(db_path=catalog_path, warehouse_path=str(wh_root))
+        table = catalog.load_table("earthcatalog.stac_items")
+        result1 = table.scan().to_arrow()
+        first_run_count = result1.num_rows
+        first_run_ids = set(result1.column("id").to_pylist())
+
+        inv2 = tmp_path / "inv2.csv"
+        extra_pairs = [
+            ("mock-bucket", "stac/item-extra-0.stac.json"),
+            ("mock-bucket", "stac/item-extra-1.stac.json"),
+        ]
+        extra_items = [
+            {
+                "id": "v2-item-extra-0",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[-10, 60], [10, 60], [10, 70], [-10, 70], [-10, 60]]],
+                },
+                "properties": {
+                    "datetime": "2023-01-15T00:00:00Z",
+                    "platform": "NISAR",
+                    "percent_valid_pixels": 90.0,
+                    "date_dt": 15.0,
+                    "proj:code": "EPSG:32632",
+                    "sat:orbit_state": "ascending",
+                    "scene_1_id": "s1",
+                    "scene_2_id": "s2",
+                    "scene_1_frame": "f1",
+                    "scene_2_frame": "f2",
+                    "version": "002",
+                    "start_datetime": "2023-01-10T00:00:00Z",
+                    "end_datetime": "2023-01-20T00:00:00Z",
+                    "updated": "2023-06-01T00:00:00Z",
+                },
+                "links": [],
+                "assets": {},
+            },
+            {
+                "id": "v2-item-extra-1",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[-10, 60], [10, 60], [10, 70], [-10, 70], [-10, 60]]],
+                },
+                "properties": {
+                    "datetime": "2023-02-15T00:00:00Z",
+                    "platform": "NISAR",
+                    "percent_valid_pixels": 85.0,
+                    "date_dt": 14.0,
+                    "proj:code": "EPSG:32632",
+                    "sat:orbit_state": "ascending",
+                    "scene_1_id": "s3",
+                    "scene_2_id": "s4",
+                    "scene_1_frame": "f3",
+                    "scene_2_frame": "f4",
+                    "version": "002",
+                    "start_datetime": "2023-02-10T00:00:00Z",
+                    "end_datetime": "2023-02-20T00:00:00Z",
+                    "updated": "2023-06-01T00:00:00Z",
+                },
+                "links": [],
+                "assets": {},
+            },
+        ]
+
+        extra_item_map = dict(zip(extra_pairs, extra_items))
+        all_item_map = {**_ITEM_MAP, **extra_item_map}
+
+        for (bucket, key), item in extra_item_map.items():
+            obstore.put(staging_store, f"{bucket}/{key}", json.dumps(item).encode())
+        inv2.write_text(_make_inventory_csv(extra_pairs))
+
+        catalog_path2 = str(tmp_path / "catalog2.db")
+        import shutil
+        shutil.copy(catalog_path, catalog_path2)
+
+        async def _mock_fetch_all(store, bucket, key):
+            return all_item_map.get((bucket, key))
+
+        with (
+            patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch_all),
+            dask.config.set(scheduler="synchronous"),
+        ):
+            run_backfill_v2(
+                inventory_path=str(inv2),
+                catalog_path=catalog_path2,
+                staging_store=staging_store,
+                staging_prefix="ingest2",
+                warehouse_store=MemoryStore(),
+                warehouse_root=str(wh_root),
+                partitioner=_PARTITIONER,
+                chunk_size=4,
+                use_lock=False,
+                delta=True,
+            )
+
+        catalog2 = open_catalog(db_path=catalog_path2, warehouse_path=str(wh_root))
+        table2 = catalog2.load_table("earthcatalog.stac_items")
+        result2 = table2.scan().to_arrow()
+        second_run_count = result2.num_rows
+        second_run_ids = set(result2.column("id").to_pylist())
+
+        assert second_run_count == first_run_count + 56
+        for item_id in first_run_ids:
+            assert item_id in second_run_ids
+        assert "v2-item-extra-0" in second_run_ids
+        assert "v2-item-extra-1" in second_run_ids
+
+        for cell_dir in (wh_root).glob("grid_partition=*"):
+            for year_dir in cell_dir.glob("year=*"):
+                part_files = sorted(year_dir.glob("part_*.parquet"))
+                part_names = [p.name for p in part_files]
+                assert len(part_names) == len(set(part_names)), f"Duplicate parquet names in {year_dir}"
 
 
 # ---------------------------------------------------------------------------
-# TestRunBackfillDask  (integration — requires real S3 read access)
+# Integration tests — fetch real STAC items from public ITS_LIVE bucket
 # ---------------------------------------------------------------------------
 
-INTEGRATION_INVENTORY = "/tmp/test_inventory_200.csv"
+_REAL_ITEM_KEY = (
+    "velocity_image_pair/landsatOLI/v02/N60W030/"
+    "LC08_L1TP_232011_20190524_20200828_02_T1_X_LC08_L1TP_232011_20190711_20200827_02_T1_G0120V02_P056.stac.json"
+)
 
 
 @pytest.mark.integration
-class TestRunBackfillDask:
-    """
-    End-to-end tests that fetch real STAC items from the public ITS_LIVE S3
-    bucket and write GeoParquet to a local warehouse.
-
-    Requires the 200-item inventory at ``/tmp/test_inventory_200.csv``
-    (generated by ``make_test_inventory.py`` in the smoke-test phase).
-
-    The Dask *synchronous* scheduler is used, so the full pipeline runs in a
-    single process and stack traces are readable.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _use_memory_store_config(self, tmp_path):
-        """Point store_config at a MemoryStore so catalog up/download are in-proc."""
-        store = MemoryStore()
-        store_config.set_store(store)
-        store_config.set_catalog_key("catalog.db")
-        yield store
+class TestFetchRealS3:
+    """Fetch real STAC items from the public its-live-data bucket."""
 
     @pytest.fixture()
-    def warehouse_dirs(self, tmp_path):
-        wh = tmp_path / "warehouse"
-        wh.mkdir()
-        return LocalStore(str(wh)), str(wh)
+    def public_store(self):
+        from obstore.store import S3Store
 
-    def _run(self, warehouse_dirs, **kwargs):
-        wh_store, wh_root = warehouse_dirs
-        catalog_path = str(Path(wh_root).parent / "catalog.db")
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=INTEGRATION_INVENTORY,
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=None,  # real S3 fetcher
-                h3_resolution=1,
-                chunk_size=50,
-                max_workers_per_task=8,
-                use_lock=False,
-                **kwargs,
-            )
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        return S3Store(bucket="its-live-data", region="us-west-2", skip_signature=True)
 
-        catalog = open_catalog(db_path=catalog_path, warehouse_path=wh_root)
-        return get_or_create_table(catalog)
+    def test_fetch_single_item(self, public_store):
+        import asyncio
 
-    def test_rows_written_from_real_s3(self, warehouse_dirs):
-        """200 real STAC items must produce ≥ 200 rows (H3 fan-out)."""
-        if not Path(INTEGRATION_INVENTORY).exists():
-            pytest.skip(f"inventory not found: {INTEGRATION_INVENTORY}")
-        table = self._run(warehouse_dirs)
-        result = table.scan().to_arrow()
-        assert result.num_rows >= 200
+        from earthcatalog.pipelines.backfill import _fetch_item_async
 
-    def test_single_snapshot_real_data(self, warehouse_dirs):
-        if not Path(INTEGRATION_INVENTORY).exists():
-            pytest.skip(f"inventory not found: {INTEGRATION_INVENTORY}")
-        table = self._run(warehouse_dirs)
-        assert len(table.history()) == 1
+        result = asyncio.run(_fetch_item_async(public_store, "its-live-data", _REAL_ITEM_KEY))
+        assert result is not None
+        assert result["type"] == "Feature"
+        assert "geometry" in result
+        assert "properties" in result
 
-    def test_hive_layout_real_data(self, warehouse_dirs):
-        if not Path(INTEGRATION_INVENTORY).exists():
-            pytest.skip(f"inventory not found: {INTEGRATION_INVENTORY}")
-        _, wh_root = warehouse_dirs
-        self._run(warehouse_dirs)
-        parquet_files = list(Path(wh_root).glob("**/*.parquet"))
-        assert len(parquet_files) > 0
-        for f in parquet_files:
-            parts = f.parts
-            assert any(p.startswith("grid_partition=") for p in parts)
-            assert any(p.startswith("year=") for p in parts)
+    def test_fetch_all_with_real_store(self, public_store):
+        import asyncio
 
-    def test_compact_produces_fewer_files_than_no_compact(self, tmp_path):
-        if not Path(INTEGRATION_INVENTORY).exists():
-            pytest.skip(f"inventory not found: {INTEGRATION_INVENTORY}")
+        from earthcatalog.pipelines.backfill import _fetch_all_async
 
-        # No compaction
-        wh_no = tmp_path / "wh_no"
-        wh_no.mkdir()
-        store_config.set_store(MemoryStore())
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=INTEGRATION_INVENTORY,
-                catalog_path=str(tmp_path / "cat_no.db"),
-                warehouse_store=LocalStore(str(wh_no)),
-                warehouse_root=str(wh_no),
-                h3_resolution=1,
-                chunk_size=50,
-                compact=False,
-                use_lock=False,
-            )
-        n_no = len(list(wh_no.glob("**/*.parquet")))
+        pairs = [("its-live-data", _REAL_ITEM_KEY)]
+        items, failed = asyncio.run(_fetch_all_async(pairs, concurrency=10, store=public_store))
 
-        # With compaction
-        wh_yes = tmp_path / "wh_yes"
-        wh_yes.mkdir()
-        store_config.set_store(MemoryStore())
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=INTEGRATION_INVENTORY,
-                catalog_path=str(tmp_path / "cat_yes.db"),
-                warehouse_store=LocalStore(str(wh_yes)),
-                warehouse_root=str(wh_yes),
-                h3_resolution=1,
-                chunk_size=50,
-                compact=True,
-                compact_threshold=2,
-                use_lock=False,
-            )
-        n_yes = len(list(wh_yes.glob("**/*.parquet")))
+        assert len(items) == 1
+        assert len(failed) == 0
+        assert items[0]["type"] == "Feature"
 
-        assert n_yes <= n_no, f"compaction increased file count: {n_yes} > {n_no}"
+    def test_fetch_missing_key_returns_none(self, public_store):
+        import asyncio
 
+        from earthcatalog.pipelines.backfill import _fetch_item_async
 
-# ---------------------------------------------------------------------------
-# TestCompactGroupImplDedup  — deduplication and orphan cleanup
-# ---------------------------------------------------------------------------
-
-
-class TestCompactGroupImplDedup:
-    """
-    Unit tests for the deduplication and orphan-file cleanup added to
-    ``_compact_group_impl()``.  All I/O uses MemoryStore — no Dask, no S3.
-    """
-
-    def _cell_year(self):
-        """Return a stable (cell, year) for fixture construction."""
-        item = _STAC_ITEMS[0]
-        fo = fan_out([item], _PARTITIONER)
-        groups = group_by_partition(fo)
-        return next(iter(groups.keys()))
-
-    def _write_item_to_store(
-        self, store: MemoryStore, key: str, item_overrides: dict
-    ) -> FileMetadata:
-        """Write a single STAC item (with property overrides) to store."""
-        import copy
-
-        item = copy.deepcopy(_STAC_ITEMS[0])
-        item["properties"].update(item_overrides)
-        if "id" in item_overrides:
-            item["id"] = item_overrides["id"]
-        fo = fan_out([item], _PARTITIONER)
-        groups = group_by_partition(fo)
-        (cell, year), group_items = next(iter(groups.items()))
-        n_rows, n_bytes = write_geoparquet_s3(group_items, store, key)
-        return FileMetadata(
-            s3_key=key,
-            grid_partition=cell,
-            year=year,
-            row_count=n_rows,
-            file_size_bytes=n_bytes,
+        result = asyncio.run(
+            _fetch_item_async(public_store, "its-live-data", "nonexistent/file.stac.json")
         )
-
-    def test_dedup_removes_duplicate_ids(self):
-        """Two part files with the same item id → compaction yields one row per id."""
-        store = MemoryStore()
-        cell, year = self._cell_year()
-        year_str = str(year) if year is not None else "unknown"
-        prefix = f"grid_partition={cell}/year={year_str}"
-
-        # Write the same item twice with different `updated` timestamps.
-        fm1 = self._write_item_to_store(
-            store,
-            f"{prefix}/part_000000_aaa.parquet",
-            {"id": "dup-item", "updated": "2026-01-01T00:00:00Z"},
-        )
-        fm2 = self._write_item_to_store(
-            store,
-            f"{prefix}/part_000001_bbb.parquet",
-            {"id": "dup-item", "updated": "2026-04-01T00:00:00Z"},
-        )
-        out_key = f"{prefix}/compacted.parquet"
-        _compact_group_impl([fm1, fm2], out_key, store)
-
-        tbl = _read_from_store(store, out_key)
-        ids = tbl.column("id").to_pylist()
-        # All ids that represent the same source item collapse after H3 fan-out
-        # — each unique (id, grid_partition) pair must appear exactly once.
-        assert len(ids) == len(set(ids)), f"duplicate ids after compaction: {ids}"
-
-    def test_dedup_keeps_most_recent_updated(self):
-        """When two rows share an id, the one with the later `updated` is kept."""
-        store = MemoryStore()
-        cell, year = self._cell_year()
-        year_str = str(year) if year is not None else "unknown"
-        prefix = f"grid_partition={cell}/year={year_str}"
-
-        fm_old = self._write_item_to_store(
-            store,
-            f"{prefix}/part_old.parquet",
-            {"id": "versioned-item", "updated": "2026-01-01T00:00:00Z", "version": "001"},
-        )
-        fm_new = self._write_item_to_store(
-            store,
-            f"{prefix}/part_new.parquet",
-            {"id": "versioned-item", "updated": "2026-04-01T00:00:00Z", "version": "002"},
-        )
-        out_key = f"{prefix}/compacted.parquet"
-        _compact_group_impl([fm_old, fm_new], out_key, store)
-
-        tbl = _read_from_store(store, out_key)
-        # Find the row(s) for "versioned-item" (may be fan-out duplicates with
-        # the same id; all should carry the newer version).
-        ids = tbl.column("id").to_pylist()
-        versions = tbl.column("version").to_pylist()
-        for i, id_val in enumerate(ids):
-            if id_val == "versioned-item":
-                assert versions[i] == "002", f"expected version '002' but got '{versions[i]}'"
-
-    def test_orphan_files_are_not_deleted(self):
-        """
-        Orphan sweep has been removed from _compact_group_impl.
-
-        Files present in the prefix but absent from file_metas must NOT be
-        touched here — the sweep is only safe in final_compact.py where one
-        task owns each (cell, year) prefix exclusively.  Deleting here during
-        concurrent ingest caused workers to remove each other's registered
-        part files.
-        """
-        store = MemoryStore()
-        cell, year = self._cell_year()
-        year_str = str(year) if year is not None else "unknown"
-        prefix = f"grid_partition={cell}/year={year_str}"
-
-        # Two known part files.
-        fm1 = self._write_item_to_store(
-            store,
-            f"{prefix}/part_known_1.parquet",
-            {},
-        )
-        fm2 = self._write_item_to_store(
-            store,
-            f"{prefix}/part_known_2.parquet",
-            {},
-        )
-        # One orphan — exists on disk but NOT in file_metas.
-        orphan_key = f"{prefix}/part_orphan.parquet"
-        self._write_item_to_store(store, orphan_key, {})
-
-        out_key = f"{prefix}/compacted.parquet"
-        _compact_group_impl([fm1, fm2], out_key, store)
-
-        # Orphan must still be present — no sweep.
-        raw = bytes(obstore.get(store, orphan_key).bytes())
-        assert len(raw) > 0
-
-        # Compacted output must also be present.
-        raw = bytes(obstore.get(store, out_key).bytes())
-        assert len(raw) > 0
-
-    def test_single_file_passthrough_leaves_orphan_intact(self):
-        """Single-file passthrough returns fm unchanged; orphan files are not deleted."""
-        store = MemoryStore()
-        cell, year = self._cell_year()
-        year_str = str(year) if year is not None else "unknown"
-        prefix = f"grid_partition={cell}/year={year_str}"
-
-        fm = self._write_item_to_store(
-            store,
-            f"{prefix}/part_only.parquet",
-            {},
-        )
-        orphan_key = f"{prefix}/part_stale.parquet"
-        self._write_item_to_store(store, orphan_key, {})
-
-        out_key = f"{prefix}/compacted_unused.parquet"
-        result = _compact_group_impl([fm], out_key, store)
-
-        # Single-file passthrough: result is the original fm.
-        assert result is fm
-        # Orphan must still be present — no sweep.
-        raw = bytes(obstore.get(store, orphan_key).bytes())
-        assert len(raw) > 0
-
-
-# ---------------------------------------------------------------------------
-# TestIngestStats
-# ---------------------------------------------------------------------------
-
-
-class TestIngestStats:
-    """
-    Unit tests for _write_ingest_stats() and fan-out counter propagation
-    through the full pipeline.
-    """
-
-    def _make_final_metas(self, cell="81007ffffffffff"):
-        """Return two minimal FileMetadata entries for testing."""
-        return [
-            FileMetadata(
-                s3_key=f"grid_partition={cell}/year=2019/compacted_a.parquet",
-                grid_partition=cell,
-                year=2019,
-                row_count=1000,
-                file_size_bytes=500_000,
-            ),
-            FileMetadata(
-                s3_key=f"grid_partition={cell}/year=2020/compacted_b.parquet",
-                grid_partition=cell,
-                year=2020,
-                row_count=200,
-                file_size_bytes=100_000,
-            ),
-        ]
-
-    # ------------------------------------------------------------------
-    # _write_ingest_stats — file creation and content
-    # ------------------------------------------------------------------
-
-    def test_creates_stats_file(self, tmp_path):
-        """Stats file is created next to the catalog."""
-        catalog = tmp_path / "catalog.db"
-        catalog.touch()
-        _write_ingest_stats(
-            catalog_path=str(catalog),
-            inventory_path="s3://bucket/manifest.json",
-            since=None,
-            source_items=1000,
-            total_rows=2800,
-            final_metas=self._make_final_metas(),
-            fan_out_counter={1: 50, 2: 400, 3: 550},
-            h3_resolution=1,
-        )
-        stats_path = tmp_path / "ingest_stats.json"
-        assert stats_path.exists()
-
-    def test_stats_values_correct(self, tmp_path):
-        """Written record contains correct computed fields."""
-        from collections import Counter
-
-        catalog = tmp_path / "catalog.db"
-        catalog.touch()
-        _write_ingest_stats(
-            catalog_path=str(catalog),
-            inventory_path="s3://bucket/manifest.json",
-            since=None,
-            source_items=1000,
-            total_rows=2800,
-            final_metas=self._make_final_metas(),
-            fan_out_counter=Counter({1: 50, 2: 400, 3: 550}),
-            h3_resolution=1,
-        )
-        records = json.loads((tmp_path / "ingest_stats.json").read_text())
-        assert len(records) == 1
-        r = records[0]
-        assert r["source_items"] == 1000
-        assert r["total_rows"] == 2800
-        assert r["avg_fan_out"] == 2.8
-        assert r["overhead_pct"] == 180.0
-        assert r["unique_cells"] == 1
-        assert r["unique_years"] == 2
-        assert r["files_written"] == 2
-        assert r["h3_resolution"] == 1
-        assert r["since"] is None
-        assert r["fan_out_distribution"] == {"1": 50, "2": 400, "3": 550}
-
-    def test_appends_across_runs(self, tmp_path):
-        """Each call appends a new record; existing records are preserved."""
-        from collections import Counter
-
-        catalog = tmp_path / "catalog.db"
-        catalog.touch()
-        for i in range(3):
-            _write_ingest_stats(
-                catalog_path=str(catalog),
-                inventory_path=f"s3://bucket/manifest_{i}.json",
-                since=None,
-                source_items=100 * (i + 1),
-                total_rows=200 * (i + 1),
-                final_metas=self._make_final_metas(),
-                fan_out_counter=Counter({2: 100 * (i + 1)}),
-                h3_resolution=1,
-            )
-        records = json.loads((tmp_path / "ingest_stats.json").read_text())
-        assert len(records) == 3
-        assert records[0]["source_items"] == 100
-        assert records[1]["source_items"] == 200
-        assert records[2]["source_items"] == 300
-
-    def test_since_serialised(self, tmp_path):
-        """When since is set, it is written as an ISO string."""
-        from collections import Counter
-        from datetime import datetime
-
-        catalog = tmp_path / "catalog.db"
-        catalog.touch()
-        since = datetime(2026, 4, 1, tzinfo=UTC)
-        _write_ingest_stats(
-            catalog_path=str(catalog),
-            inventory_path="s3://bucket/manifest.json",
-            since=since,
-            source_items=10,
-            total_rows=20,
-            final_metas=self._make_final_metas(),
-            fan_out_counter=Counter({2: 10}),
-            h3_resolution=1,
-        )
-        records = json.loads((tmp_path / "ingest_stats.json").read_text())
-        assert records[0]["since"] == since.isoformat()
-
-    # ------------------------------------------------------------------
-    # fan-out counter propagation through _ingest_chunk_impl
-    # ------------------------------------------------------------------
-
-    def test_ingest_chunk_returns_counter(self):
-        """_ingest_chunk_impl must return a Counter alongside file metas."""
-        from collections import Counter
-
-        store = MemoryStore()
-        metas, counter, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        assert isinstance(counter, Counter)
-        # Total items counted must equal number of source items fetched.
-        assert sum(counter.values()) == len(_STAC_ITEMS)
-        # All keys must be positive integers (cells per item).
-        assert all(k >= 1 for k in counter)
-
-    def test_ingest_chunk_counter_sums_to_total_rows(self):
-        """sum(k * v for k, v in counter) == total rows written."""
-        store = MemoryStore()
-        metas, counter, _ = _ingest_chunk_impl(
-            _ALL_PAIRS,
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        total_rows_from_metas = sum(m.row_count for m in metas)
-        total_rows_from_counter = sum(k * v for k, v in counter.items())
-        assert total_rows_from_counter == total_rows_from_metas
-
-    def test_empty_chunk_returns_empty_counter(self):
-        """An empty bucket-key list returns an empty Counter, not an error."""
-        from collections import Counter
-
-        store = MemoryStore()
-        metas, counter, _ = _ingest_chunk_impl(
-            [],
-            _PARTITIONER,
-            store,
-            chunk_id=0,
-            item_fetcher=_mock_fetcher,
-        )
-        assert metas == []
-        assert counter == Counter()
-
-    # ------------------------------------------------------------------
-    # end-to-end: stats file written by run_backfill
-    # ------------------------------------------------------------------
-
-    def test_run_backfill_writes_stats_file(self, tmp_path):
-        """run_backfill() must create ingest_stats.json in the catalog directory."""
-        from obstore.store import LocalStore, MemoryStore
-
-        from earthcatalog.core import store_config
-
-        store_config.set_store(MemoryStore())
-        store_config.set_catalog_key("catalog.db")
-
-        wh = tmp_path / "warehouse"
-        wh.mkdir()
-        wh_store = LocalStore(str(wh))
-        catalog_path = str(tmp_path / "catalog.db")
-
-        # Empty CSV with header — produces 0 items, still writes stats.
-        inv = tmp_path / "inv.csv"
-        inv.write_text("bucket,key\n")
-
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=str(inv),
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=str(wh),
-                item_fetcher=_mock_fetcher,
-                h3_resolution=2,
-                chunk_size=10,
-                use_lock=False,
-            )
-
-        stats_path = tmp_path / "ingest_stats.json"
-        assert stats_path.exists(), "ingest_stats.json was not created"
-        records = json.loads(stats_path.read_text())
-        assert len(records) == 1
-        r = records[0]
-        assert r["h3_resolution"] == 2
-        assert r["source_items"] == 0
-        assert r["total_rows"] == 0
-
-    def test_run_backfill_stats_with_items(self, tmp_path):
-        """Stats record reflects correct counts when items are actually ingested."""
-        import csv
-
-        from obstore.store import LocalStore, MemoryStore
-
-        from earthcatalog.core import store_config
-
-        # Write a tiny CSV inventory pointing at mock keys.
-        inv = tmp_path / "inv.csv"
-        with open(inv, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["bucket", "key"])
-            for b, k in _ALL_PAIRS:
-                w.writerow([b, k])
-
-        store_config.set_store(MemoryStore())
-        store_config.set_catalog_key("catalog.db")
-
-        wh = tmp_path / "warehouse"
-        wh.mkdir()
-        wh_store = LocalStore(str(wh))
-        catalog_path = str(tmp_path / "catalog.db")
-
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=str(inv),
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=str(wh),
-                item_fetcher=_mock_fetcher,
-                h3_resolution=2,
-                chunk_size=50,
-                use_lock=False,
-            )
-
-        records = json.loads((tmp_path / "ingest_stats.json").read_text())
-        r = records[0]
-        assert r["source_items"] == len(_STAC_ITEMS)
-        assert r["total_rows"] == sum(int(k) * v for k, v in r["fan_out_distribution"].items())
-        assert r["avg_fan_out"] > 0
-        assert r["files_written"] > 0
-        assert isinstance(r["fan_out_distribution"], dict)
-
-
-# ---------------------------------------------------------------------------
-# TestLoadProcessedFiles
-# ---------------------------------------------------------------------------
-
-
-class TestLoadProcessedFiles:
-    """Unit tests for _load_processed_files()."""
-
-    def test_returns_empty_set_when_file_missing(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _load_processed_files
-
-        result = _load_processed_files(str(tmp_path / "nonexistent.json"))
-        assert result == set()
-
-    def test_returns_empty_set_on_corrupt_file(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _load_processed_files
-
-        p = tmp_path / "stats.json"
-        p.write_text("not valid json{{")
-        result = _load_processed_files(str(p))
-        assert result == set()
-
-    def test_returns_inventory_file_keys(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _load_processed_files
-
-        p = tmp_path / "stats.json"
-        records = [
-            {
-                "inventory_file": "inventory/data/file1.parquet",
-                "run_id": "2026-01-01T00:00:00+00:00",
-            },
-            {
-                "inventory_file": "inventory/data/file2.parquet",
-                "run_id": "2026-01-01T00:01:00+00:00",
-            },
-            {"inventory_file": None, "run_id": "2026-01-01T00:02:00+00:00"},  # null → excluded
-        ]
-        p.write_text(json.dumps(records))
-        result = _load_processed_files(str(p))
-        assert result == {"inventory/data/file1.parquet", "inventory/data/file2.parquet"}
-
-    def test_records_without_inventory_file_field_excluded(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _load_processed_files
-
-        p = tmp_path / "stats.json"
-        # Old-format records (before this field was added) have no inventory_file key.
-        records = [{"run_id": "2026-01-01T00:00:00+00:00", "source_items": 100}]
-        p.write_text(json.dumps(records))
-        result = _load_processed_files(str(p))
-        assert result == set()
-
-
-# ---------------------------------------------------------------------------
-# TestPerFileMiniRuns
-# ---------------------------------------------------------------------------
-
-
-class TestPerFileMiniRuns:
-    """
-    Tests for the spot-resilient per-file mini-run path in run_backfill().
-
-    We simulate a manifest by patching _list_manifest_files and
-    _iter_inventory_file_from_store so no real S3 calls are made.
-    """
-
-    def _make_env(self, tmp_path):
-        """Return (catalog_path, wh_store, wh_root, stats_path)."""
-        from obstore.store import LocalStore, MemoryStore
-
-        from earthcatalog.core import store_config
-
-        store_config.set_store(MemoryStore())
-        store_config.set_catalog_key("catalog.db")
-
-        wh = tmp_path / "warehouse"
-        wh.mkdir()
-        wh_store = LocalStore(str(wh))
-        catalog_path = str(tmp_path / "catalog.db")
-        stats_path = tmp_path / "ingest_stats.json"
-        return catalog_path, wh_store, str(wh), stats_path
-
-    def test_per_file_writes_one_stats_record_per_file(self, tmp_path):
-        """
-        With two manifest data files, ingest_stats.json should have two records
-        — one per file — each with a distinct inventory_file field.
-        """
-        import io
-
-        import dask
-
-        catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
-
-        # Build a fake inventory parquet file for each manifest data file.
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        def _make_parquet_bytes(pairs):
-            tbl = pa.table(
-                {
-                    "bucket": [b for b, _ in pairs],
-                    "key": [k for _, k in pairs],
-                }
-            )
-            buf = io.BytesIO()
-            pq.write_table(tbl, buf)
-            buf.seek(0)
-            return buf.read()
-
-        file_a_pairs = [
-            ("mock-bucket", "stac/item-0000.stac.json"),
-            ("mock-bucket", "stac/item-0001.stac.json"),
-        ]
-        file_b_pairs = [
-            ("mock-bucket", "stac/item-0002.stac.json"),
-            ("mock-bucket", "stac/item-0003.stac.json"),
-        ]
-
-        fake_dest_store = object()  # dummy — never used directly
-        fake_data_keys = ["inv/data/fileA.parquet", "inv/data/fileB.parquet"]
-
-        pairs_by_key = {
-            "inv/data/fileA.parquet": file_a_pairs,
-            "inv/data/fileB.parquet": file_b_pairs,
-        }
-
-        def fake_list_manifest(uri):
-            return "mock-bucket", fake_dest_store, fake_data_keys
-
-        def fake_iter_file(store, data_key, batch_size=65536, since=None):
-            yield from pairs_by_key[data_key]
-
-        manifest_uri = "s3://fake-log-bucket/inv/manifest.json"
-
-        with (
-            patch(
-                "earthcatalog.pipelines.backfill._list_manifest_files",
-                side_effect=fake_list_manifest,
-            ),
-            patch(
-                "earthcatalog.pipelines.backfill._iter_inventory_file_from_store",
-                side_effect=fake_iter_file,
-            ),
-            dask.config.set(scheduler="synchronous"),
-        ):
-            run_backfill(
-                inventory_path=manifest_uri,
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=_mock_fetcher,
-                h3_resolution=2,
-                chunk_size=50,
-                use_lock=False,
-                per_file_mini_runs=True,
-            )
-
-        assert stats_path.exists(), "ingest_stats.json was not created"
-        records = json.loads(stats_path.read_text())
-        assert len(records) == 2, f"expected 2 records, got {len(records)}"
-        keys = {r["inventory_file"] for r in records}
-        assert keys == set(fake_data_keys)
-
-    def test_checkpoint_skips_already_processed_files(self, tmp_path):
-        """
-        If ingest_stats.json already records fileA, only fileB should be
-        processed in the new run.
-        """
-        import dask
-
-        catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
-
-        # Pre-seed stats with fileA already done.
-        stats_path.write_text(
-            json.dumps(
-                [
-                    {
-                        "inventory_file": "inv/data/fileA.parquet",
-                        "run_id": "2026-01-01T00:00:00+00:00",
-                        "source_items": 2,
-                    }
-                ]
-            )
-        )
-
-        file_b_pairs = [("mock-bucket", "stac/item-0002.stac.json")]
-        fake_data_keys = ["inv/data/fileA.parquet", "inv/data/fileB.parquet"]
-        pairs_by_key = {"inv/data/fileB.parquet": file_b_pairs}
-        processed = []
-
-        def fake_list_manifest(uri):
-            return "mock-bucket", object(), fake_data_keys
-
-        def fake_iter_file(store, data_key, batch_size=65536, since=None):
-            processed.append(data_key)
-            yield from pairs_by_key.get(data_key, [])
-
-        with (
-            patch(
-                "earthcatalog.pipelines.backfill._list_manifest_files",
-                side_effect=fake_list_manifest,
-            ),
-            patch(
-                "earthcatalog.pipelines.backfill._iter_inventory_file_from_store",
-                side_effect=fake_iter_file,
-            ),
-            dask.config.set(scheduler="synchronous"),
-        ):
-            run_backfill(
-                inventory_path="s3://fake-log-bucket/inv/manifest.json",
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=_mock_fetcher,
-                h3_resolution=2,
-                chunk_size=50,
-                use_lock=False,
-                per_file_mini_runs=True,
-                report_location=str(stats_path),
-            )
-
-        # Only fileB should have been iterated.
-        assert processed == ["inv/data/fileB.parquet"], (
-            f"fileA should be skipped; processed={processed}"
-        )
-
-        records = json.loads(stats_path.read_text())
-        # One pre-existing record + one new record for fileB.
-        assert len(records) == 2
-        keys = {r["inventory_file"] for r in records}
-        assert "inv/data/fileB.parquet" in keys
-
-    def test_per_file_false_uses_monolithic_path(self, tmp_path):
-        """
-        When per_file_mini_runs=False, a manifest URI goes through the
-        monolithic _iter_inventory path (no _list_manifest_files call).
-        """
-        import csv
-
-        import dask
-
-        catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
-
-        # Use a CSV inventory (not a manifest) to keep it simple.
-        inv = tmp_path / "inv.csv"
-        with open(inv, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["bucket", "key"])
-            for b, k in _ALL_PAIRS[:2]:
-                w.writerow([b, k])
-
-        list_manifest_called = []
-
-        def fake_list_manifest(uri):
-            list_manifest_called.append(uri)
-            return "mock-bucket", object(), []
-
-        with (
-            patch(
-                "earthcatalog.pipelines.backfill._list_manifest_files",
-                side_effect=fake_list_manifest,
-            ),
-            dask.config.set(scheduler="synchronous"),
-        ):
-            run_backfill(
-                inventory_path=str(inv),
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=_mock_fetcher,
-                h3_resolution=2,
-                chunk_size=50,
-                use_lock=False,
-                per_file_mini_runs=False,
-            )
-
-        assert list_manifest_called == [], (
-            "_list_manifest_files should not be called in monolithic mode"
-        )
-
-    def test_inventory_file_field_is_null_for_monolithic_run(self, tmp_path):
-        """
-        In monolithic mode the ingest_stats.json record should have
-        inventory_file=null (not a data-file key).
-        """
-        import csv
-
-        import dask
-
-        catalog_path, wh_store, wh_root, stats_path = self._make_env(tmp_path)
-
-        inv = tmp_path / "inv.csv"
-        with open(inv, "w", newline="") as fh:
-            csv.writer(fh).writerow(["bucket", "key"])
-
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=str(inv),
-                catalog_path=catalog_path,
-                warehouse_store=wh_store,
-                warehouse_root=wh_root,
-                item_fetcher=_mock_fetcher,
-                h3_resolution=2,
-                use_lock=False,
-            )
-
-        records = json.loads(stats_path.read_text())
-        assert records[0]["inventory_file"] is None
+        assert result is None

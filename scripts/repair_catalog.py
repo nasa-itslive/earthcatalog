@@ -24,10 +24,8 @@ Usage
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -71,6 +69,8 @@ import obstore  # noqa: E402
 from obstore.store import S3Store  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from pyiceberg.exceptions import NamespaceAlreadyExistsError  # noqa: E402
+
 from earthcatalog.core.catalog import (  # noqa: E402
     FULL_NAME,
     ICEBERG_SCHEMA,
@@ -78,7 +78,6 @@ from earthcatalog.core.catalog import (  # noqa: E402
     PARTITION_SPEC,
     open_catalog,
 )
-from pyiceberg.exceptions import NamespaceAlreadyExistsError  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Build obstore S3Store for the warehouse bucket
