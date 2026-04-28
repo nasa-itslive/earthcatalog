@@ -141,7 +141,7 @@ def _compact_group_impl(
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        pq.write_table(merged, tmp_path)
+        pq.write_table(merged, tmp_path, compression="zstd")
         data = Path(tmp_path).read_bytes()
         obstore.put(store, out_key, data)
     finally:

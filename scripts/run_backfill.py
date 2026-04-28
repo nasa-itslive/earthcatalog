@@ -61,12 +61,22 @@ def main() -> None:
     parser.add_argument(
         "--fetch-concurrency", type=int, default=256, help="Async fetch concurrency per worker"
     )
-    parser.add_argument("--h3-resolution", type=int, default=1)
+    parser.add_argument(
+        "--h3-resolution",
+        type=int,
+        default=None,
+        help="H3 resolution (auto-detected from catalog for delta runs)",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--since", default=None, help="Only items modified >= this date (YYYY-MM-DD)"
     )
     parser.add_argument("--no-lock", action="store_true")
+    parser.add_argument(
+        "--skip-upload",
+        action="store_true",
+        help="Skip uploading catalog.db to S3 (for local testing)",
+    )
     parser.add_argument(
         "--skip-inventory",
         action="store_true",
@@ -234,6 +244,7 @@ def main() -> None:
             retry_pending=args.retry_pending,
             delta=args.delta,
             create_client=_create_cluster,
+            upload=not args.skip_upload,
         )
     elif args.scheduler == "local":
         from dask.distributed import Client, LocalCluster
@@ -262,6 +273,7 @@ def main() -> None:
                 skip_ingest=args.skip_ingest,
                 retry_pending=args.retry_pending,
                 delta=args.delta,
+                upload=not args.skip_upload,
             )
     else:
         from earthcatalog.pipelines.backfill import run_backfill
@@ -285,6 +297,7 @@ def main() -> None:
                 skip_ingest=args.skip_ingest,
                 retry_pending=args.retry_pending,
                 delta=args.delta,
+                upload=not args.skip_upload,
             )
 
 

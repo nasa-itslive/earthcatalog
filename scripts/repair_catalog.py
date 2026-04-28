@@ -1,74 +1,78 @@
 """
-Repair the earthcatalog Iceberg table after the Bug-2 orphan-sweep incident.
+Rebuild the earthcatalog Iceberg catalog from warehouse Parquet files.
 
-The bug caused compacted_*.parquet files that were already registered in
-Iceberg to be deleted from S3, leaving ~13 700 dangling file references.
-This script:
+Scans the warehouse for all ``*.parquet`` files with hive-style paths
+(``grid_partition=X/year=Y/*.parquet``), creates a fresh SQLite catalog,
+and registers every file via ``table.add_files()``.
 
-  1. Lists all .parquet files currently present in the warehouse on S3.
-  2. Creates a fresh SQLite catalog (earthcatalog_repaired.db).
-  3. Registers every existing file via table.add_files() — PyIceberg infers
-     partition values (grid_partition, year) from the hive-style path layout.
-  4. Verifies the repaired catalog with a quick scan.
-  5. Optionally uploads the repaired catalog to S3 (--upload flag).
+Supports local filesystem paths and S3 URIs.  For public S3 buckets,
+no credentials are needed — anonymous access is used automatically.
 
 Usage
 -----
+Local::
+
+    python scripts/repair_catalog.py \\
+        --warehouse /tmp/warehouse_test \\
+        --output /tmp/earthcatalog.db \\
+        --h3-resolution 1
+
+S3::
+
     python scripts/repair_catalog.py \\
         --warehouse s3://its-live-data/test-space/stac/catalog/warehouse/ \\
-        --catalog-s3 s3://its-live-data/test-space/stac/catalog/earthcatalog.db \\
         --output /tmp/earthcatalog_repaired.db \\
-        [--upload]
+        --h3-resolution 1 \\
+        --upload
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import sys
+import re
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-parser = argparse.ArgumentParser(description="Repair earthcatalog Iceberg catalog")
-parser.add_argument(
-    "--warehouse",
-    default="s3://its-live-data/test-space/stac/catalog/warehouse/",
-    help="S3 URI of the Iceberg warehouse root",
+parser = argparse.ArgumentParser(
+    description="Rebuild earthcatalog Iceberg catalog from warehouse files"
 )
 parser.add_argument(
-    "--catalog-s3",
-    default="s3://its-live-data/test-space/stac/catalog/earthcatalog.db",
-    help="S3 URI of the current catalog.db (used for reference / backup only)",
+    "--warehouse",
+    required=True,
+    help="Warehouse root (local path or s3:// URI)",
 )
 parser.add_argument(
     "--output",
     default="/tmp/earthcatalog_repaired.db",
-    help="Local path for the repaired SQLite catalog",
+    help="Local path for the rebuilt SQLite catalog",
+)
+parser.add_argument(
+    "--h3-resolution",
+    type=int,
+    default=None,
+    help="H3 resolution to store as table property",
 )
 parser.add_argument(
     "--upload",
     action="store_true",
-    help="Upload the repaired catalog to --catalog-s3 when done",
+    help="Upload rebuilt catalog to S3 (requires --catalog-s3)",
 )
 parser.add_argument(
-    "--workers",
-    type=int,
-    default=32,
-    help="Thread-pool size for parallel S3 HEAD checks",
+    "--catalog-s3",
+    default="s3://its-live-data/test-space/stac/catalog/earthcatalog.db",
+    help="S3 URI to upload the catalog to (used with --upload)",
 )
 args = parser.parse_args()
 
+HIVE_RE = re.compile(
+    r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+)
+
 # ---------------------------------------------------------------------------
-# Imports (after arg parse so --help works without heavy deps)
+# Imports
 # ---------------------------------------------------------------------------
 
-import obstore  # noqa: E402
-from obstore.store import S3Store  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# noqa: E402
 from pyiceberg.exceptions import NamespaceAlreadyExistsError  # noqa: E402
 
 from earthcatalog.core.catalog import (  # noqa: E402
@@ -76,61 +80,56 @@ from earthcatalog.core.catalog import (  # noqa: E402
     ICEBERG_SCHEMA,
     NAMESPACE,
     PARTITION_SPEC,
+    PROP_GRID_RESOLUTION,
+    PROP_GRID_TYPE,
     open_catalog,
 )
 
 # ---------------------------------------------------------------------------
-# Build obstore S3Store for the warehouse bucket
+# 1. List all hive-style parquet files
 # ---------------------------------------------------------------------------
 
-region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+parquet_uris: list[str] = []
 
-warehouse_no_scheme = args.warehouse.removeprefix("s3://")
-warehouse_bucket, warehouse_prefix = warehouse_no_scheme.split("/", 1)
+if args.warehouse.startswith("s3://"):
+    import obstore
+    from obstore.store import S3Store
 
-store_kwargs: dict = dict(bucket=warehouse_bucket, region=region)
-key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-token = os.environ.get("AWS_SESSION_TOKEN")
-if key_id:
-    store_kwargs["aws_access_key_id"] = key_id
-if secret:
-    store_kwargs["aws_secret_access_key"] = secret
-if token:
-    store_kwargs["aws_session_token"] = token
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+    no_scheme = args.warehouse.removeprefix("s3://")
+    bucket, prefix = no_scheme.split("/", 1)
 
-store = S3Store(**store_kwargs)
+    store_kwargs: dict = dict(bucket=bucket, region=region, skip_signature=True)
+    key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    token = os.environ.get("AWS_SESSION_TOKEN")
+    if key_id and secret:
+        store_kwargs["aws_access_key_id"] = key_id
+        store_kwargs["aws_secret_access_key"] = secret
+        del store_kwargs["skip_signature"]
+        if token:
+            store_kwargs["aws_session_token"] = token
 
-# ---------------------------------------------------------------------------
-# 1. List all .parquet files present in the warehouse
-# ---------------------------------------------------------------------------
+    store = S3Store(**store_kwargs)
 
-print(f"Listing compacted_*.parquet files under s3://{warehouse_bucket}/{warehouse_prefix} …")
-all_parquet: list[str] = []
-part_files: list[str] = []
-for batch in obstore.list(store, prefix=warehouse_prefix):
-    for obj in batch:
-        key = obj["path"]
-        basename = key.rsplit("/", 1)[-1]
-        if basename.startswith("compacted_") and key.endswith(".parquet"):
-            all_parquet.append(key)
-        elif basename.startswith("part_") and key.endswith(".parquet"):
-            part_files.append(key)
+    print(f"Listing *.parquet files under s3://{bucket}/{prefix} …")
+    for batch in obstore.list(store, prefix=prefix):
+        for obj in batch:
+            key: str = obj["path"]
+            if key.endswith(".parquet") and HIVE_RE.search(key):
+                parquet_uris.append(f"s3://{bucket}/{key}")
+else:
+    warehouse_path = Path(args.warehouse)
+    print(f"Listing *.parquet files under {warehouse_path} …")
+    for f in warehouse_path.glob("**/*.parquet"):
+        rel = str(f.relative_to(warehouse_path))
+        if HIVE_RE.search(rel):
+            parquet_uris.append(str(f))
 
-print(f"  Found {len(all_parquet):,} compacted_*.parquet files (will register)")
-if part_files:
-    print(
-        f"  Found {len(part_files):,} part_*.parquet files (raw ingest chunks — skipping to avoid duplicates)"
-    )
-    print(
-        "  NOTE: these may be leftovers from interrupted mini-runs. Safe to delete manually if confirmed stale."
-    )
-
-# Build full s3:// URIs for add_files
-parquet_uris = [f"s3://{warehouse_bucket}/{k}" for k in all_parquet]
+print(f"  Found {len(parquet_uris):,} parquet files with hive-style paths")
 
 # ---------------------------------------------------------------------------
-# 2. Create a fresh catalog and register all existing files
+# 2. Create a fresh catalog and register all files
 # ---------------------------------------------------------------------------
 
 output_path = Path(args.output)
@@ -143,15 +142,19 @@ try:
 except NamespaceAlreadyExistsError:
     pass
 
+props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+if args.h3_resolution is not None:
+    props[PROP_GRID_RESOLUTION] = str(args.h3_resolution)
+
 table = catalog.create_table(
     identifier=FULL_NAME,
     schema=ICEBERG_SCHEMA,
     partition_spec=PARTITION_SPEC,
+    properties=props,
 )
 
-print(f"Registering {len(parquet_uris):,} files into fresh catalog …")
+print(f"Registering {len(parquet_uris):,} files …")
 
-# add_files in batches to keep Iceberg transactions manageable
 BATCH = 2_000
 total_registered = 0
 for i in range(0, len(parquet_uris), BATCH):
@@ -175,18 +178,22 @@ print(f"Manifest files: {len(list(table.inspect.manifests())) if snap else 0}")
 # ---------------------------------------------------------------------------
 
 if args.upload:
+    import obstore
+    from obstore.store import S3Store
+
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
     no_scheme = args.catalog_s3.removeprefix("s3://")
     cat_bucket, cat_key = no_scheme.split("/", 1)
     cat_store_kwargs: dict = dict(bucket=cat_bucket, region=region)
+    key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
     if key_id:
         cat_store_kwargs["aws_access_key_id"] = key_id
     if secret:
         cat_store_kwargs["aws_secret_access_key"] = secret
-    if token:
-        cat_store_kwargs["aws_session_token"] = token
     cat_store = S3Store(**cat_store_kwargs)
     obstore.put(cat_store, cat_key, output_path.read_bytes())
-    print(f"Uploaded repaired catalog → {args.catalog_s3}")
+    print(f"Uploaded catalog → {args.catalog_s3}")
 else:
-    print(f"\nRepaired catalog written to {output_path}")
+    print(f"\nCatalog written to {output_path}")
     print("Re-run with --upload to push it to S3.")

@@ -346,7 +346,7 @@ def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
         raw = pq.ParquetFile(tmp).read()
         geo_meta = pq.ParquetFile(tmp).metadata.metadata.get(b"geo", b"")
         aligned = _align_schema(raw, geo_meta)
-        pq.write_table(aligned, path)
+        pq.write_table(aligned, path, compression="zstd")
         return len(aligned)
     finally:
         if os.path.exists(tmp):

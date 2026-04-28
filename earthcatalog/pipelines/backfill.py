@@ -75,6 +75,8 @@ import pyarrow.parquet as pq
 import tqdm
 
 from earthcatalog.core.catalog import (
+    PROP_GRID_RESOLUTION,
+    PROP_GRID_TYPE,
     open_catalog,
     upload_catalog,
 )
@@ -795,6 +797,7 @@ def register_and_cleanup(
     staging_store: object,
     staging_prefix: str,
     upload: bool = True,
+    h3_resolution: int | None = None,
 ) -> None:
     """
     Phase 4: rebuild Iceberg catalog from warehouse files, upload, cleanup staging.
@@ -824,10 +827,15 @@ def register_and_cleanup(
     except NoSuchTableError:
         pass
 
+    props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+    if h3_resolution is not None:
+        props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+
     table = catalog.create_table(
         identifier=FULL_NAME,
         schema=ICEBERG_SCHEMA,
         partition_spec=PARTITION_SPEC,
+        properties=props,
     )
 
     hive_re = re.compile(
@@ -868,6 +876,7 @@ def register_delta(
     staging_store: object,
     staging_prefix: str,
     upload: bool = True,
+    h3_resolution: int | None = None,
 ) -> None:
     """
     Phase 4 delta: add new parquet files to existing Iceberg table (no drop).
@@ -891,14 +900,23 @@ def register_delta(
     except (NamespaceAlreadyExistsError, NoSuchNamespaceError):
         pass
 
+    props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+    if h3_resolution is not None:
+        props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+
     try:
         table = catalog.load_table(FULL_NAME)
         print(f"Opened existing Iceberg table {FULL_NAME}")
+        missing = {k: v for k, v in props.items() if k not in table.properties}
+        if missing:
+            with table.transaction() as tx:
+                tx.set_properties(**missing)
     except NoSuchTableError:
         table = catalog.create_table(
             identifier=FULL_NAME,
             schema=ICEBERG_SCHEMA,
             partition_spec=PARTITION_SPEC,
+            properties=props,
         )
         print(f"Created new Iceberg table {FULL_NAME}")
 
@@ -966,13 +984,14 @@ def run_backfill(
     warehouse_store: object,
     warehouse_root: str,
     partitioner: object | None = None,
-    h3_resolution: int = 1,
+    h3_resolution: int | None = None,
     chunk_size: int = 100_000,
     compact_rows: int = 100_000,
     fetch_concurrency: int = 256,
     limit: int | None = None,
     since: datetime | None = None,
     use_lock: bool = True,
+    upload: bool = True,
     skip_inventory: bool = False,
     skip_ingest: bool = False,
     retry_pending: bool = False,
@@ -998,7 +1017,13 @@ def run_backfill(
     warehouse_root:
         Path or s3:// URI for the warehouse root (used by add_files).
     partitioner:
-        H3Partitioner or similar. Defaults to H3Partitioner(h3_resolution).
+        H3Partitioner or similar.  When *None*, the partitioner is built from
+        *h3_resolution* (see below).
+    h3_resolution:
+        H3 resolution for the default partitioner.  When *None* the resolution
+        is read from the existing Iceberg table's properties.  If the table
+        does not exist yet and no resolution is given, a ``ValueError`` is
+        raised.
     chunk_size:
         Items per chunk Parquet in Phase 1.
     compact_rows:
@@ -1021,7 +1046,33 @@ def run_backfill(
         Coiled to avoid idle cluster timeout during long Phase 1 runs.
     """
     if partitioner is None:
-        partitioner = H3Partitioner(resolution=h3_resolution)
+        if h3_resolution is not None:
+            partitioner = H3Partitioner(resolution=h3_resolution)
+        else:
+            from pyiceberg.exceptions import NoSuchTableError
+
+            from earthcatalog.core.catalog import FULL_NAME
+
+            catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+            try:
+                table = catalog.load_table(FULL_NAME)
+            except NoSuchTableError:
+                raise ValueError(
+                    "No existing table and no --h3-resolution given. "
+                    "Specify --h3-resolution for the initial backfill."
+                )
+
+            raw = table.properties.get(PROP_GRID_RESOLUTION)
+            if raw is not None:
+                partitioner = H3Partitioner(resolution=int(raw))
+                print(f"Auto-detected H3 resolution {int(raw)} from catalog")
+            else:
+                partitioner = H3Partitioner(resolution=1)
+                print("No resolution property on table, defaulting to H3 resolution 1")
+
+    resolved_resolution = (
+        partitioner.resolution if hasattr(partitioner, "resolution") else h3_resolution
+    )
 
     def _run() -> None:
         # Phase 1 — Scheduler
@@ -1242,6 +1293,8 @@ def run_backfill(
                 new_parquet_paths=new_paths,
                 staging_store=staging_store,
                 staging_prefix=staging_prefix,
+                h3_resolution=resolved_resolution,
+                upload=upload,
             )
         else:
             register_and_cleanup(
@@ -1249,6 +1302,8 @@ def run_backfill(
                 warehouse_root=warehouse_root,
                 staging_store=staging_store,
                 staging_prefix=staging_prefix,
+                h3_resolution=resolved_resolution,
+                upload=upload,
             )
 
     if use_lock:
