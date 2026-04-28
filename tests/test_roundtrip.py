@@ -72,6 +72,7 @@ def _write_and_add(iceberg_table_fixture, items, resolution=2):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.e2e
 class TestRoundTrip:
     def test_append_and_scan_row_count(self, iceberg_table, tmp_path):
         """Rows written must be readable back via PyIceberg scan."""

@@ -51,9 +51,10 @@ ITEMS = [
 ]
 
 
-@pytest.fixture()
-def populated_table(tmp_path):
+@pytest.fixture(scope="module")
+def populated_table(tmp_path_factory):
     """Build and populate an Iceberg table; return (table, duckdb_connection)."""
+    tmp_path = tmp_path_factory.mktemp("duckdb")
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
     cat = open_catalog(db_path=db, warehouse_path=wh)

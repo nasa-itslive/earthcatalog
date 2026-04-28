@@ -209,9 +209,7 @@ class TestFetchAllAsync:
         for bucket, key in pairs:
             obstore.put(store, key, json.dumps(_ITEM_MAP[(bucket, key)]).encode())
 
-        items, failed = asyncio.run(
-            _fetch_all_async(pairs, concurrency=10, store=store)
-        )
+        items, failed = asyncio.run(_fetch_all_async(pairs, concurrency=10, store=store))
 
         assert len(items) == 4
         assert len(failed) == 0
@@ -225,9 +223,7 @@ class TestFetchAllAsync:
         bucket, key = _ALL_PAIRS[0]
         obstore.put(store, key, json.dumps(_ITEM_MAP[(bucket, key)]).encode())
 
-        items, failed = asyncio.run(
-            _fetch_all_async(_ALL_PAIRS, concurrency=10, store=store)
-        )
+        items, failed = asyncio.run(_fetch_all_async(_ALL_PAIRS, concurrency=10, store=store))
 
         assert len(items) == 1
         assert len(failed) == 7
@@ -626,6 +622,7 @@ class TestRegisterAndCleanup:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.e2e
 class TestRunBackfillV2:
     @pytest.fixture(autouse=True)
     def _setup_store_config(self):
@@ -932,7 +929,9 @@ class TestCompactCellYearDeltaS3:
         assert len(report["output_files"]) == 1
         assert "part_000002.parquet" in report["output_files"][0]
 
-        old_data = memoryview(obstore.get(wh_store, f"grid_partition={cell}/year={year}/part_000000.parquet").bytes()).tobytes()
+        old_data = memoryview(
+            obstore.get(wh_store, f"grid_partition={cell}/year={year}/part_000000.parquet").bytes()
+        ).tobytes()
         assert old_data == b"old"
 
 
@@ -1034,6 +1033,7 @@ class TestRegisterDelta:
         assert "delta-1" in ids
 
 
+@pytest.mark.e2e
 class TestRunBackfillV2Delta:
     @pytest.fixture(autouse=True)
     def _setup_store_config(self):
@@ -1155,6 +1155,7 @@ class TestRunBackfillV2Delta:
 
         catalog_path2 = str(tmp_path / "catalog2.db")
         import shutil
+
         shutil.copy(catalog_path, catalog_path2)
 
         async def _mock_fetch_all(store, bucket, key):
@@ -1193,7 +1194,9 @@ class TestRunBackfillV2Delta:
             for year_dir in cell_dir.glob("year=*"):
                 part_files = sorted(year_dir.glob("part_*.parquet"))
                 part_names = [p.name for p in part_files]
-                assert len(part_names) == len(set(part_names)), f"Duplicate parquet names in {year_dir}"
+                assert len(part_names) == len(set(part_names)), (
+                    f"Duplicate parquet names in {year_dir}"
+                )
 
 
 # ---------------------------------------------------------------------------

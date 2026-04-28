@@ -81,7 +81,7 @@ PARTITION_SPEC = PartitionSpec(
 )
 
 
-def open_catalog(db_path: str, warehouse_path: str) -> SqlCatalog:
+def open(db_path: str, warehouse_path: str) -> SqlCatalog:
     """
     Open (or create) a SQLite-backed Iceberg catalog.
 
@@ -153,7 +153,7 @@ def upload_catalog(local_path: str) -> None:
     print(f"Catalog uploaded: {local_path} → {key}")
 
 
-def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
+def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
     """Return the stac_items table, creating it (and the namespace) if needed.
 
     Parameters
@@ -183,7 +183,6 @@ def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
 
     try:
         table = catalog.load_table(FULL_NAME)
-        # Backfill properties on existing tables that predate this feature.
         missing = {k: v for k, v in props.items() if k not in table.properties}
         if missing:
             with table.transaction() as tx:
@@ -196,3 +195,18 @@ def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
             partition_spec=PARTITION_SPEC,
             properties=props,
         )
+
+
+def info(table) -> object:
+    """Return a CatalogInfo for *table*.
+
+    Shortcut for :func:`earthcatalog.core.catalog_info.catalog_info`.
+    """
+    from .catalog_info import catalog_info
+
+    return catalog_info(table)
+
+
+# Backward-compatible aliases.
+open_catalog = open
+get_or_create_table = get_or_create

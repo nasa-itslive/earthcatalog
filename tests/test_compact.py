@@ -221,6 +221,7 @@ class TestScanWarehouse:
         assert sum(len(v) for v in result.values()) == 1
 
 
+@pytest.mark.e2e
 class TestCompactWarehouse:
     """Integration tests for compact_warehouse() using local storage."""
 

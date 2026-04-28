@@ -46,6 +46,7 @@ include = ["earthcatalog*"]
 testpaths = ["tests"]
 markers = [
   "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
+  "e2e: heavy pipeline tests skipped in pre-commit (run with pytest -m e2e)",
 ]
 
 [tool.ruff]

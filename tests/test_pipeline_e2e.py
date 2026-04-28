@@ -132,6 +132,7 @@ def _run_pipeline(inventory_csv, catalog_dirs, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.e2e
 class TestPipelineE2E:
     def test_rows_written(self, inventory_csv, catalog_dirs):
         """At least one row per STAC item must appear in the Iceberg table."""

@@ -44,63 +44,67 @@ GeoParquet files directly to the warehouse, and returns only lightweight metadat
 the head node. Expect ~1M items/hour on a modest Dask cluster.
 
 ```bash
-earthcatalog backfill \
+python scripts/run_backfill.py \
     --inventory  s3://my-bucket/inventory/manifest.json \
-    --catalog    s3://my-bucket/catalog/catalog.db \
+    --catalog    /tmp/catalog.db \
     --warehouse  s3://my-bucket/warehouse \
+    --scheduler  local \
     --workers    32
 ```
 
-### 2. Incremental updates
+### 2. Daily delta ingest
 
-After the initial ingest, run the incremental pipeline whenever a new S3 Inventory
-is available. It fetches only keys modified since the last run (`--since`), writes
-new GeoParquet files, and appends a new Iceberg snapshot. Typical runs complete in
-minutes for daily deltas.
+After the initial ingest, use the daily delta pipeline to detect and ingest new items.
+The delta producer reads the S3 Inventory manifest, hashes item IDs with xxh3_128,
+anti-joins against the warehouse hash index (~2 seconds for 40M items), and writes
+a delta parquet with only new items.
 
 ```bash
-earthcatalog incremental \
-    --inventory  /tmp/s3_inventory.csv \
-    --catalog    /tmp/catalog.db \
-    --warehouse  /tmp/warehouse \
-    --since      2024-01-01
+# Produce delta (runs daily via GitHub Actions)
+python scripts/daily_delta.py \
+    s3://log-bucket/inventory/.../manifest.json \
+    --warehouse-hash s3://my-bucket/warehouse_id_hashes.parquet \
+    --delta-prefix s3://my-bucket/delta
+
+# Ingest delta (runs weekly via GitHub Actions)
+python scripts/run_backfill.py \
+    --inventory s3://my-bucket/delta/pending/delta_2026-04-27.parquet \
+    --delta \
+    --scheduler local \
+    --workers 4
 ```
 
 ### 3. Spatial query
 
 EarthCatalog stores grid metadata (type and resolution) as Iceberg table
-properties at ingest time. Use `CatalogInfo` to discover the grid system and
-convert any geometry to the correct partition keys — no prior knowledge required.
+properties at ingest time. Use `CatalogInfo` to discover the grid system,
+prune files via Iceberg partition filtering, and query with DuckDB's spatial
+extension — no prior knowledge required.
 
 ```python
 import duckdb
 from shapely.geometry import box
-from earthcatalog.core.catalog import open_catalog, get_or_create_table
-from earthcatalog.core.catalog_info import CatalogInfo
+from earthcatalog.core import catalog
 
-catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
-table   = get_or_create_table(catalog)
+c = catalog.open(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
+table   = catalog.get_or_create(c)
+info    = catalog.info(table)
 
-# Discover grid type and resolution from the table — no config needed.
-info = CatalogInfo.from_table(table)
-# CatalogInfo(grid_type='h3', resolution=1)
-
-bbox = box(-60, 60, -30, 80)           # Greenland
-sql  = info.cell_list_sql(bbox)        # "grid_partition IN ('8001fff...', ...)"
+bbox  = box(-60, 60, -30, 80)                                    # Greenland
+paths = info.file_paths(table, bbox)                              # Iceberg-partition-pruned file list
 
 con = duckdb.connect()
-con.execute("INSTALL iceberg; LOAD iceberg; INSTALL spatial; LOAD spatial;")
+con.execute("INSTALL spatial; LOAD spatial;")
 
 df = con.execute(f"""
-    SELECT id, platform, datetime, geometry
-    FROM iceberg_scan('{table.metadata_location}')
-    WHERE {sql}
-      AND datetime >= '2022-01-01'
-      AND ST_Intersects(ST_GeomFromWKB(geometry), ST_GeomFromText('{bbox.wkt}'))
+    SELECT id, platform, datetime
+    FROM read_parquet({paths})
+    WHERE datetime >= '2022-01-01'
+      AND ST_Intersects(geometry, ST_GeomFromText('{bbox.wkt}'))
     ORDER BY datetime
 """).df()
-# grid_partition prunes to candidate files (zero I/O on the rest);
-# ST_Intersects then does exact geometry intersection within those files.
+# Iceberg partition pruning limits files scanned;
+# ST_Intersects then does exact geometry intersection.
 ```
 
 ## Documentation
