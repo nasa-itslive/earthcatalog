@@ -618,7 +618,7 @@ class TestRegisterAndCleanup:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end — run_backfill_v2
+# End-to-end — run_backfill
 # ---------------------------------------------------------------------------
 
 
@@ -631,7 +631,7 @@ class TestRunBackfillV2:
         yield
 
     def test_end_to_end_with_mock_fetcher(self, tmp_path):
-        from earthcatalog.pipelines.backfill import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill
 
         inv = tmp_path / "inv.csv"
         inv.write_text(_make_inventory_csv(_ALL_PAIRS))
@@ -655,7 +655,7 @@ class TestRunBackfillV2:
             patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
             dask.config.set(scheduler="synchronous"),
         ):
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=str(inv),
                 catalog_path=catalog_path,
                 staging_store=staging_store,
@@ -679,7 +679,7 @@ class TestRunBackfillV2:
             assert item["id"] in ids
 
     def test_idempotent_re_run(self, tmp_path):
-        from earthcatalog.pipelines.backfill import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill
 
         inv = tmp_path / "inv.csv"
         inv.write_text(_make_inventory_csv(_ALL_PAIRS))
@@ -701,7 +701,7 @@ class TestRunBackfillV2:
             patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
             dask.config.set(scheduler="synchronous"),
         ):
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=str(inv),
                 catalog_path=catalog_path,
                 staging_store=staging_store,
@@ -722,7 +722,7 @@ class TestRunBackfillV2:
             patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
             dask.config.set(scheduler="synchronous"),
         ):
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=str(inv),
                 catalog_path=catalog_path2,
                 staging_store=staging_store,
@@ -1042,7 +1042,7 @@ class TestRunBackfillV2Delta:
         yield
 
     def test_delta_does_not_overwrite_existing_parquets(self, tmp_path):
-        from earthcatalog.pipelines.backfill import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill
 
         inv = tmp_path / "inv.csv"
         inv.write_text(_make_inventory_csv(_ALL_PAIRS))
@@ -1064,7 +1064,7 @@ class TestRunBackfillV2Delta:
             patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch),
             dask.config.set(scheduler="synchronous"),
         ):
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=str(inv),
                 catalog_path=catalog_path,
                 staging_store=staging_store,
@@ -1165,7 +1165,7 @@ class TestRunBackfillV2Delta:
             patch("earthcatalog.pipelines.backfill._fetch_item_async", side_effect=_mock_fetch_all),
             dask.config.set(scheduler="synchronous"),
         ):
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=str(inv2),
                 catalog_path=catalog_path2,
                 staging_store=staging_store,

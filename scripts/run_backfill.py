@@ -135,6 +135,7 @@ def main() -> None:
 
     if args.delta and args.warehouse.startswith("s3://"):
         from earthcatalog.core.catalog import download_catalog
+
         download_catalog(args.catalog)
 
     if args.scheduler == "coiled":
@@ -149,8 +150,7 @@ def main() -> None:
         wheel_dir = tempfile.mkdtemp(prefix="earthcatalog-wheel-")
         print("Building local wheel …")
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "wheel", ".", "--no-deps",
-             "-w", wheel_dir, "--quiet"]
+            [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "-w", wheel_dir, "--quiet"]
         )
         wheels = glob.glob(f"{wheel_dir}/*.whl")
         if not wheels:
@@ -170,16 +170,14 @@ def main() -> None:
             import tempfile
 
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "uninstall", "-y",
-                 "earthcatalog", "--quiet"]
+                [sys.executable, "-m", "pip", "uninstall", "-y", "earthcatalog", "--quiet"]
             )
             td = tempfile.mkdtemp()
             path = os.path.join(td, whl_name)
             with open(path, "wb") as f:
                 f.write(whl_bytes)
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--no-deps",
-                 path, "--quiet"]
+                [sys.executable, "-m", "pip", "install", "--no-deps", path, "--quiet"]
             )
 
             for mod in list(sys.modules):
@@ -215,9 +213,9 @@ def main() -> None:
             client.run(_verify)
             return client
 
-        from earthcatalog.pipelines.backfill import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill
 
-        run_backfill_v2(
+        run_backfill(
             inventory_path=args.inventory,
             catalog_path=args.catalog,
             staging_store=staging_store,
@@ -243,10 +241,10 @@ def main() -> None:
         cluster = LocalCluster(n_workers=args.workers, threads_per_worker=args.threads_per_worker)
         client = Client(cluster)
 
-        from earthcatalog.pipelines.backfill import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill
 
         with client:
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=args.inventory,
                 catalog_path=args.catalog,
                 staging_store=staging_store,
@@ -266,10 +264,10 @@ def main() -> None:
                 delta=args.delta,
             )
     else:
-        from earthcatalog.pipelines.backfill import run_backfill_v2
+        from earthcatalog.pipelines.backfill import run_backfill
 
         with dask.config.set(scheduler="synchronous"):
-            run_backfill_v2(
+            run_backfill(
                 inventory_path=args.inventory,
                 catalog_path=args.catalog,
                 staging_store=staging_store,

@@ -430,7 +430,6 @@ def ingest_chunk(
     chunk_id = chunk_key.rsplit("/", 1)[-1].replace("chunk_", "").replace(".parquet", "")
 
     if failed:
-
         now = datetime.now(UTC).isoformat()
         pending_key = f"{pending_prefix}/chunk_{chunk_id}.parquet"
         fail_tbl = pa.table(
@@ -633,7 +632,9 @@ def compact_cell_year(
         out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
         return str(out_dir / f"part_{idx:06d}.parquet")
 
-    return _stream_compact(cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key)
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key
+    )
 
 
 def compact_cell_year_s3(
@@ -666,7 +667,9 @@ def compact_cell_year_s3(
     def _out_key(idx: int) -> str:
         return f"grid_partition={cell}/year={year}/part_{idx:06d}.parquet"
 
-    return _stream_compact(cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key)
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key
+    )
 
 
 def _empty_compact_report(cell: str, year: str) -> dict[str, Any]:
@@ -739,7 +742,9 @@ def compact_cell_year_delta(
         out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
         return str(out_dir / f"part_{start_idx + idx:06d}.parquet")
 
-    return _stream_compact(cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key)
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key
+    )
 
 
 def compact_cell_year_delta_s3(
@@ -774,7 +779,9 @@ def compact_cell_year_delta_s3(
     def _out_key(idx: int) -> str:
         return f"grid_partition={cell}/year={year}/part_{start_idx + idx:06d}.parquet"
 
-    return _stream_compact(cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key)
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -947,11 +954,11 @@ def _get_client(
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator — run_backfill_v2
+# Orchestrator — run_backfill
 # ---------------------------------------------------------------------------
 
 
-def run_backfill_v2(
+def run_backfill(
     inventory_path: str,
     catalog_path: str,
     staging_store: object,
@@ -1062,22 +1069,26 @@ def run_backfill_v2(
 
             pending_ids = _list_existing_chunks(staging_store, pending_prefix)
             if pending_ids and not retry_pending:
-                print(f"Phase 2: {len(pending_ids)} pending chunks recorded (use --retry-pending to retry)")
+                print(
+                    f"Phase 2: {len(pending_ids)} pending chunks recorded (use --retry-pending to retry)"
+                )
 
             if retry_pending and pending_ids:
                 pending_keys = [
-                    f"{pending_prefix}/chunk_{cid:06d}.parquet"
-                    for cid in sorted(pending_ids)
+                    f"{pending_prefix}/chunk_{cid:06d}.parquet" for cid in sorted(pending_ids)
                 ]
                 print(f"Phase 2: retrying {len(pending_ids)} pending chunks")
                 chunk_keys = pending_keys
 
             if completed_ids:
+
                 def _chunk_id_from_key(key: str) -> int:
                     fname = key.rsplit("/", 1)[-1]
                     return int(fname.removeprefix("chunk_").removesuffix(".parquet"))
 
-                chunk_keys = [ck for ck in chunk_keys if _chunk_id_from_key(ck) not in completed_ids]
+                chunk_keys = [
+                    ck for ck in chunk_keys if _chunk_id_from_key(ck) not in completed_ids
+                ]
                 print(f"Phase 2: {len(chunk_keys)} chunks remaining after skip")
 
             n_tasks = len(chunk_keys)
