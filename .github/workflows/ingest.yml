@@ -2,7 +2,7 @@ name: Ingest
 
 on:
   schedule:
-    - cron: "0 4 * * 1" # 04:00 UTC every Monday
+    - cron: "0 4 * * *" # 04:00 UTC daily
   workflow_dispatch:
     inputs:
       delta_date:
@@ -33,10 +33,6 @@ on:
         description: "Items per chunk"
         required: false
         default: "10000"
-      consolidate:
-        description: "Run consolidation after ingest"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -78,7 +74,7 @@ jobs:
           if [ -n "${{ github.event.inputs.delta_date }}" ]; then
             DATE="${{ github.event.inputs.delta_date }}"
           else
-            DATE=$(date -u +%Y-%m-%d)
+            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
           fi
           DELTA_PATH="${{ env.DELTA_PREFIX }}/pending/delta_${DATE}.parquet"
           echo "date=$DATE" >> "$GITHUB_OUTPUT"
@@ -88,6 +84,25 @@ jobs:
             echo "::error::Delta file not found: $DELTA_PATH"
             exit 1
           }
+
+      - name: Download catalog
+        run: |
+          uv run python -c "
+          from obstore.store import S3Store
+          from earthcatalog.core import store_config
+          from earthcatalog.core.catalog import download_catalog
+
+          store = S3Store(bucket='its-live-data', region='us-west-2')
+          store_config.set_store(store)
+          store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+          download_catalog('/tmp/earthcatalog.db')
+          "
+
+      - name: Catalog info (before)
+        run: |
+          uv run python scripts/info.py \
+            --catalog /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
 
       - name: Run delta ingest
         run: |
@@ -102,9 +117,11 @@ jobs:
 
           uv run python scripts/run_backfill.py \
             --inventory "${{ steps.delta.outputs.delta_path }}" \
+            --catalog /tmp/earthcatalog.db \
             --delta \
             --scheduler "$SCHEDULER" \
             --chunk-size "${{ github.event.inputs.chunk_size || '10000' }}" \
+            --hash-index ${{ env.WAREHOUSE_HASH }} \
             $EXTRA_ARGS
 
       - name: Update warehouse hash index
@@ -119,14 +136,12 @@ jobs:
           INGESTED="${{ env.DELTA_PREFIX }}/ingested/delta_${{ steps.delta.outputs.date }}.done"
           aws s3 mv "${{ steps.delta.outputs.delta_path }}" "$INGESTED"
 
-      - name: Consolidate small parquet files
-        if: success() && github.event.inputs.consolidate != 'false'
+      - name: Catalog info (after)
+        if: always()
         run: |
-          uv run python scripts/consolidate.py \
-            --warehouse ${{ env.WAREHOUSE }} \
+          uv run python scripts/info.py \
             --catalog /tmp/earthcatalog.db \
-            --threshold 2 \
-            --use-lock
+            --warehouse ${{ env.WAREHOUSE }}
 
       - name: Summary
         if: always()
@@ -134,4 +149,3 @@ jobs:
           echo "### Ingest Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "Date: ${{ steps.delta.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Delta: \`${{ steps.delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Consolidate: ${{ github.event.inputs.consolidate || 'true' }}" >> "$GITHUB_STEP_SUMMARY"

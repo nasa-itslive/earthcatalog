@@ -77,6 +77,7 @@ import tqdm
 from earthcatalog.core.catalog import (
     PROP_GRID_RESOLUTION,
     PROP_GRID_TYPE,
+    PROP_HASH_INDEX_PATH,
     open_catalog,
     upload_catalog,
 )
@@ -798,6 +799,7 @@ def register_and_cleanup(
     staging_prefix: str,
     upload: bool = True,
     h3_resolution: int | None = None,
+    hash_index_path: str | None = None,
 ) -> None:
     """
     Phase 4: rebuild Iceberg catalog from warehouse files, upload, cleanup staging.
@@ -807,12 +809,17 @@ def register_and_cleanup(
     3. Register via table.add_files().
     4. Upload catalog.
     5. Delete all staging files.
+
+    ``hash_index_path`` defaults to ``{warehouse_root}_id_hashes.parquet``.
     """
     import re
 
     from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
     from earthcatalog.core.catalog import FULL_NAME, ICEBERG_SCHEMA, NAMESPACE, PARTITION_SPEC
+
+    if hash_index_path is None:
+        hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
 
     catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
 
@@ -827,7 +834,7 @@ def register_and_cleanup(
     except NoSuchTableError:
         pass
 
-    props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+    props: dict[str, str] = {PROP_GRID_TYPE: "h3", PROP_HASH_INDEX_PATH: hash_index_path}
     if h3_resolution is not None:
         props[PROP_GRID_RESOLUTION] = str(h3_resolution)
 
@@ -877,6 +884,7 @@ def register_delta(
     staging_prefix: str,
     upload: bool = True,
     h3_resolution: int | None = None,
+    hash_index_path: str | None = None,
 ) -> None:
     """
     Phase 4 delta: add new parquet files to existing Iceberg table (no drop).
@@ -884,6 +892,8 @@ def register_delta(
     Opens (or creates) the Iceberg table, calls ``table.add_files()``
     with only the newly written parquets, then uploads the catalog.
     Existing warehouse files are never touched.
+
+    ``hash_index_path`` defaults to ``{warehouse_root}_id_hashes.parquet``.
     """
     from pyiceberg.exceptions import (
         NamespaceAlreadyExistsError,
@@ -892,6 +902,9 @@ def register_delta(
     )
 
     from earthcatalog.core.catalog import FULL_NAME, ICEBERG_SCHEMA, NAMESPACE, PARTITION_SPEC
+
+    if hash_index_path is None:
+        hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
 
     catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
 
@@ -903,6 +916,7 @@ def register_delta(
     props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
     if h3_resolution is not None:
         props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+    props[PROP_HASH_INDEX_PATH] = hash_index_path
 
     try:
         table = catalog.load_table(FULL_NAME)
@@ -997,6 +1011,7 @@ def run_backfill(
     retry_pending: bool = False,
     delta: bool = False,
     create_client: Callable[[], object] | None = None,
+    hash_index_path: str | None = None,
 ) -> None:
     """
     Four-phase staging-based backfill pipeline.
@@ -1295,6 +1310,7 @@ def run_backfill(
                 staging_prefix=staging_prefix,
                 h3_resolution=resolved_resolution,
                 upload=upload,
+                hash_index_path=hash_index_path,
             )
         else:
             register_and_cleanup(
@@ -1304,6 +1320,7 @@ def run_backfill(
                 staging_prefix=staging_prefix,
                 h3_resolution=resolved_resolution,
                 upload=upload,
+                hash_index_path=hash_index_path,
             )
 
     if use_lock:

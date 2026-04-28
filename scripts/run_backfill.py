@@ -107,6 +107,11 @@ def main() -> None:
     parser.add_argument("--threads-per-worker", type=int, default=2)
     parser.add_argument("--coiled-n-workers", type=int, default=10)
     parser.add_argument("--coiled-vm-type", default="c6i.xlarge")
+    parser.add_argument(
+        "--hash-index",
+        default=None,
+        help="S3 URI for hash index (default: {warehouse}_id_hashes.parquet)",
+    )
     args = parser.parse_args()
 
     since = None
@@ -245,6 +250,7 @@ def main() -> None:
             delta=args.delta,
             create_client=_create_cluster,
             upload=not args.skip_upload,
+            hash_index_path=args.hash_index,
         )
     elif args.scheduler == "local":
         from dask.distributed import Client, LocalCluster
@@ -274,6 +280,7 @@ def main() -> None:
                 retry_pending=args.retry_pending,
                 delta=args.delta,
                 upload=not args.skip_upload,
+                hash_index_path=args.hash_index,
             )
     else:
         from earthcatalog.pipelines.backfill import run_backfill
@@ -298,6 +305,7 @@ def main() -> None:
                 retry_pending=args.retry_pending,
                 delta=args.delta,
                 upload=not args.skip_upload,
+                hash_index_path=args.hash_index,
             )
 
 

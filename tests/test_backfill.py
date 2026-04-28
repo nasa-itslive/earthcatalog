@@ -1032,6 +1032,104 @@ class TestRegisterDelta:
         assert "existing-1" in ids
         assert "delta-1" in ids
 
+    def test_register_delta_sets_hash_index_path(self, tmp_path):
+        from earthcatalog.core import store_config
+        from earthcatalog.core.catalog import PROP_HASH_INDEX_PATH
+
+        store_config.set_store(MemoryStore())
+        store_config.set_catalog_key("catalog.db")
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+
+        from earthcatalog.core.catalog import (
+            FULL_NAME,
+            ICEBERG_SCHEMA,
+            NAMESPACE,
+            PARTITION_SPEC,
+            open_catalog,
+        )
+
+        db_path = str(tmp_path / "test.db")
+        catalog = open_catalog(db_path=db_path, warehouse_path=str(wh_root))
+        from pyiceberg.exceptions import NamespaceAlreadyExistsError
+
+        try:
+            catalog.create_namespace(NAMESPACE)
+        except NamespaceAlreadyExistsError:
+            pass
+        catalog.create_table(
+            identifier=FULL_NAME,
+            schema=ICEBERG_SCHEMA,
+            partition_spec=PARTITION_SPEC,
+        )
+
+        staging_store = MemoryStore()
+
+        from earthcatalog.pipelines.backfill import register_delta
+
+        register_delta(
+            catalog_path=db_path,
+            warehouse_root=str(wh_root),
+            new_parquet_paths=[],
+            staging_store=staging_store,
+            staging_prefix="staging",
+            upload=False,
+        )
+
+        table = catalog.load_table(FULL_NAME)
+        assert table.properties.get(PROP_HASH_INDEX_PATH) == f"{wh_root}_id_hashes.parquet"
+
+    def test_register_delta_custom_hash_index_path(self, tmp_path):
+        from earthcatalog.core import store_config
+        from earthcatalog.core.catalog import PROP_HASH_INDEX_PATH
+
+        store_config.set_store(MemoryStore())
+        store_config.set_catalog_key("catalog.db")
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+
+        from earthcatalog.core.catalog import (
+            FULL_NAME,
+            ICEBERG_SCHEMA,
+            NAMESPACE,
+            PARTITION_SPEC,
+            open_catalog,
+        )
+
+        db_path = str(tmp_path / "test.db")
+        catalog = open_catalog(db_path=db_path, warehouse_path=str(wh_root))
+        from pyiceberg.exceptions import NamespaceAlreadyExistsError
+
+        try:
+            catalog.create_namespace(NAMESPACE)
+        except NamespaceAlreadyExistsError:
+            pass
+        catalog.create_table(
+            identifier=FULL_NAME,
+            schema=ICEBERG_SCHEMA,
+            partition_spec=PARTITION_SPEC,
+        )
+
+        staging_store = MemoryStore()
+        custom_path = "s3://my-bucket/custom_hashes.parquet"
+
+        from earthcatalog.pipelines.backfill import register_delta
+
+        register_delta(
+            catalog_path=db_path,
+            warehouse_root=str(wh_root),
+            new_parquet_paths=[],
+            staging_store=staging_store,
+            staging_prefix="staging",
+            upload=False,
+            hash_index_path=custom_path,
+        )
+
+        table = catalog.load_table(FULL_NAME)
+        assert table.properties.get(PROP_HASH_INDEX_PATH) == custom_path
+
 
 @pytest.mark.e2e
 class TestRunBackfillV2Delta:

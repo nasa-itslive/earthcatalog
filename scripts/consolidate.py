@@ -105,12 +105,14 @@ def _scan_warehouse(store: S3Store) -> dict[tuple[str, str], list[dict]]:
             fname = m.group("file")
             part_m = _PART_RE.match(fname)
             idx = int(part_m.group("idx")) if part_m else 999999
-            partitions[(m.group("cell"), m.group("year"))].append({
-                "path": path,
-                "name": fname,
-                "index": idx,
-                "size": obj.get("size", 0),
-            })
+            partitions[(m.group("cell"), m.group("year"))].append(
+                {
+                    "path": path,
+                    "name": fname,
+                    "index": idx,
+                    "size": obj.get("size", 0),
+                }
+            )
 
     for files in partitions.values():
         files.sort(key=lambda f: f["index"])
@@ -184,10 +186,17 @@ def consolidate_partition(
             f"  [dry-run] {cell}/{year}: would merge {len(to_merge)} files "
             f"({merge_total_rows:,} rows) [{merge_names}]"
         )
-        return {"cell": cell, "year": year, "merged_files": len(to_merge), "merged_rows": merge_total_rows}
+        return {
+            "cell": cell,
+            "year": year,
+            "merged_files": len(to_merge),
+            "merged_rows": merge_total_rows,
+        }
 
     merge_names = ", ".join(f["name"] for f, _ in to_merge)
-    print(f"  Consolidating {cell}/{year}: merging {len(to_merge)} files ({merge_total_rows:,} rows) [{merge_names}]")
+    print(
+        f"  Consolidating {cell}/{year}: merging {len(to_merge)} files ({merge_total_rows:,} rows) [{merge_names}]"
+    )
 
     tables: list[pa.Table] = []
     for f, _ in to_merge:
@@ -199,7 +208,9 @@ def consolidate_partition(
     expected = merge_total_rows
 
     if unique.num_rows < expected:
-        print(f"    Dedup: {expected:,} → {unique.num_rows:,} (removed {expected - unique.num_rows:,} dupes)")
+        print(
+            f"    Dedup: {expected:,} → {unique.num_rows:,} (removed {expected - unique.num_rows:,} dupes)"
+        )
 
     base = f"grid_partition={cell}/year={year}"
     merge_base_idx = to_merge[0][0]["index"]
@@ -213,7 +224,10 @@ def consolidate_partition(
     verified_rows = pq.ParquetFile(io.BytesIO(data)).metadata.num_rows
 
     if verified_rows != len(unique):
-        print(f"    ERROR: verified {verified_rows:,} != expected {len(unique):,}, aborting", file=sys.stderr)
+        print(
+            f"    ERROR: verified {verified_rows:,} != expected {len(unique):,}, aborting",
+            file=sys.stderr,
+        )
         try:
             obstore.delete(store, consolidated_path)
         except Exception:
@@ -269,6 +283,7 @@ def rebuild_catalog(
         ICEBERG_SCHEMA,
         NAMESPACE,
         PARTITION_SPEC,
+        PROP_GRID_TYPE,
         open_catalog,
         upload_catalog,
     )
@@ -280,6 +295,13 @@ def rebuild_catalog(
     except (NamespaceAlreadyExistsError, Exception):
         pass
 
+    saved_props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+    try:
+        existing = catalog.load_table(FULL_NAME)
+        saved_props.update(existing.properties)
+    except NoSuchTableError:
+        pass
+
     try:
         catalog.drop_table(FULL_NAME)
     except NoSuchTableError:
@@ -289,6 +311,7 @@ def rebuild_catalog(
         identifier=FULL_NAME,
         schema=ICEBERG_SCHEMA,
         partition_spec=PARTITION_SPEC,
+        properties=saved_props,
     )
 
     all_paths: list[str] = []
@@ -329,7 +352,9 @@ def run_consolidate(
 
     results: list[dict] = []
     for (cell, year), files in sorted(over_threshold.items()):
-        r = consolidate_partition(store, cell, year, files, threshold, dry_run, compact_rows=compact_rows)
+        r = consolidate_partition(
+            store, cell, year, files, threshold, dry_run, compact_rows=compact_rows
+        )
         if r is not None:
             results.append(r)
 
@@ -382,6 +407,7 @@ def main() -> None:
 
     if args.use_lock:
         from earthcatalog.core.lock import S3Lock
+
         with S3Lock(owner="consolidate"):
             run_consolidate(
                 warehouse_uri=args.warehouse,

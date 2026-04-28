@@ -49,7 +49,7 @@ jobs:
           if [ -n "${{ github.event.inputs.date }}" ]; then
             DATE="${{ github.event.inputs.date }}"
           else
-            DATE=$(date -u +%Y-%m-%d)
+            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
           fi
           echo "date=$DATE" >> "$GITHUB_OUTPUT"
           echo "manifest_url=s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory/${DATE}T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
