@@ -28,19 +28,16 @@ earthcatalog transforms STAC items from public S3 buckets into a queryable Parqu
 
 ## Why earthcatalog
 
-Traditional STAC catalogs either:
-- Store one row per item (not spatially partitioned) — queries scan everything
-- Use naive tiling (lat/lon grids) — cells near poles have wildly different areas
+Traditional STAC implementations use databases (PostgreSQL with PostGIS, Cloud SQL, etc.) to serve API queries. While fine for single-item lookups, they struggle with bulk exports — retrieving 100K+ rows means streaming through a database cursor with all the serialization overhead.
 
-earthcatalog uses H3 resolution 1:
-- 842 global cells at roughly equal area (~5M km² each)
-- Files are compact — each cell typically has 50-200K rows
-- Spatial queries open only the relevant files
+earthcatalog takes a different approach — spatially partitioned GeoParquet:
 
-Other benefits:
-- **No AWS credentials needed** for the public ITS_LIVE bucket
-- **No infrastructure** — SQLite catalog on S3, no Glue NoCatalog, no REST servers
-- **Incremental updates** — only new items from the S3 Inventory delta
+- **No moving parts**: Parquet files sit on S3, no database to maintain or sync
+- **Spatial partitioning**: Queries with spatial filters open only relevant files — typically 2-10 files out of 5,000
+- **H3 resolution 1**: 842 global cells at roughly equal area (~5M km² each); works with any grid, not tied to H3 specifically
+- **Zero serialization overhead**: DuckDB reads directly from S3; bulk exports are limited only by network bandwidth
+- **No credentials needed**: Public ITS_LIVE bucket accessible without AWS keys
+- **SQLite on S3**: No infrastructure (no RDS, no Glue, no REST API) — the catalog is a single SQLite file on S3
 
 ---
 
