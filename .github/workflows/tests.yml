@@ -31,7 +31,7 @@ jobs:
         run: uv sync --all-groups
 
       - name: Run tests (unit + integration-free)
-        run: uv run pytest --tb=short -q -m "not integration"
+        run: uv run python -m pytest --tb=short -q -m "not integration"
 
       - name: Upload test results
         if: failure()

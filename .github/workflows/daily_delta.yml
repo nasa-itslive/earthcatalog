@@ -5,7 +5,6 @@ on:
   # schedule:
   #   - cron: "0 2 * * *" # 02:00 UTC daily
   workflow_dispatch:
-  workflow_dispatch:
     inputs:
       date:
         description: "Date for delta file name (YYYY-MM-DD). Defaults to today."
