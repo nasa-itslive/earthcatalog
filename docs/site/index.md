@@ -1,3 +1,6 @@
+<center><img src="https://raw.githubusercontent.com/nasa-itslive/earthcatalog/refs/heads/main/docs/images/earthcatalog.png" width="300px" /></center>
+
+
 # earthcatalog
 
 **Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg.**
@@ -10,12 +13,14 @@ earthcatalog ingests STAC item catalogs from AWS S3 into a spatially-partitioned
 
 ## What it does
 
-earthcatalog transforms STAC items from the public ITS_LIVE S3 bucket into a queryable Parquet catalog. Each STAC item is fanned out to one row per intersecting H3 cell at resolution 1 (~100km hexagons), then grouped by cell and year into Parquet files:
+earthcatalog transforms STAC items from public S3 buckets into a queryable Parquet catalog. Each STAC item is mapped to a DGGS (H3 by default) cells, then grouped by cell and year into Parquet files:
 
-- **Input**: S3 Inventory manifest with `.stac.json` keys
-- **Fan-out**: One row per (item × H3 cell) — a point near a cell boundary maps to multiple cells
+- **Input**: S3 Inventory manifest with `.stac.json` keys, the stac items
+- **Spatial partitioning**: One row per (item × H3 cell) — a point near a cell boundary maps to multiple cells
 - **Output**: One Parquet file per `(grid_partition, year)` bucket
 - **Catalog**: PyIceberg table backed by SQLite, hosted on S3
+
+[Why spatial partitioning matters →](https://www.architecture-performance.fr/ap_blog/spatial-queries-in-duckdb-with-r-tree-and-h3-indexing/)
 
 **File pruning happens at read time**: A DuckDB query on a point queries only the Parquet files for that cell + year — no full scan required.
 
@@ -156,3 +161,7 @@ What's not yet:
 - **[Ingest Workflow](operations/ingest_workflow.md)** — GitHub Actions daily delta + ingest
 - **[Maintenance](maintenance/compact.md)** — Warehouse compaction
 - **[API Reference](api/index.md)** — Python API docs
+
+---
+
+<i>Built from commit <a href="https://github.com/nasa-itslive/earthcatalog/commit/6cf6d54">6cf6d54</a> (2026-04-29)</i>
