@@ -37,8 +37,8 @@ ITEMS = [
             "proj:code": "EPSG:32632",
             "sat:orbit_state": "ascending",
         },
-        "links": [],
-        "assets": {},
+        "links": [{"href": "http://example.com", "rel": "canonical"}],
+        "assets": {"data": {"href": f"s3://bucket/item-{i:04d}.tif", "title": f"Data {i}"}},
     }
     for i in range(5)
 ]
@@ -104,8 +104,8 @@ class TestRoundTrip:
         table = _write_and_add(iceberg_table, ITEMS)
         result = table.scan().to_arrow()
         assert result.schema.field("id").type == pa.string()
-        assert result.schema.field("percent_valid_pixels").type == pa.int32()
-        assert result.schema.field("date_dt").type == pa.int32()
+        assert result.schema.field("percent_valid_pixels").type == pa.int64()
+        assert result.schema.field("date_dt").type == pa.int64()
         # geometry is binary (WKB) — may come back as binary or large_binary
         assert result.schema.field("geometry").type in (pa.binary(), pa.large_binary())
 
@@ -145,13 +145,16 @@ class TestRoundTrip:
         result = table.scan().to_arrow()
         assert result.num_rows == n * 2
 
-    def test_raw_stac_recoverable(self, iceberg_table, tmp_path):
-        """raw_stac must deserialise back to the original item dict."""
+    def test_assets_links_are_json_strings(self, iceberg_table, tmp_path):
+        """assets and links columns must be JSON strings (not structs/lists)."""
         table = _write_and_add(iceberg_table, [ITEMS[0]])
         result = table.scan().to_arrow()
-        raw = json.loads(result.column("raw_stac")[0].as_py())
-        assert raw["id"] == ITEMS[0]["id"]
-        assert raw["properties"]["platform"] == "sentinel-1"
+        assert result.schema.field("assets").type == pa.string()
+        assert result.schema.field("links").type == pa.string()
+        assets = json.loads(result.column("assets")[0].as_py())
+        assert "data" in assets
+        links = json.loads(result.column("links")[0].as_py())
+        assert links[0]["href"] == "http://example.com"
 
     def test_grid_partition_column_populated(self, iceberg_table, tmp_path):
         """Every row must have a non-null, non-empty grid_partition."""

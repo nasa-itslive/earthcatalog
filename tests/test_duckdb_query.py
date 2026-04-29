@@ -45,7 +45,9 @@ ITEMS = [
             "sat:orbit_state": "descending",
         },
         "links": [],
-        "assets": {},
+        "assets": {
+            "data": {"href": f"s3://fake-bucket/duck-item-{i:04d}.tif", "type": "image/tiff"}
+        },
     }
     for i in range(4)
 ]
@@ -153,13 +155,17 @@ class TestDuckDBQuery:
         ).fetchall()
         assert len(rows) > 0
 
-    def test_raw_stac_json_parseable_in_duckdb(self, populated_table):
-        """raw_stac stored as JSON string must be parseable by DuckDB json_extract."""
+    def test_assets_json_parseable_in_duckdb(self, populated_table):
+        """assets stored as JSON string must be parseable by DuckDB json_extract."""
         tbl, con = populated_table
         rows = con.execute(
-            f"SELECT json_extract(raw_stac, '$.id') "
-            f"FROM iceberg_scan('{tbl.metadata_location}') LIMIT 5"
+            f"SELECT assets "
+            f"FROM iceberg_scan('{tbl.metadata_location}') "
+            f"WHERE assets IS NOT NULL LIMIT 5"
         ).fetchall()
         assert len(rows) > 0
+        import json
+
         for (val,) in rows:
-            assert val is not None
+            parsed = json.loads(val)
+            assert isinstance(parsed, dict)

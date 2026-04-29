@@ -2,6 +2,8 @@
 Tests for CatalogInfo — grid metadata discovery from Iceberg table properties.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 from shapely.geometry import Point, box
 
@@ -284,6 +286,118 @@ class TestStats:
         info = catalog_info(h3_table)
         sql = info.cell_list_sql(box(-60, 60, -30, 80))
         full = f"SELECT * FROM t WHERE {sql} AND datetime > '2020-01-01'"
-        # Just assert it's a valid string with expected structure
         assert "grid_partition IN (" in full
         assert "AND datetime" in full
+
+
+# ---------------------------------------------------------------------------
+# file_paths — datetime filtering
+# ---------------------------------------------------------------------------
+
+
+def _build_multiyear_warehouse(tmp_path, years):
+    from earthcatalog.core.catalog import get_or_create, open
+    from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
+    from earthcatalog.grids.h3_partitioner import H3Partitioner
+
+    db = str(tmp_path / "catalog.db")
+    wh = str(tmp_path / "warehouse")
+    cat = open(db_path=db, warehouse_path=wh)
+    tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
+
+    items = []
+    for i, year in enumerate(years):
+        items.append(
+            {
+                "id": f"dt-test-{i}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[-50, 65], [-48, 65], [-48, 68], [-50, 68], [-50, 65]]],
+                },
+                "properties": {"datetime": f"{year}-06-15T00:00:00Z", "platform": "NISAR"},
+                "links": [],
+                "assets": {},
+            }
+        )
+
+    p = H3Partitioner(resolution=2)
+    rows = fan_out(items, p)
+    paths = []
+    for idx, ((cell, year), group) in enumerate(group_by_partition(rows).items()):
+        out = str(tmp_path / f"part_{cell}_{year}_{idx}.parquet")
+        write_geoparquet(group, out)
+        paths.append(out)
+    tbl.add_files(paths)
+    return tbl
+
+
+class TestFilePathsDatetime:
+    def test_no_datetime_returns_all_files(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022, 2023])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+        all_paths = info.file_paths(tbl, pt)
+        filtered = info.file_paths(tbl, pt, start_datetime="2022-01-01")
+        assert len(filtered) < len(all_paths)
+
+    def test_start_datetime_prunes_earlier_years(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022, 2023])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+        paths = info.file_paths(tbl, pt, start_datetime="2022-01-01")
+        years_in_result = set()
+        for task in tbl.scan().plan_files():
+            if task.file.file_path in paths:
+                years_in_result.add(task.file.partition[1] + 1970)
+        for y in years_in_result:
+            assert y >= 2022
+
+    def test_end_datetime_prunes_later_years(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022, 2023])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+        paths = info.file_paths(tbl, pt, end_datetime="2021-12-31T23:59:59Z")
+        for task in tbl.scan().plan_files():
+            if task.file.file_path in paths:
+                assert task.file.partition[1] + 1970 <= 2021
+
+    def test_both_datetimes_narrows_range(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022, 2023])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+        paths = info.file_paths(tbl, pt, start_datetime="2021-06-01", end_datetime="2022-06-01")
+        years_in_result = set()
+        for task in tbl.scan().plan_files():
+            if task.file.file_path in paths:
+                years_in_result.add(task.file.partition[1] + 1970)
+        for y in years_in_result:
+            assert 2021 <= y <= 2022
+
+    def test_string_and_datetime_both_work(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+        paths_str = info.file_paths(tbl, pt, start_datetime="2022-01-01")
+        paths_dt = info.file_paths(tbl, pt, start_datetime=datetime(2022, 1, 1, tzinfo=UTC))
+        assert set(paths_str) == set(paths_dt)
+
+    def test_naive_datetime_gets_utc(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+        paths = info.file_paths(tbl, pt, start_datetime=datetime(2022, 1, 1))
+        years_in_result = {
+            task.file.partition[1] + 1970
+            for task in tbl.scan().plan_files()
+            if task.file.file_path in paths
+        }
+        for y in years_in_result:
+            assert y >= 2022
+
+    def test_empty_cells_returns_empty_with_datetime(self, tmp_path):
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+        paths = info.file_paths(tbl, box(170, -10, 175, 0), start_datetime="2022-01-01")
+        assert paths == []

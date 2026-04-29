@@ -112,11 +112,14 @@ def _compact_group_impl(
         tbl = pq.ParquetFile(io.BytesIO(raw)).read()
         tables.append(tbl)
 
-    merged = pa.concat_tables(tables, promote_options="none")
+    merged = pa.concat_tables(tables, promote_options="default")
 
+    dedup_sort_keys = [("id", "ascending")]
+    if "created" in merged.schema.names:
+        dedup_sort_keys.append(("created", "descending"))
     sort_indices = pc.sort_indices(
         merged,
-        sort_keys=[("id", "ascending"), ("updated", "descending")],
+        sort_keys=dedup_sort_keys,
         null_placement="at_end",
     )
     merged = merged.take(sort_indices)

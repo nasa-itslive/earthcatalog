@@ -20,6 +20,7 @@ Example::
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from shapely.geometry import mapping
 
@@ -29,6 +30,17 @@ from earthcatalog.core.catalog import (
     PROP_GRID_RESOLUTION,
     PROP_GRID_TYPE,
 )
+
+
+def _parse_dt(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
 @dataclass
@@ -51,18 +63,35 @@ class CatalogInfo:
             return self._geojson_keys(geom)
         raise ValueError(f"Unknown grid type: {self.grid_type!r}")
 
-    def file_paths(self, table, geom) -> list[str]:
+    def file_paths(
+        self,
+        table,
+        geom,
+        start_datetime: str | datetime | None = None,
+        end_datetime: str | datetime | None = None,
+    ) -> list[str]:
         """Return Parquet file paths for partitions intersecting *geom*.
 
         Uses Iceberg partition pruning (zero I/O on irrelevant files) and
         returns paths suitable for DuckDB's ``read_parquet()``.
+
+        When *start_datetime* and/or *end_datetime* are provided, Iceberg
+        projects the filter onto the ``year`` partition so entire year
+        partitions are skipped without reading manifests.
         """
-        from pyiceberg.expressions import In
+        from pyiceberg.expressions import And, GreaterThanOrEqual, In, LessThanOrEqual
 
         cells = self.cells_for_geometry(geom)
         if not cells:
             return []
-        scan = table.scan(row_filter=In("grid_partition", cells))
+
+        row_filter = In("grid_partition", cells)
+        if start_datetime is not None:
+            row_filter = And(row_filter, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))
+        if end_datetime is not None:
+            row_filter = And(row_filter, LessThanOrEqual("datetime", _parse_dt(end_datetime)))
+
+        scan = table.scan(row_filter=row_filter)
         return [task.file.file_path for task in scan.plan_files()]
 
     def stats(self, table) -> list[dict]:

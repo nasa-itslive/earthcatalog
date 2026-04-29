@@ -152,6 +152,30 @@ class TestReadParquetSpatial:
         paths = info.file_paths(tbl, box(170, -10, 175, 0))
         assert paths == []
 
+    def test_file_paths_with_datetime_returns_fewer_files(self, warehouse):
+        _, tbl, _ = warehouse
+        info = catalog_info(tbl)
+        all_paths = info.file_paths(tbl, BBOX_GREENLAND)
+        filtered = info.file_paths(tbl, BBOX_GREENLAND, start_datetime="2023-01-01")
+        assert len(filtered) <= len(all_paths)
+
+    def test_file_paths_datetime_with_duckdb_query(self, warehouse):
+        tmp_path, tbl, files = warehouse
+        info = catalog_info(tbl)
+        paths = info.file_paths(tbl, BBOX_GREENLAND, start_datetime="2023-01-01")
+
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        if paths:
+            df = con.execute(f"""
+                SELECT id, datetime
+                FROM read_parquet({paths})
+                WHERE ST_Intersects(geometry, ST_GeomFromText('{BBOX_GREENLAND.wkt}'))
+                ORDER BY datetime
+            """).df()
+            for dt_val in df["datetime"]:
+                assert dt_val.year >= 2023
+
 
 class TestIcebergScanSpatial:
     """Document the DuckDB iceberg_scan + spatial extension limitation."""

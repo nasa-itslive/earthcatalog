@@ -77,21 +77,32 @@ python scripts/run_backfill.py \
 ### 3. Spatial query
 
 EarthCatalog stores grid metadata (type and resolution) as Iceberg table
-properties at ingest time. Use `CatalogInfo` to discover the grid system,
-prune files via Iceberg partition filtering, and query with DuckDB's spatial
-extension — no prior knowledge required.
+properties at ingest time. Use `CatalogInfo` to discover the grid system and
+prune files via Iceberg partition filtering before querying.
+
+#### Option A — DuckDB (tabular)
 
 ```python
 import duckdb
-from shapely.geometry import box
-from earthcatalog.core import catalog
+from shapely.geometry import Point
+from earthcatalog.core import catalog, store_config
+from obstore.store import S3Store
 
-c = catalog.open(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
-table   = catalog.get_or_create(c)
-info    = catalog.info(table)
+# Point to the public catalog (no credentials needed)
+store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
+store_config.set_store(store)
+store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+catalog.download_catalog('/tmp/catalog.db')
 
-bbox  = box(-60, 60, -30, 80)                                    # Greenland
-paths = info.file_paths(table, bbox)                              # Iceberg-partition-pruned file list
+c     = catalog.open(db_path='/tmp/catalog.db',
+                     warehouse_path='s3://its-live-data/test-space/stac/catalog/warehouse')
+table = catalog.get_or_create(c)
+info  = catalog.info(table)
+
+# Prune to the relevant Parquet files (cell + year partitions)
+point = Point(-133.99, 58.74)   # inside item footprints in this cell
+paths = info.file_paths(table, point, start_datetime='2020-01-01',
+                        end_datetime='2022-12-31')
 
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
@@ -99,12 +110,55 @@ con.execute("INSTALL spatial; LOAD spatial;")
 df = con.execute(f"""
     SELECT id, platform, datetime
     FROM read_parquet({paths})
-    WHERE datetime >= '2022-01-01'
-      AND ST_Intersects(geometry, ST_GeomFromText('{bbox.wkt}'))
+    WHERE datetime >= '2020-01-01'
+      AND datetime <= '2022-12-31T23:59:59Z'
+      AND ST_Intersects(geometry, ST_GeomFromText('{point.wkt}'))
     ORDER BY datetime
+    LIMIT 10
 """).df()
-# Iceberg partition pruning limits files scanned;
-# ST_Intersects then does exact geometry intersection.
+```
+
+#### Option B — rustac + CQL2 (STAC-native)
+
+[rustac](https://github.com/gadomski/rustac) queries the same GeoParquet files
+using the STAC API search model with CQL2 filters.
+
+```python
+import rustac, cql2, json, pystac
+from earthcatalog.core import catalog, store_config
+from obstore.store import S3Store
+from shapely.geometry import Point
+
+store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
+store_config.set_store(store)
+store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+catalog.download_catalog('/tmp/catalog.db')
+
+c     = catalog.open('/tmp/catalog.db',
+                     's3://its-live-data/test-space/stac/catalog/warehouse')
+table = catalog.get_or_create(c)
+info  = catalog.info(table)
+
+point = Point(-133.99, 58.74)
+paths = info.file_paths(table, point, start_datetime='2020-01-01',
+                        end_datetime='2022-12-31')
+
+client = rustac.DuckdbClient()
+cql2_filter = cql2.parse_text('percent_valid_pixels > 50').to_json()
+
+# rustac.DuckdbClient.search() takes one href at a time
+items = []
+for path in paths:
+    items.extend(client.search(path, filter=cql2_filter))
+
+# Hydrate to pystac.Item (assets/links stored as JSON strings in GeoParquet)
+def to_stac(raw: dict) -> pystac.Item:
+    for key in ('assets', 'links', 'bbox'):
+        if isinstance(raw.get(key), str):
+            raw[key] = json.loads(raw[key])
+    return pystac.Item.from_dict(raw)
+
+stac_items = [to_stac(i) for i in items]
 ```
 
 ## Documentation

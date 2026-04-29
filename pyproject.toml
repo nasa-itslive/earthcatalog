@@ -25,7 +25,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "mypy", "pre-commit", "zensical", "mkdocstrings[python]"]
+dev = [
+  "jupyterlab",
+  "dask-labextension",
+  "pytest",
+  "ruff",
+  "mypy",
+  "pre-commit",
+  "zensical",
+  "mkdocstrings[python]",
+]
 
 [project.urls]
 Homepage = "https://github.com/nasa-itslive/earthcatalog"

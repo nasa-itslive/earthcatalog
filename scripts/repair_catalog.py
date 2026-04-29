@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from collections import defaultdict
 from pathlib import Path
 
 parser = argparse.ArgumentParser(
@@ -155,13 +156,39 @@ table = catalog.create_table(
 
 print(f"Registering {len(parquet_uris):,} files …")
 
-BATCH = 2_000
+# Group files by cell so we can commit one snapshot per cell batch.
+# We pass files in batches of BATCH size regardless of cell to keep
+# snapshot count low, but we annotate each DataFile with its partition value.
+
+by_cell: dict[str, list[str]] = defaultdict(list)
+for uri in parquet_uris:
+    m = HIVE_RE.search(uri)
+    if m:
+        by_cell[m.group("cell")].append(uri)
+
+BATCH = 500  # files per snapshot commit
 total_registered = 0
-for i in range(0, len(parquet_uris), BATCH):
-    batch_uris = parquet_uris[i : i + BATCH]
-    table.add_files(file_paths=batch_uris)
+batch_uris: list[str] = []
+
+
+def _flush(uris: list[str]) -> None:
+    table.add_files(file_paths=uris)
+
+
+for cell, uris in by_cell.items():
+    for uri in uris:
+        batch_uris.append(uri)
+        if len(batch_uris) >= BATCH:
+            _flush(batch_uris)
+            total_registered += len(batch_uris)
+            print(
+                f"  registered {total_registered:,} / {len(parquet_uris):,}", end="\r", flush=True
+            )
+            batch_uris = []
+
+if batch_uris:
+    _flush(batch_uris)
     total_registered += len(batch_uris)
-    print(f"  registered {total_registered:,} / {len(parquet_uris):,}", end="\r", flush=True)
 
 print(f"\nDone — {total_registered:,} files registered in {output_path}")
 
