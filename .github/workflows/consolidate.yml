@@ -1,8 +1,10 @@
+# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
 name: Consolidate
 
 on:
-  schedule:
-    - cron: "0 4 1 * *" # 04:00 UTC on the 1st of every month
+  # schedule:
+  #   - cron: "0 4 1 * *" # 04:00 UTC on the 1st of every month
+  workflow_dispatch:
   workflow_dispatch:
     inputs:
       threshold:

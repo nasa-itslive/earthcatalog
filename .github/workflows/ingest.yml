@@ -1,8 +1,9 @@
+# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
 name: Ingest
 
 on:
-  schedule:
-    - cron: "0 4 * * *" # 04:00 UTC daily
+  # schedule:
+  #   - cron: "0 4 * * *" # 04:00 UTC daily
   workflow_dispatch:
     inputs:
       delta_date:
