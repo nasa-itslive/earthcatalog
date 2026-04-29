@@ -12,7 +12,7 @@ palette = [
     { scheme = "slate",   primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: dark)"  },
 ]
 font    = { text = "Roboto", code = "Roboto Mono" }
-icon    = { logo = "material/earth" }
+icon    = { logo = "docs/images/earthcatalog.png" }
 features = [
     "content.code.copy",
     "content.code.annotate",
@@ -104,3 +104,5 @@ Maintenance = "api/maintenance.md"
 
 [nav.Operations]
 "Ingest Guide" = "operations/ingest_guide.md"
+"Ingest Workflow" = "operations/ingest_workflow.md"
+"Query Catalog" = "operations/query_catalog.md"
