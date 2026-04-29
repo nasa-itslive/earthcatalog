@@ -2,41 +2,47 @@
 """
 Update the warehouse hash index after a delta ingest.
 
-Reads a delta parquet's (bucket, key) pairs, hashes the item IDs,
-appends them to the existing warehouse hash index, and uploads.
+Two modes:
+
+1. **delta** — reads a delta inventory parquet's ``key`` column, derives
+   item IDs from filenames, hashes them and appends to the existing index.
+   Use this after ``daily_delta.py`` produces a new delta file.
+
+2. **bootstrap** — scans ALL warehouse GeoParquet files, reads every ``id``
+   column, and rebuilds the index from scratch.  Use for the initial build
+   or as a periodic integrity check.
 
 Usage
 -----
-    python scripts/update_hash_index.py \
-      s3://its-live-data/test-space/stac/catalog/delta/ingested/delta_2026-04-28.done \
+Delta update::
+
+    python scripts/update_hash_index.py \\
+      s3://its-live-data/test-space/stac/catalog/delta/ingested/delta_2026-04-28.done \\
       --warehouse-hash s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
 
-Also used for initial bootstrap from the warehouse GeoParquet files:
+Bootstrap from warehouse::
 
-    python scripts/update_hash_index.py \
-      --bootstrap s3://its-live-data/test-space/stac/catalog/warehouse \
+    python scripts/update_hash_index.py \\
+      --bootstrap s3://its-live-data/test-space/stac/catalog/warehouse \\
       --warehouse-hash s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
 """
+
+from __future__ import annotations
 
 import argparse
 import io
 import re
 
 import obstore
-import pyarrow as pa
 import pyarrow.parquet as pq
-import xxhash
 from obstore.store import S3Store
 
-_HASH_SEED = 42
+from earthcatalog.core.hash_index import hash_id, read_hashes, write_hashes
+
 _BATCH_SIZE = 100_000
 _HIVE_RE = re.compile(
     r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
 )
-
-
-def _hash_id(item_id: str) -> bytes:
-    return xxhash.xxh3_128(item_id.encode("utf-8"), seed=_HASH_SEED).digest()
 
 
 def _get_store(bucket: str, prefix: str = "") -> S3Store:
@@ -75,32 +81,14 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
     return bucket, key
 
 
-def _read_existing_hashes(store: S3Store, key: str) -> set[bytes]:
-    try:
-        raw = bytes(obstore.get(store, key).bytes())
-    except FileNotFoundError:
-        return set()
-    pf = pq.ParquetFile(io.BytesIO(raw))
-    hashes: set[bytes] = set()
-    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash"]):
-        for h in batch.column("id_hash").to_pylist():
-            hashes.add(h)
-    return hashes
+def update_from_delta(delta_uri: str, warehouse_hash_uri: str) -> dict:
+    """
+    Append hashes for items in *delta_uri* to the hash index.
 
-
-def _write_sorted_hash_index(hashes: set[bytes], store: S3Store, key: str) -> int:
-    sorted_hashes = sorted(hashes)
-    arr = pa.array(sorted_hashes, type=pa.binary(16))
-    tbl = pa.table({"id_hash": arr})
-    buf = io.BytesIO()
-    pq.write_table(tbl, buf, compression="zstd")
-    obstore.put(store, key, buf.getvalue())
-    return len(sorted_hashes)
-
-
-def update_from_delta(
-    delta_uri: str, warehouse_hash_uri: str
-) -> dict:
+    *delta_uri* is a delta inventory parquet with a ``key`` column whose
+    values are S3 keys like ``…/ITEM_ID.stac.json``.  Item IDs are derived
+    by stripping the path prefix and ``.stac.json`` suffix.
+    """
     bucket, key = _parse_s3_uri(delta_uri)
     store = _get_store(bucket)
 
@@ -108,7 +96,7 @@ def update_from_delta(
     wh_store = _get_store(wh_bucket)
 
     print(f"Reading existing hash index: {warehouse_hash_uri}")
-    existing = _read_existing_hashes(wh_store, wh_key)
+    existing = read_hashes(wh_store, wh_key)
     print(f"  Existing hashes: {len(existing):,}")
 
     print(f"Reading delta: {delta_uri}")
@@ -120,22 +108,25 @@ def update_from_delta(
         for k in batch.column("key").to_pylist():
             fname = k.rsplit("/", 1)[-1]
             item_id = fname.removesuffix(".stac.json")
-            h = _hash_id(item_id)
+            h = hash_id(item_id)
             if h not in existing:
                 existing.add(h)
                 new_count += 1
 
     print(f"  New hashes to add: {new_count:,}")
-
-    total = _write_sorted_hash_index(existing, wh_store, wh_key)
+    total = write_hashes(existing, wh_store, wh_key)
     print(f"  Written: {warehouse_hash_uri} ({total:,} total hashes)")
 
     return {"new": new_count, "total": total}
 
 
-def bootstrap_from_warehouse(
-    warehouse_uri: str, warehouse_hash_uri: str
-) -> dict:
+def bootstrap_from_warehouse(warehouse_uri: str, warehouse_hash_uri: str) -> dict:
+    """
+    Rebuild the hash index by scanning all warehouse GeoParquet files.
+
+    Reads the ``id`` column from every hive-partitioned parquet file under
+    *warehouse_uri* and writes a fresh sorted hash index.
+    """
     wh_bucket, wh_prefix = _parse_s3_uri(warehouse_uri)
     wh_store = _get_store(wh_bucket, prefix=wh_prefix)
 
@@ -156,13 +147,13 @@ def bootstrap_from_warehouse(
             pf = pq.ParquetFile(io.BytesIO(raw))
             for data_batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id"]):
                 for item_id in data_batch.column("id").to_pylist():
-                    all_hashes.add(_hash_id(item_id))
+                    if item_id is not None:
+                        all_hashes.add(hash_id(str(item_id)))
             if file_count % 100 == 0:
                 print(f"  Processed {file_count} files, {len(all_hashes):,} hashes")
 
     print(f"  Total: {file_count} files, {len(all_hashes):,} unique hashes")
-
-    total = _write_sorted_hash_index(all_hashes, hash_store, hash_key)
+    total = write_hashes(all_hashes, hash_store, hash_key)
     print(f"  Written: {warehouse_hash_uri} ({total:,} hashes)")
 
     return {"files": file_count, "total": total}
@@ -172,7 +163,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Update warehouse hash index")
     parser.add_argument("delta", nargs="?", help="s3:// URI to ingested delta parquet")
     parser.add_argument(
-        "--bootstrap", help="s3:// URI to warehouse root for initial hash index build",
+        "--bootstrap",
+        help="s3:// URI to warehouse root for initial hash index build",
     )
     parser.add_argument(
         "--warehouse-hash",

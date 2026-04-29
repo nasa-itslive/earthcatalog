@@ -112,6 +112,15 @@ def main() -> None:
         default=None,
         help="S3 URI for hash index (default: {warehouse}_id_hashes.parquet)",
     )
+    parser.add_argument(
+        "--update-hash-index",
+        action="store_true",
+        help=(
+            "After delta ingest, update the hash index by reading item IDs from "
+            "the newly written warehouse parquet files (Plan B: exact, no warehouse scan). "
+            "Only effective with --delta."
+        ),
+    )
     args = parser.parse_args()
 
     since = None
@@ -251,6 +260,7 @@ def main() -> None:
             create_client=_create_cluster,
             upload=not args.skip_upload,
             hash_index_path=args.hash_index,
+            update_hash_index=args.update_hash_index,
         )
     elif args.scheduler == "local":
         from dask.distributed import Client, LocalCluster
@@ -281,6 +291,7 @@ def main() -> None:
                 delta=args.delta,
                 upload=not args.skip_upload,
                 hash_index_path=args.hash_index,
+                update_hash_index=args.update_hash_index,
             )
     else:
         from earthcatalog.pipelines.backfill import run_backfill
@@ -306,6 +317,7 @@ def main() -> None:
                 delta=args.delta,
                 upload=not args.skip_upload,
                 hash_index_path=args.hash_index,
+                update_hash_index=args.update_hash_index,
             )
 
 

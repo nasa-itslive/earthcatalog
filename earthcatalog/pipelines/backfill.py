@@ -876,6 +876,75 @@ def register_and_cleanup(
     cleanup_staging(staging_store, staging_prefix)
 
 
+def _update_hash_index_from_parquets(
+    new_parquet_paths: list[str],
+    hash_index_path: str,
+    warehouse_root: str,
+) -> None:
+    """
+    Read ``id`` column from newly registered parquet files, hash each ID,
+    merge into the existing hash index, and write back.
+
+    For S3 warehouse paths a bucket-level store is opened from the
+    warehouse_root URI.  For local paths no store is needed.
+    """
+    from earthcatalog.core.hash_index import merge_hashes_from_parquets, read_hashes, write_hashes
+
+    is_s3 = hash_index_path.startswith("s3://")
+
+    if is_s3:
+        no_scheme = hash_index_path.removeprefix("s3://")
+        hash_bucket, hash_key = no_scheme.split("/", 1)
+        from earthcatalog.core import store_config
+
+        hash_store = store_config.get_store()
+        print(f"Reading existing hash index: {hash_index_path}")
+        existing = read_hashes(hash_store, hash_key)
+    else:
+        from pathlib import Path
+
+        import pyarrow.parquet as pq
+
+        from earthcatalog.core.hash_index import _BATCH_SIZE
+
+        existing: set[bytes] = set()
+        if Path(hash_index_path).exists():
+            pf = pq.ParquetFile(hash_index_path)
+            for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash"]):
+                for h in batch.column("id_hash").to_pylist():
+                    existing.add(bytes(h))
+
+    print(f"  Existing hashes: {len(existing):,}")
+
+    # For S3 warehouse paths, we need a store that can read the new parquets.
+    # They live in the same bucket as the warehouse.
+    warehouse_store: object | None = None
+    if warehouse_root.startswith("s3://"):
+        from earthcatalog.core import store_config
+
+        warehouse_store = store_config.get_store()
+
+    updated, n_new = merge_hashes_from_parquets(new_parquet_paths, existing, store=warehouse_store)
+    print(f"  New hashes from {len(new_parquet_paths):,} parquet files: {n_new:,}")
+
+    if is_s3:
+        total = write_hashes(updated, hash_store, hash_key)
+        print(f"  Written: {hash_index_path} ({total:,} total hashes)")
+    else:
+        import io as _io
+
+        import pyarrow as pa
+        import pyarrow.parquet as _pq
+
+        sorted_hashes = sorted(updated)
+        arr = pa.array(sorted_hashes, type=pa.binary(16))
+        tbl = pa.table({"id_hash": arr})
+        buf = _io.BytesIO()
+        _pq.write_table(tbl, buf, compression="zstd")
+        Path(hash_index_path).write_bytes(buf.getvalue())
+        print(f"  Written: {hash_index_path} ({len(sorted_hashes):,} total hashes)")
+
+
 def register_delta(
     catalog_path: str,
     warehouse_root: str,
@@ -885,6 +954,7 @@ def register_delta(
     upload: bool = True,
     h3_resolution: int | None = None,
     hash_index_path: str | None = None,
+    update_hash_index: bool = False,
 ) -> None:
     """
     Phase 4 delta: add new parquet files to existing Iceberg table (no drop).
@@ -892,6 +962,12 @@ def register_delta(
     Opens (or creates) the Iceberg table, calls ``table.add_files()``
     with only the newly written parquets, then uploads the catalog.
     Existing warehouse files are never touched.
+
+    When *update_hash_index* is True, the warehouse hash index is updated
+    by reading the ``id`` column from each newly written parquet file,
+    hashing each ID, and merging into the existing index.  This is Plan B:
+    read from the actual warehouse files that were just registered, so the
+    index exactly reflects what is in the catalog.
 
     ``hash_index_path`` defaults to ``{warehouse_root}_id_hashes.parquet``.
     """
@@ -941,6 +1017,13 @@ def register_delta(
         print(f"Added {len(new_parquet_paths):,} new files to Iceberg catalog.")
     else:
         print("No new parquet files to register.")
+
+    if update_hash_index and new_parquet_paths:
+        _update_hash_index_from_parquets(
+            new_parquet_paths=new_parquet_paths,
+            hash_index_path=hash_index_path,
+            warehouse_root=warehouse_root,
+        )
 
     if upload:
         upload_catalog(catalog_path)
@@ -1012,6 +1095,7 @@ def run_backfill(
     delta: bool = False,
     create_client: Callable[[], object] | None = None,
     hash_index_path: str | None = None,
+    update_hash_index: bool = False,
 ) -> None:
     """
     Four-phase staging-based backfill pipeline.
@@ -1311,6 +1395,7 @@ def run_backfill(
                 h3_resolution=resolved_resolution,
                 upload=upload,
                 hash_index_path=hash_index_path,
+                update_hash_index=update_hash_index,
             )
         else:
             register_and_cleanup(
