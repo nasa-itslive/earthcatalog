@@ -28,7 +28,7 @@ jobs:
         run: pip install uv
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync
 
       - name: Run tests (unit + integration-free)
         run: uv run python -m pytest --tb=short -q -m "not integration"
