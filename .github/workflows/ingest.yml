@@ -43,6 +43,7 @@ env:
   WAREHOUSE_HASH: s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
   DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
   WAREHOUSE: s3://its-live-data/test-space/stac/catalog/warehouse
+  STAGING: s3://its-live-data/test-space/stac/catalog/ingest
 
 jobs:
   ingest:
@@ -68,7 +69,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Determine delta path
+      - name: Determine delta path and staging
         id: delta
         run: |
           if [ -n "${{ github.event.inputs.delta_date }}" ]; then
@@ -77,8 +78,10 @@ jobs:
             DATE=$(date -u -d "yesterday" +%Y-%m-%d)
           fi
           DELTA_PATH="${{ env.DELTA_PREFIX }}/pending/delta_${DATE}.parquet"
+          STAGING_PATH="${{ env.STAGING }}/delta_${DATE}"
           echo "date=$DATE" >> "$GITHUB_OUTPUT"
           echo "delta_path=$DELTA_PATH" >> "$GITHUB_OUTPUT"
+          echo "staging_path=$STAGING_PATH" >> "$GITHUB_OUTPUT"
           echo "Checking $DELTA_PATH ..."
           aws s3 ls "$DELTA_PATH" || {
             echo "::error::Delta file not found: $DELTA_PATH"
@@ -118,17 +121,14 @@ jobs:
           uv run python scripts/run_backfill.py \
             --inventory "${{ steps.delta.outputs.delta_path }}" \
             --catalog /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }} \
+            --staging "${{ steps.delta.outputs.staging_path }}" \
             --delta \
+            --update-hash-index \
             --scheduler "$SCHEDULER" \
             --chunk-size "${{ github.event.inputs.chunk_size || '10000' }}" \
             --hash-index ${{ env.WAREHOUSE_HASH }} \
             $EXTRA_ARGS
-
-      - name: Update warehouse hash index
-        run: |
-          uv run python scripts/update_hash_index.py \
-            "${{ steps.delta.outputs.delta_path }}" \
-            --warehouse-hash ${{ env.WAREHOUSE_HASH }}
 
       - name: Move delta to ingested
         if: success()
@@ -149,3 +149,5 @@ jobs:
           echo "### Ingest Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "Date: ${{ steps.delta.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Delta: \`${{ steps.delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Staging: \`${{ steps.delta.outputs.staging_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Hash index: updated via --update-hash-index" >> "$GITHUB_STEP_SUMMARY"
