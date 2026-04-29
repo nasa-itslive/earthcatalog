@@ -22,6 +22,8 @@ dependencies = [
   "coiled",
   "orjson",
   "xxhash",
+  "tqdm",
+  "pandas",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,8 @@ dev = [
   "jupyterlab",
   "dask-labextension",
   "pytest",
+  "pytest-asyncio",
+  "pytest-xdist",
   "ruff",
   "mypy",
   "pre-commit",
