@@ -31,13 +31,12 @@ jobs:
         run: |
           uv venv
           source .venv/bin/activate
-          uv sync --dev
-          uv pip install -e .
+          uv sync --extra dev
 
       - name: Run tests (unit + integration-free)
         run: |
           source .venv/bin/activate
-          python -m pytest --tb=short -q -m "not integration"
+          pytest --tb=short -q -m "not integration"
 
       - name: Upload test results
         if: failure()
