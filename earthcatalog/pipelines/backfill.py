@@ -1011,6 +1011,20 @@ def register_delta(
         print(f"Created new Iceberg table {FULL_NAME}")
 
     if new_parquet_paths:
+        # Convert relative paths to full s3:// URIs for PyIceberg table.add_files().
+        # Phase 3 compact returns relative keys like "grid_partition=.../part_N.parquet".
+        # Local paths (absolute or in test scenarios) are left as-is.
+        full_paths = []
+        for p in new_parquet_paths:
+            if p.startswith("s3://"):
+                full_paths.append(p)  # already full S3 URI
+            elif p.startswith("/") or (len(p) > 1 and p[1] == ":"):
+                full_paths.append(p)  # local absolute path (Windows or Unix)
+            else:
+                # relative path — convert to full S3 URI
+                full_paths.append(f"{warehouse_root.rstrip('/')}/{p}")
+        new_parquet_paths = full_paths
+
         batch_size = 2000
         for i in range(0, len(new_parquet_paths), batch_size):
             table.add_files(new_parquet_paths[i : i + batch_size])
