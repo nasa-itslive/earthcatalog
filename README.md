@@ -44,63 +44,121 @@ GeoParquet files directly to the warehouse, and returns only lightweight metadat
 the head node. Expect ~1M items/hour on a modest Dask cluster.
 
 ```bash
-earthcatalog backfill \
+python scripts/run_backfill.py \
     --inventory  s3://my-bucket/inventory/manifest.json \
-    --catalog    s3://my-bucket/catalog/catalog.db \
+    --catalog    /tmp/catalog.db \
     --warehouse  s3://my-bucket/warehouse \
+    --scheduler  local \
     --workers    32
 ```
 
-### 2. Incremental updates
+### 2. Daily delta ingest
 
-After the initial ingest, run the incremental pipeline whenever a new S3 Inventory
-is available. It fetches only keys modified since the last run (`--since`), writes
-new GeoParquet files, and appends a new Iceberg snapshot. Typical runs complete in
-minutes for daily deltas.
+After the initial ingest, use the daily delta pipeline to detect and ingest new items.
+The delta producer reads the S3 Inventory manifest, hashes item IDs with xxh3_128,
+anti-joins against the warehouse hash index (~2 seconds for 40M items), and writes
+a delta parquet with only new items.
 
 ```bash
-earthcatalog incremental \
-    --inventory  /tmp/s3_inventory.csv \
-    --catalog    /tmp/catalog.db \
-    --warehouse  /tmp/warehouse \
-    --since      2024-01-01
+# Produce delta (runs daily via GitHub Actions)
+python scripts/daily_delta.py \
+    s3://log-bucket/inventory/.../manifest.json \
+    --warehouse-hash s3://my-bucket/warehouse_id_hashes.parquet \
+    --delta-prefix s3://my-bucket/delta
+
+# Ingest delta (runs weekly via GitHub Actions)
+python scripts/run_backfill.py \
+    --inventory s3://my-bucket/delta/pending/delta_2026-04-27.parquet \
+    --delta \
+    --scheduler local \
+    --workers 4
 ```
 
 ### 3. Spatial query
 
 EarthCatalog stores grid metadata (type and resolution) as Iceberg table
 properties at ingest time. Use `CatalogInfo` to discover the grid system and
-convert any geometry to the correct partition keys — no prior knowledge required.
+prune files via Iceberg partition filtering before querying.
+
+#### Option A — DuckDB (tabular)
 
 ```python
 import duckdb
-from shapely.geometry import box
-from earthcatalog.core.catalog import open_catalog, get_or_create_table
-from earthcatalog.core.catalog_info import CatalogInfo
+from shapely.geometry import Point
+from earthcatalog.core import catalog, store_config
+from obstore.store import S3Store
 
-catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
-table   = get_or_create_table(catalog)
+# Point to the public catalog (no credentials needed)
+store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
+store_config.set_store(store)
+store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+catalog.download_catalog('/tmp/catalog.db')
 
-# Discover grid type and resolution from the table — no config needed.
-info = CatalogInfo.from_table(table)
-# CatalogInfo(grid_type='h3', resolution=1)
+c     = catalog.open(db_path='/tmp/catalog.db',
+                     warehouse_path='s3://its-live-data/test-space/stac/catalog/warehouse')
+table = catalog.get_or_create(c)
+info  = catalog.info(table)
 
-bbox = box(-60, 60, -30, 80)           # Greenland
-sql  = info.cell_list_sql(bbox)        # "grid_partition IN ('8001fff...', ...)"
+# Prune to the relevant Parquet files (cell + year partitions)
+point = Point(-133.99, 58.74)   # inside item footprints in this cell
+paths = info.file_paths(table, point, start_datetime='2020-01-01',
+                        end_datetime='2022-12-31')
 
 con = duckdb.connect()
-con.execute("INSTALL iceberg; LOAD iceberg; INSTALL spatial; LOAD spatial;")
+con.execute("INSTALL spatial; LOAD spatial;")
 
 df = con.execute(f"""
-    SELECT id, platform, datetime, geometry
-    FROM iceberg_scan('{table.metadata_location}')
-    WHERE {sql}
-      AND datetime >= '2022-01-01'
-      AND ST_Intersects(ST_GeomFromWKB(geometry), ST_GeomFromText('{bbox.wkt}'))
+    SELECT id, platform, datetime
+    FROM read_parquet({paths})
+    WHERE datetime >= '2020-01-01'
+      AND datetime <= '2022-12-31T23:59:59Z'
+      AND ST_Intersects(geometry, ST_GeomFromText('{point.wkt}'))
     ORDER BY datetime
+    LIMIT 10
 """).df()
-# grid_partition prunes to candidate files (zero I/O on the rest);
-# ST_Intersects then does exact geometry intersection within those files.
+```
+
+#### Option B — rustac + CQL2 (STAC-native)
+
+[rustac](https://github.com/gadomski/rustac) queries the same GeoParquet files
+using the STAC API search model with CQL2 filters.
+
+```python
+import rustac, cql2, json, pystac
+from earthcatalog.core import catalog, store_config
+from obstore.store import S3Store
+from shapely.geometry import Point
+
+store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
+store_config.set_store(store)
+store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+catalog.download_catalog('/tmp/catalog.db')
+
+c     = catalog.open('/tmp/catalog.db',
+                     's3://its-live-data/test-space/stac/catalog/warehouse')
+table = catalog.get_or_create(c)
+info  = catalog.info(table)
+
+point = Point(-133.99, 58.74)
+paths = info.file_paths(table, point, start_datetime='2020-01-01',
+                        end_datetime='2022-12-31')
+
+client = rustac.DuckdbClient()
+cql2_filter = cql2.parse_text('percent_valid_pixels > 50').to_json()
+
+# rustac.DuckdbClient.search() takes one href at a time
+items = []
+for path in paths:
+    items.extend(client.search(path, filter=cql2_filter))
+
+# Hydrate to pystac.Item (assets/links stored as JSON strings in GeoParquet)
+def to_stac(raw: dict) -> pystac.Item:
+    for key in ('assets', 'links', 'bbox'):
+        if isinstance(raw.get(key), str):
+            raw[key] = json.loads(raw[key])
+    return pystac.Item.from_dict(raw)
+
+stac_items = [to_stac(i) for i in items]
 ```
 
 ## Documentation

@@ -27,11 +27,16 @@ jobs:
       - name: Install uv
         run: pip install uv
 
-      - name: Install dependencies
-        run: uv sync --all-groups
+      - name: Install project and test dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv sync --extra dev
 
       - name: Run tests (unit + integration-free)
-        run: uv run pytest --tb=short -q -m "not integration"
+        run: |
+          source .venv/bin/activate
+          pytest --tb=short -q -m "not integration"
 
       - name: Upload test results
         if: failure()

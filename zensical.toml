@@ -1,32 +1,33 @@
 [project]
-site_name        = "earthcatalog"
-site_url         = "https://nasa-itslive.github.io/earthcatalog/"
+site_name = "earthcatalog"
+site_url = "https://nasa-itslive.github.io/earthcatalog/"
 site_description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
-site_author      = "NASA ITS_LIVE"
-docs_dir         = "docs/site"
+site_author = "NASA ITS_LIVE"
+docs_dir = "docs/site"
+repo_url = "https://github.com/nasa-itslive/earthcatalog"
 
 [theme]
-name    = "material"
+name = "material"
 palette = [
-    { scheme = "default", primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: light)" },
-    { scheme = "slate",   primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: dark)"  },
+  { scheme = "default", primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: light)" },
+  { scheme = "slate", primary = "indigo", accent = "cyan", media = "(prefers-color-scheme: dark)" },
 ]
-font    = { text = "Roboto", code = "Roboto Mono" }
-icon    = { logo = "material/earth" }
+font = { text = "Roboto", code = "Roboto Mono" }
+icon = { logo = "docs/images/earthcatalog.png", repo = "https://github.com/nasa-itslive/earthcatalog" }
 features = [
-    "content.code.copy",
-    "content.code.annotate",
-    "navigation.tabs",
-    "navigation.sections",
-    "navigation.top",
-    "navigation.footer",
-    "search.suggest",
-    "search.highlight",
-    "toc.integrate",
+  "content.code.copy",
+  "content.code.annotate",
+  "navigation.tabs",
+  "navigation.sections",
+  "navigation.top",
+  "navigation.footer",
+  "search.suggest",
+  "search.highlight",
+  "toc.integrate",
 ]
 
 [repository]
-url  = "https://github.com/nasa-itslive/earthcatalog"
+url = "https://github.com/nasa-itslive/earthcatalog"
 name = "nasa-itslive/earthcatalog"
 
 [[plugins]]
@@ -39,11 +40,11 @@ name = "mkdocstrings"
 paths = ["."]
 
 [plugins.mkdocstrings.handlers.python.options]
-docstring_style          = "google"
-show_source              = true
-show_root_heading        = true
-show_category_heading    = true
-members_order            = "source"
+docstring_style = "google"
+show_source = true
+show_root_heading = true
+show_category_heading = true
+members_order = "source"
 
 [[markdown_extensions]]
 name = "admonition"
@@ -70,7 +71,7 @@ alternate_style = true
 name = "pymdownx.emoji"
 
 [markdown_extensions.pymdownx.emoji]
-emoji_index    = "!!python/name:material.extensions.emoji.twemoji"
+emoji_index = "!!python/name:material.extensions.emoji.twemoji"
 emoji_generator = "!!python/name:material.extensions.emoji.to_svg"
 
 [[markdown_extensions]]
@@ -83,24 +84,26 @@ name = "toc"
 permalink = true
 
 [nav]
-Home            = "index.md"
-"Quick Start"   = "quickstart.md"
-Architecture    = "architecture.md"
-Configuration   = "configuration.md"
+Home = "index.md"
+"Quick Start" = "quickstart.md"
+Architecture = "architecture.md"
+Configuration = "configuration.md"
 
 [nav.Pipelines]
-Incremental  = "pipelines/incremental.md"
-Backfill     = "pipelines/backfill.md"
+Incremental = "pipelines/incremental.md"
+Backfill = "pipelines/backfill.md"
 
 [nav.Maintenance]
 Compaction = "maintenance/compact.md"
 
 [nav."API Reference"]
-Overview    = "api/index.md"
-Core        = "api/core.md"
-Grids       = "api/grids.md"
-Pipelines   = "api/pipelines.md"
+Overview = "api/index.md"
+Core = "api/core.md"
+Grids = "api/grids.md"
+Pipelines = "api/pipelines.md"
 Maintenance = "api/maintenance.md"
 
 [nav.Operations]
 "Ingest Guide" = "operations/ingest_guide.md"
+"Ingest Workflow" = "operations/ingest_workflow.md"
+"Query Catalog" = "operations/query_catalog.md"

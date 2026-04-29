@@ -14,7 +14,7 @@ This tool:
    ``(grid_partition, year)`` bucket.
 2. For every bucket with ≥ *threshold* part files: merges them into one
    consolidated, deduplicated, sorted file (reusing
-   :func:`~earthcatalog.pipelines.backfill._compact_group_impl`).
+   :func:`~earthcatalog.maintenance.compact._compact_group_impl`).
 3. Rebuilds the Iceberg catalog from all files currently in the warehouse
    (a "repair table" operation) so stale and new paths are resolved in one
    clean snapshot.
@@ -58,12 +58,17 @@ As a CLI::
 from __future__ import annotations
 
 import argparse
+import io
 import re
+import tempfile
 import uuid
 from collections import defaultdict
 from pathlib import Path
 
 import obstore
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from obstore.store import LocalStore
 
 from earthcatalog.core.catalog import (
@@ -73,7 +78,6 @@ from earthcatalog.core.catalog import (
     upload_catalog,
 )
 from earthcatalog.core.transform import FileMetadata
-from earthcatalog.pipelines.backfill import _compact_group_impl
 
 # Matches the hive-style path layout written by both run() and run_backfill():
 # grid_partition=<cell>/year=<year>/part_NNNNNN_<uuid>.parquet
@@ -82,6 +86,83 @@ from earthcatalog.pipelines.backfill import _compact_group_impl
 _HIVE_RE = re.compile(
     r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
 )
+
+
+def _compact_group_impl(
+    file_metas: list[FileMetadata],
+    out_key: str,
+    store: object,
+) -> FileMetadata:
+    """
+    Merge all part files for one ``(cell, year)`` bucket,
+    deduplicate rows by ``id``, sort, and write one consolidated GeoParquet
+    file to *store*.
+
+    If the bucket has only one file the file is returned as-is (no I/O).
+    """
+    cell = file_metas[0].grid_partition
+    year = file_metas[0].year
+
+    if len(file_metas) == 1:
+        return file_metas[0]
+
+    tables: list[pa.Table] = []
+    for fm in file_metas:
+        raw = bytes(obstore.get(store, fm.s3_key).bytes())
+        tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+        tables.append(tbl)
+
+    merged = pa.concat_tables(tables, promote_options="default")
+
+    dedup_sort_keys = [("id", "ascending")]
+    if "created" in merged.schema.names:
+        dedup_sort_keys.append(("created", "descending"))
+    sort_indices = pc.sort_indices(
+        merged,
+        sort_keys=dedup_sort_keys,
+        null_placement="at_end",
+    )
+    merged = merged.take(sort_indices)
+    id_col = merged.column("id").to_pylist()
+    seen: set = set()
+    keep: list[int] = []
+    for i, id_val in enumerate(id_col):
+        if id_val not in seen:
+            seen.add(id_val)
+            keep.append(i)
+    if len(keep) < merged.num_rows:
+        print(f"INFO: dedup removed {merged.num_rows - len(keep)} duplicate rows in {out_key}")
+    merged = merged.take(pa.array(keep, type=pa.int64()))
+
+    merged = merged.sort_by(
+        [
+            ("platform", "ascending"),
+            ("datetime", "ascending"),
+        ]
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        pq.write_table(merged, tmp_path, compression="zstd")
+        data = Path(tmp_path).read_bytes()
+        obstore.put(store, out_key, data)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    for fm in file_metas:
+        try:
+            obstore.delete(store, fm.s3_key)
+        except Exception as exc:
+            print(f"WARN: could not delete {fm.s3_key}: {exc}")
+
+    return FileMetadata(
+        s3_key=out_key,
+        grid_partition=cell,
+        year=year,
+        row_count=merged.num_rows,
+        file_size_bytes=len(data),
+    )
 
 
 def _scan_warehouse(store: object) -> dict[tuple[str, str], list[FileMetadata]]:

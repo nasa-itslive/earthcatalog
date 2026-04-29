@@ -1,575 +1,1085 @@
 """
-Dask distributed backfill pipeline for earthcatalog.
+Staging-based backfill pipeline for earthcatalog.
 
-Architecture (three levels)
+Architecture (four phases, fully idempotent)
+--------------------------------------------
+
+Phase 1 — Scheduler (head node)
+    Reads the inventory manifest/CSV/Parquet and writes fixed-size chunk
+    files (Parquet, one row per ``.stac.json`` item) to a staging prefix.
+    Each chunk contains up to *chunk_size* ``(bucket, key)`` pairs.
+    Already-written chunks are skipped on restart (idempotent).
+
+Phase 2 — Ingest (one Dask task per chunk)
+    Each worker:
+    1. Reads its chunk Parquet from the staging store.
+    2. Async-fetches all STAC JSONs using ``obstore.get_async`` with a
+       ``TaskGroup`` + ``Semaphore``.
+    3. Accumulates items in memory, fans out through the H3 partitioner.
+    4. Writes each ``(cell, year)`` group as NDJSON to:
+       ``staging/{cell}/{year}/chunk_{id}.ndjson``
+
+Phase 3 — Compact (one Dask task per (cell, year))
+    Each worker:
+    1. Scans the staging prefix for ALL ``.ndjson`` files in its bucket.
+    2. Reads them into memory, deduplicates by ``id``.
+    3. Writes up to *compact_rows* rows per GeoParquet file.
+    4. Does NOT delete NDJSON staging files (Phase 4 does that).
+
+Phase 4 — Register (head node)
+    1. Drops and recreates the Iceberg table.
+    2. Registers all warehouse Parquet files via ``table.add_files()``.
+    3. Uploads the catalog.
+    4. Deletes all staging files.
+
+Delta mode (``delta=True``)
 ---------------------------
+Lightweight append-only path for small incremental ingests.
 
-Level 0 — ``ingest_chunk`` (one Dask task per inventory chunk)
-    Each worker fetches STAC JSON from S3, fans out through the H3 partitioner,
-    groups by ``(grid_partition, year)``, and writes one GeoParquet file per
-    group directly to the warehouse store via ``write_geoparquet_s3``.
-    Returns a list of ``FileMetadata`` dicts (~200 B each) — no Parquet data
-    crosses the network to the head node.
+Phase 3 — Delta Compact
+    Same as normal compact (NDJSON → GeoParquet) but output files are
+    numbered starting from the next available index in the warehouse
+    partition, so existing parquets are never overwritten.
 
-Level 1 — ``compact_group`` (one Dask task per (cell, year) bucket)
-    Each worker downloads all part files for its bucket from the warehouse store,
-    merges them into one Arrow table, sorts by ``(platform, datetime)``, writes
-    one consolidated GeoParquet file back to the store, and deletes the originals.
-    Returns a single ``FileMetadata``.
-    If a bucket already has only one file, the task is a no-op passthrough.
+Phase 4 — Delta Register
+    Opens the existing Iceberg table (no drop) and calls
+    ``table.add_files()`` with only the newly written parquets.
 
-Level 2 — catalog registration (head node only)
-    ``table.add_files(final_paths)`` registers all compacted files in exactly
-    one Iceberg snapshot.  The catalog is then uploaded to the configured store.
+Spot resilience
+---------------
+Every phase is individually idempotent.  If a spot instance is killed:
 
-Key invariant
--------------
-Parquet data never travels through the head node.  Workers own all I/O.
-The head node handles only inventory streaming, metadata collection (~200 B/file),
-and the final ``table.add_files()`` call.
-
-CLI
----
-::
-
-    # Synchronous (single-process, readable tracebacks — good for debugging)
-    python -m earthcatalog.pipelines.backfill \\
-        --inventory /tmp/inventory.csv \\
-        --catalog   /tmp/catalog.db \\
-        --warehouse /tmp/warehouse \\
-        --scheduler synchronous --limit 200
-
-    # Local Dask cluster
-    python -m earthcatalog.pipelines.backfill \\
-        --inventory /tmp/inventory.csv \\
-        --catalog   /tmp/catalog.db \\
-        --warehouse /tmp/warehouse \\
-        --scheduler local --workers 4
-
-    # Coiled cloud cluster
-    python -m earthcatalog.pipelines.backfill \\
-        --inventory  s3://my-bucket/inventory.parquet \\
-        --catalog    /tmp/catalog.db \\
-        --warehouse  /tmp/warehouse \\
-        --scheduler  coiled \\
-        --coiled-n-workers   20 \\
-        --coiled-software    my-software-env \\
-        --coiled-region      us-west-2
+- Phase 1: chunks already written survive; scheduler skips them.
+- Phase 2: NDJSON files written by dead workers survive and are picked
+  up by Phase 3 on the next run.
+- Phase 3: each (cell, year) task scans S3 fresh.
+- Phase 4: catalog is rebuilt from scratch (drop + recreate).
 """
 
-import concurrent.futures
+from __future__ import annotations
+
+import asyncio
 import io
-import json
+import sys
 import tempfile
-import uuid
 from collections import Counter, defaultdict
-from collections.abc import Generator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import dask
 import obstore
+import orjson
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import tqdm
 
 from earthcatalog.core.catalog import (
-    download_catalog,
-    get_or_create_table,
+    PROP_GRID_RESOLUTION,
+    PROP_GRID_TYPE,
+    PROP_HASH_INDEX_PATH,
     open_catalog,
     upload_catalog,
 )
-from earthcatalog.core.lock import S3Lock
 from earthcatalog.core.transform import (
-    FileMetadata,
     fan_out,
     group_by_partition,
-    write_geoparquet_s3,
+)
+from earthcatalog.core.transform import (
+    write_geoparquet as _write_geoparquet,
 )
 from earthcatalog.grids.h3_partitioner import H3Partitioner
-from earthcatalog.pipelines.incremental import (
-    _iter_inventory,
-    _iter_inventory_file_from_store,
-    _list_manifest_files,
-)
+from earthcatalog.pipelines.incremental import _iter_inventory
+
+_FETCH_RETRIES = 3
+_FETCH_BACKOFF_BASE = 0.5
+_FETCH_CONCURRENCY = 256
+
 
 # ---------------------------------------------------------------------------
-# Default S3 item fetcher (production)
+# Phase 1 — Scheduler: write chunk files to staging
 # ---------------------------------------------------------------------------
 
-_S3_STORES: dict[str, object] = {}
 
-
-def _get_s3_store(bucket: str) -> object:
-    from obstore.store import S3Store
-
-    if bucket not in _S3_STORES:
-        _S3_STORES[bucket] = S3Store(
-            bucket=bucket,
-            region="us-west-2",
-            skip_signature=True,
-        )
-    return _S3_STORES[bucket]
-
-
-def _s3_fetcher(bucket: str, key: str) -> dict | None:
-    """Fetch one STAC JSON item from a public S3 bucket via obstore."""
+def _list_existing_chunks(
+    staging_store: object,
+    staging_prefix: str,
+) -> set[int]:
+    """Return set of chunk IDs already present in the staging store."""
+    prefix = staging_prefix.rstrip("/") + "/"
+    existing: set[int] = set()
     try:
-        raw = obstore.get(_get_s3_store(bucket), key).bytes()
-        return json.loads(bytes(raw))
-    except Exception as exc:
-        print(f"WARN: failed to fetch s3://{bucket}/{key}: {exc}")
-        return None
+        result = obstore.list(staging_store, prefix=prefix)
+        for objs in result:
+            for obj in objs:
+                name = str(obj["path"])
+                if "/" in name:
+                    name = name.rsplit("/", 1)[-1]
+                if name.startswith("chunk_") and name.endswith(".parquet"):
+                    existing.add(int(name.removeprefix("chunk_").removesuffix(".parquet")))
+    except FileNotFoundError:
+        pass
+    return existing
 
 
-# ---------------------------------------------------------------------------
-# Level 0 — ingest_chunk
-# ---------------------------------------------------------------------------
+def _list_completed_chunk_ids(
+    staging_store: object,
+    staging_prefix: str,
+    pending_prefix: str,
+) -> set[int]:
+    """Return chunk IDs that have a completion marker and no pending file."""
+    completed: set[int] = set()
+    marker_prefix = f"{staging_prefix}/_completed/"
+    try:
+        result = obstore.list(staging_store, prefix=marker_prefix)
+        for objs in result:
+            for obj in objs:
+                name = str(obj["path"])
+                fname = name.rsplit("/", 1)[-1]
+                if fname.startswith("chunk_") and fname.endswith(".done"):
+                    cid_str = fname.removeprefix("chunk_").removesuffix(".done")
+                    if cid_str.isdigit():
+                        completed.add(int(cid_str))
+    except FileNotFoundError:
+        pass
+    pending_ids = _list_existing_chunks(staging_store, pending_prefix)
+    return completed - pending_ids
 
 
-def _ingest_chunk_impl(
-    bucket_key_pairs: list[tuple[str, str]],
-    partitioner: object,
-    warehouse_store: object,
+def _write_one_chunk(
     chunk_id: int,
-    item_fetcher: object = None,
-    max_workers: int = 16,
-) -> tuple[list[FileMetadata], Counter]:
+    batch: list[tuple[str, str]],
+    staging_store: object,
+    staging_prefix: str,
+) -> str:
+    """Write a single chunk Parquet. Returns the chunk key."""
+    chunk_key = f"{staging_prefix}/chunk_{chunk_id:06d}.parquet"
+    tbl = pa.table({"bucket": [b for b, _ in batch], "key": [k for _, k in batch]})
+    buf = io.BytesIO()
+    pq.write_table(tbl, buf)
+    obstore.put(staging_store, chunk_key, buf.getvalue())
+    return chunk_key
+
+
+def write_chunks(
+    inventory_path: str,
+    staging_store: object,
+    staging_prefix: str,
+    chunk_size: int = 100_000,
+    limit: int | None = None,
+    since: datetime | None = None,
+    write_concurrency: int = 8,
+) -> list[str]:
     """
-    Level 0 worker: fetch STAC items → fan_out → group_by_partition → write.
+    Read inventory and write chunk Parquet files to the staging store.
 
-    Parameters
-    ----------
-    bucket_key_pairs:
-        List of ``(bucket, key)`` pairs to fetch from S3.
-    partitioner:
-        An :class:`~earthcatalog.core.partitioner.AbstractPartitioner` instance
-        (e.g. ``H3Partitioner``).  Must be serialisable by cloudpickle.
-    warehouse_store:
-        An ``obstore``-compatible store where GeoParquet files are written.
-        Use ``LocalStore`` or ``MemoryStore`` for tests; ``S3Store`` for
-        production.
-    chunk_id:
-        Integer chunk identifier used in the output filename.
-    item_fetcher:
-        Callable ``(bucket, key) -> dict | None``.  When ``None``, the default
-        public S3 fetcher is used.  Pass a custom callable for tests.
-    max_workers:
-        Number of threads for parallel item fetching.
+    Streams from the inventory iterator into chunk-sized buffers and writes
+    each chunk as soon as it's full — no need to materialize the entire
+    inventory in memory.
 
-    Returns
-    -------
-    A tuple of:
+    Already-written chunks are detected via a single ``obstore.list`` call
+    upfront. Items belonging to existing chunks are still consumed from the
+    inventory iterator but not buffered or written.
 
-    - ``list[FileMetadata]`` — one entry per ``(grid_partition, year)`` group
-      written.  Empty groups produce no entry.  No Parquet data is returned;
-      only tiny metadata records (~200 B each).
-    - ``Counter[int]`` — fan-out distribution: maps number-of-cells (1, 2, 3,
-      …) to count-of-source-items that landed in that many cells.  Used by the
-      driver to compute overlap statistics without a post-hoc warehouse scan.
+    Writes are parallelized with a thread pool.
+
+    Returns list of chunk keys (including pre-existing ones).
     """
-    if item_fetcher is None:
-        item_fetcher = _s3_fetcher
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        items = list(
-            filter(
-                None,
-                pool.map(lambda bc: item_fetcher(*bc), bucket_key_pairs),
-            )
+    import tqdm
+
+    existing_ids = _list_existing_chunks(staging_store, staging_prefix)
+    if existing_ids:
+        max_existing = max(existing_ids)
+        print(f"Phase 1: {len(existing_ids)} existing chunks found (up to chunk {max_existing})")
+    else:
+        max_existing = -1
+
+    chunk_keys: dict[int, str] = {}
+    written = 0
+    skipped = len(existing_ids)
+    chunk_id = 0
+    buf: list[tuple[str, str]] = []
+    total_items = 0
+
+    for cid in existing_ids:
+        chunk_keys[cid] = f"{staging_prefix}/chunk_{cid:06d}.parquet"
+
+    contiguous_max = -1
+    for i in range(max_existing + 1):
+        if i in existing_ids:
+            contiguous_max = i
+        else:
+            break
+
+    items_to_skip = (contiguous_max + 1) * chunk_size
+
+    with ThreadPoolExecutor(max_workers=write_concurrency) as pool:
+        pending: dict[object, int] = {}
+        pbar = tqdm.tqdm(desc="Phase 1", unit="chunk")
+
+        def _collect(done_futures):
+            nonlocal written
+            for f in done_futures:
+                key = f.result()
+                cid = pending[f]
+                chunk_keys[cid] = key
+                written += 1
+                del pending[f]
+                pbar.update(1)
+
+        inv_iter = _iter_inventory(inventory_path, since=since)
+
+        if items_to_skip > 0:
+            pbar.set_postfix_str(f"fast-forwarding {items_to_skip:,} items")
+            chunk_id = contiguous_max + 1
+            for b, k in inv_iter:
+                if not k.endswith(".stac.json"):
+                    continue
+                total_items += 1
+                if total_items >= items_to_skip:
+                    break
+            pbar.set_postfix_str(f"fast-forward done, at item {total_items:,}")
+
+        for b, k in inv_iter:
+            if not k.endswith(".stac.json"):
+                continue
+            total_items += 1
+
+            buf.append((b, k))
+
+            if len(buf) >= chunk_size:
+                future = pool.submit(_write_one_chunk, chunk_id, buf, staging_store, staging_prefix)
+                pending[future] = chunk_id
+                chunk_id += 1
+                buf = []
+
+                done = [f for f in list(pending) if f.done()]
+                _collect(done)
+
+                pbar.set_postfix(
+                    items=f"{total_items:,}",
+                    written=written,
+                    skipped=skipped,
+                    pending=len(pending),
+                    refresh=False,
+                )
+
+            if limit is not None and total_items >= limit:
+                break
+
+        if buf and chunk_id not in existing_ids:
+            future = pool.submit(_write_one_chunk, chunk_id, buf, staging_store, staging_prefix)
+            pending[future] = chunk_id
+
+        for f in as_completed(pending):
+            _collect([f])
+
+        pbar.close()
+
+    max_id = max(chunk_keys) if chunk_keys else -1
+    result = [chunk_keys[i] for i in range(max_id + 1)]
+
+    print(
+        f"Scheduler: {total_items:,} .stac.json items → "
+        f"{written} chunks written, {skipped} skipped (already exist)"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Ingest worker: fetch + fan-out + write NDJSON
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_item_async(store: object, bucket: str, key: str) -> dict | None:
+    """
+    Fetch one STAC JSON from S3 via obstore.get_async with retry.
+
+    Uses pre-created *store* (one per chunk, not one per item).
+    404 → None (skip).  403 → raise.  Other → retry 3× then raise.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(_FETCH_RETRIES + 1):
+        try:
+            result = await obstore.get_async(store, key)
+            buf = await result.bytes_async()
+            raw = memoryview(buf).tobytes()
+            if not raw or raw[0:1] != b"{":
+                body_preview = raw[:200].decode("utf-8", errors="replace")
+                if b"SlowDown" in raw or b"<Error>" in raw:
+                    raise OSError(f"S3 error response: {body_preview}")
+                print(
+                    f"WARN: unexpected content for s3://{bucket}/{key}: {body_preview}",
+                    file=sys.stderr,
+                )
+                return None
+            return orjson.loads(raw)
+        except FileNotFoundError:
+            print(f"WARN: s3://{bucket}/{key} not found — skipping", file=sys.stderr)
+            return None
+        except PermissionError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _FETCH_RETRIES:
+                await asyncio.sleep(_FETCH_BACKOFF_BASE * (2**attempt))
+
+    raise RuntimeError(
+        f"Failed to fetch s3://{bucket}/{key} after {_FETCH_RETRIES} retries: {last_exc}"
+    ) from last_exc
+
+
+async def _fetch_all_async(
+    pairs: list[tuple[str, str]],
+    concurrency: int,
+    store: object,
+) -> tuple[list[dict], list[tuple[str, str, str]]]:
+    """
+    Fetch multiple STAC items concurrently via obstore.get_async.
+
+    Returns (items, failed) where failed is a list of
+    ``(bucket, key, error_message)`` tuples.
+    """
+    from asyncio import Semaphore, TaskGroup
+
+    sem = Semaphore(concurrency)
+    results: dict[int, dict | None] = {}
+    errors: dict[int, str] = {}
+
+    async def _fetch(index: int, bucket: str, key: str) -> None:
+        async with sem:
+            try:
+                results[index] = await _fetch_item_async(store, bucket, key)
+            except Exception as exc:
+                print(f"ERROR: failed to fetch s3://{bucket}/{key}: {exc}", file=sys.stderr)
+                results[index] = None
+                errors[index] = str(exc)
+
+    async with TaskGroup() as tg:
+        for i, (bucket, key) in enumerate(pairs):
+            tg.create_task(_fetch(i, bucket, key))
+
+    items: list[dict] = []
+    failed: list[tuple[str, str, str]] = []
+    for i, (bucket, key) in enumerate(pairs):
+        if results.get(i) is not None:
+            items.append(results[i])
+        else:
+            failed.append((bucket, key, errors.get(i, "unknown")))
+    return items, failed
+
+
+def _write_ndjson(items: list[dict], store: object, key: str) -> int:
+    """Write a list of dicts as NDJSON to the store. Appends if file exists."""
+    if not items:
+        return 0
+    new_lines = [orjson.dumps(item) for item in items]
+    try:
+        existing = memoryview(obstore.get(store, key).bytes()).tobytes()
+        data = existing + b"\n" + b"\n".join(new_lines)
+    except FileNotFoundError:
+        data = b"\n".join(new_lines)
+    obstore.put(store, key, data)
+    return len(items)
+
+
+def ingest_chunk(
+    chunk_key: str,
+    staging_store: object,
+    staging_prefix: str,
+    pending_prefix: str,
+    partitioner: object,
+    fetch_concurrency: int = _FETCH_CONCURRENCY,
+) -> dict[str, Any]:
+    """
+    Phase 2 worker: read chunk → fetch items → fan-out → write NDJSON groups.
+
+    Failed items are written to ``pending_prefix/chunk_{id}.parquet`` for
+    retry on the next run.  If all items succeed, no pending file is created.
+
+    Returns a report dict with counts and the list of NDJSON keys written.
+    """
+    raw = memoryview(obstore.get(staging_store, chunk_key).bytes()).tobytes()
+    tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+    pairs = [
+        (str(b), str(k))
+        for b, k in zip(tbl.column("bucket").to_pylist(), tbl.column("key").to_pylist())
+    ]
+
+    source_items = len(pairs)
+    if not pairs:
+        return {
+            "chunk_key": chunk_key,
+            "source_items": 0,
+            "fetched_items": 0,
+            "fetch_failures": 0,
+            "groups_written": 0,
+            "fan_out_counter": {},
+            "ndjson_keys": [],
+        }
+
+    from obstore.store import S3Store as _S3Store
+
+    bucket = pairs[0][0]
+    source_store = _S3Store(bucket=bucket, region="us-west-2", skip_signature=True)
+    items, failed = asyncio.run(
+        _fetch_all_async(pairs, concurrency=fetch_concurrency, store=source_store)
+    )
+    fetch_failures = len(failed)
+
+    chunk_id = chunk_key.rsplit("/", 1)[-1].replace("chunk_", "").replace(".parquet", "")
+
+    if failed:
+        now = datetime.now(UTC).isoformat()
+        pending_key = f"{pending_prefix}/chunk_{chunk_id}.parquet"
+        fail_tbl = pa.table(
+            {
+                "bucket": [b for b, _, _ in failed],
+                "key": [k for _, k, _ in failed],
+                "error": [e for _, _, e in failed],
+                "timestamp": [now] * len(failed),
+            }
         )
+        buf = io.BytesIO()
+        pq.write_table(fail_tbl, buf)
+        obstore.put(staging_store, pending_key, buf.getvalue())
+    else:
+        pending_key = f"{pending_prefix}/chunk_{chunk_id}.parquet"
+        try:
+            obstore.delete(staging_store, pending_key)
+        except (FileNotFoundError, Exception):
+            pass
+
+    empty_report = {
+        "chunk_key": chunk_key,
+        "source_items": source_items,
+        "fetched_items": len(items),
+        "fetch_failures": fetch_failures,
+        "groups_written": 0,
+        "fan_out_counter": {},
+        "ndjson_keys": [],
+    }
 
     if not items:
-        return [], Counter()
+        empty_report["fetched_items"] = 0
+        return empty_report
 
     fan_out_items = fan_out(items, partitioner)
     if not fan_out_items:
-        return [], Counter()
+        return empty_report
 
-    # Compute fan-out distribution: how many distinct cells did each item land in?
     cells_per_id: dict[str, set[str]] = defaultdict(set)
     for item in fan_out_items:
-        item_id = item["id"]
-        cell = item["properties"].get("grid_partition", "__none__")
-        cells_per_id[item_id].add(cell)
-    fan_out_counter: Counter[int] = Counter(len(cells) for cells in cells_per_id.values())
+        cells_per_id[item["id"]].add(item["properties"].get("grid_partition", "__none__"))
+    fan_out_counter: dict[int, int] = dict(Counter(len(cells) for cells in cells_per_id.values()))
 
     groups = group_by_partition(fan_out_items)
-    file_metas: list[FileMetadata] = []
+    ndjson_keys: list[str] = []
 
     for (cell, year), group_items in groups.items():
-        year_str = str(year) if year is not None else "unknown"
-        key = (
-            f"grid_partition={cell}/year={year_str}/"
-            f"part_{chunk_id:06d}_{uuid.uuid4().hex[:8]}.parquet"
-        )
-        n_rows, n_bytes = write_geoparquet_s3(group_items, warehouse_store, key)
-        if n_rows > 0:
-            file_metas.append(
-                FileMetadata(
-                    s3_key=key,
-                    grid_partition=cell,
-                    year=year,
-                    row_count=n_rows,
-                    file_size_bytes=n_bytes,
-                )
-            )
+        ndjson_key = f"{staging_prefix}/{cell}/{year}/chunk_{chunk_id}.ndjson"
+        n = _write_ndjson(group_items, staging_store, ndjson_key)
+        if n > 0:
+            ndjson_keys.append(ndjson_key)
 
-    return file_metas, fan_out_counter
+    marker_key = f"{staging_prefix}/_completed/chunk_{chunk_id}.done"
+    obstore.put(staging_store, marker_key, b"ok")
 
-
-#: Dask-delayed version of :func:`_ingest_chunk_impl`.
-#: Call ``ingest_chunk(...).compute()`` or pass to ``dask.compute()``.
-ingest_chunk = dask.delayed(_ingest_chunk_impl)
-
-
-# ---------------------------------------------------------------------------
-# Level 1 — compact_group
-# ---------------------------------------------------------------------------
-
-
-def _compact_group_impl(
-    file_metas: list[FileMetadata],
-    out_key: str,
-    store: object,
-) -> FileMetadata:
-    """
-    Level 1 worker: merge all part files for one ``(cell, year)`` bucket,
-    deduplicate rows by ``id``, and remove orphan Parquet files from the
-    bucket's prefix.
-
-    If the bucket has only one file **and** there are no orphan files in the
-    prefix, the file is returned as-is (no I/O).
-
-    Steps for multi-file buckets (or buckets with orphans):
-
-    1. **Orphan sweep** — list all ``.parquet`` files under
-       ``grid_partition=<cell>/year=<year>/``; delete any that are neither in
-       *file_metas* nor the *out_key*.
-    2. **Download** all part files from *store*.
-    3. **Concatenate** Arrow tables (schema metadata including ``geo`` and
-       ``ARROW:extension:name: geoarrow.wkb`` is preserved from the first
-       table).
-    4. **Deduplicate** on ``id``: sort by ``(id ASC, updated DESC NULLS LAST)``
-       and keep the first (most-recent) occurrence of each id.
-    5. **Sort** by ``(platform, datetime)`` for Parquet locality.
-    6. **Write** one consolidated GeoParquet file to *store* at *out_key*.
-    7. **Delete** all input part files.
-
-    Parameters
-    ----------
-    file_metas:
-        Metadata for all part files belonging to one ``(grid_partition, year)``
-        bucket — all must have the same ``grid_partition`` and ``year``.
-    out_key:
-        Destination key within *store* for the compacted file.
-    store:
-        An ``obstore``-compatible store.
-
-    Returns
-    -------
-    A single :class:`~earthcatalog.core.transform.FileMetadata` for the
-    compacted output file.
-    """
-    cell = file_metas[0].grid_partition
-    year = file_metas[0].year
-    year_str = str(year) if year is not None else "unknown"
-    prefix = f"grid_partition={cell}/year={year_str}/"
-    known_keys = {fm.s3_key for fm in file_metas} | {out_key}
-
-    # ------------------------------------------------------------------
-    # Orphan sweep — delete any .parquet files in the prefix that are not
-    # among the known part files or the output key.
-    # obstore.list() returns a list of batches; each batch is a list of dicts.
-    # ------------------------------------------------------------------
-    try:
-        for batch in obstore.list(store, prefix=prefix):
-            for obj in batch:
-                key = obj["path"]
-                if key.endswith(".parquet") and key not in known_keys:
-                    try:
-                        obstore.delete(store, key)
-                        print(f"INFO: deleted orphan {key}")
-                    except Exception as exc:
-                        print(f"WARN: could not delete orphan {key}: {exc}")
-    except Exception as exc:
-        print(f"WARN: orphan sweep failed for {prefix}: {exc}")
-
-    # ------------------------------------------------------------------
-    # Single-file passthrough — only after orphan sweep.
-    # ------------------------------------------------------------------
-    if len(file_metas) == 1:
-        return file_metas[0]
-
-    # ------------------------------------------------------------------
-    # Download and read all part files.
-    # ------------------------------------------------------------------
-    tables: list[pa.Table] = []
-    for fm in file_metas:
-        raw = bytes(obstore.get(store, fm.s3_key).bytes())
-        tbl = pq.ParquetFile(io.BytesIO(raw)).read()
-        tables.append(tbl)
-
-    # Merge: pa.concat_tables preserves schema metadata (geo, field metadata)
-    # from the first table when all schemas are identical.
-    merged = pa.concat_tables(tables, promote_options="none")
-
-    # ------------------------------------------------------------------
-    # Deduplicate on `id`: keep the row with the most-recent `updated`
-    # timestamp.  Sort so the best candidate for each id comes first, then
-    # take the first occurrence.
-    # ------------------------------------------------------------------
-    sort_indices = pc.sort_indices(
-        merged,
-        sort_keys=[("id", "ascending"), ("updated", "descending")],
-        null_placement="at_end",
-    )
-    merged = merged.take(sort_indices)
-    id_col = merged.column("id").to_pylist()
-    seen: set = set()
-    keep: list[int] = []
-    for i, id_val in enumerate(id_col):
-        if id_val not in seen:
-            seen.add(id_val)
-            keep.append(i)
-    if len(keep) < merged.num_rows:
-        print(f"INFO: dedup removed {merged.num_rows - len(keep)} duplicate rows in {out_key}")
-    merged = merged.take(pa.array(keep, type=pa.int64()))
-
-    # Sort by (platform, datetime) for optimal Parquet predicate pushdown.
-    merged = merged.sort_by(
-        [
-            ("platform", "ascending"),
-            ("datetime", "ascending"),
-        ]
-    )
-
-    # ------------------------------------------------------------------
-    # Write compacted file to temp, then upload.
-    # ------------------------------------------------------------------
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        pq.write_table(merged, tmp_path)
-        data = Path(tmp_path).read_bytes()
-        obstore.put(store, out_key, data)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    # Delete input part files now that the compacted file is safely written.
-    for fm in file_metas:
-        try:
-            obstore.delete(store, fm.s3_key)
-        except Exception as exc:
-            print(f"WARN: could not delete {fm.s3_key}: {exc}")
-
-    return FileMetadata(
-        s3_key=out_key,
-        grid_partition=cell,
-        year=year,
-        row_count=merged.num_rows,
-        file_size_bytes=len(data),
-    )
-
-
-#: Dask-delayed version of :func:`_compact_group_impl`.
-compact_group = dask.delayed(_compact_group_impl)
-
-
-# ---------------------------------------------------------------------------
-# Ingest stats helpers
-# ---------------------------------------------------------------------------
-
-
-def _load_processed_files(report_location: str) -> set[str]:
-    """
-    Read ``ingest_stats.json`` and return the set of ``inventory_file`` keys
-    that have already been processed in prior runs.
-
-    Used by the spot-resilient per-file mini-run loop to skip data files that
-    were successfully registered in a previous (possibly interrupted) run.
-
-    Returns an empty set if the file does not exist, is not readable, or no
-    record contains an ``inventory_file`` field.
-
-    Parameters
-    ----------
-    report_location:
-        Local path or ``s3://`` URI to the ``ingest_stats.json`` file.
-    """
-    try:
-        if report_location.startswith("s3://"):
-            import obstore as _obs
-
-            no_scheme = report_location.removeprefix("s3://")
-            s3_bucket, s3_key = no_scheme.split("/", 1)
-            import configparser as _cp
-            import os as _os
-
-            from obstore.store import S3Store as _S3S
-
-            key_id = _os.environ.get("AWS_ACCESS_KEY_ID")
-            secret = _os.environ.get("AWS_SECRET_ACCESS_KEY")
-            token = _os.environ.get("AWS_SESSION_TOKEN")
-            region = (
-                _os.environ.get("AWS_DEFAULT_REGION")
-                or _os.environ.get("AWS_REGION")
-                or "us-west-2"
-            )
-            if not (key_id and secret):
-                cfg = _cp.ConfigParser()
-                cfg.read(_os.path.expanduser("~/.aws/credentials"))
-                profile = _os.environ.get("AWS_PROFILE", "default")
-                if profile in cfg:
-                    key_id = cfg[profile].get("aws_access_key_id", key_id)
-                    secret = cfg[profile].get("aws_secret_access_key", secret)
-                    token = cfg[profile].get("aws_session_token", token) or token
-            sk: dict = dict(bucket=s3_bucket, region=region)
-            if key_id:
-                sk["aws_access_key_id"] = key_id
-            if secret:
-                sk["aws_secret_access_key"] = secret
-            if token:
-                sk["aws_session_token"] = token
-            raw = bytes(_obs.get(_S3S(**sk), s3_key).bytes())
-            records: list[dict] = json.loads(raw)
-        else:
-            p = Path(report_location)
-            if not p.exists():
-                return set()
-            records = json.loads(p.read_text())
-        return {r["inventory_file"] for r in records if r.get("inventory_file")}
-    except Exception as exc:
-        print(f"WARN: could not load processed files from {report_location}: {exc}")
-        return set()
-
-
-def _write_ingest_stats(
-    catalog_path: str,
-    inventory_path: str,
-    since: datetime | None,
-    source_items: int,
-    total_rows: int,
-    final_metas: list[FileMetadata],
-    fan_out_counter: Counter,
-    h3_resolution: int,
-    report_location: str | None = None,
-    inventory_file: str | None = None,
-) -> None:
-    """
-    Append one run record to the ingest stats JSON file and, if the target is
-    on S3, upload it via obstore.
-
-    Resolution order for the output path
-    -------------------------------------
-    1. ``report_location`` if supplied (local path **or** ``s3://`` URI).
-    2. When ``report_location`` is ``None`` and ``catalog_path`` is a local
-       path: ``<catalog_dir>/ingest_stats.json`` (original behaviour).
-    3. When ``report_location`` is ``None`` and ``catalog_path`` is on S3
-       (i.e. begins with ``s3://``): ``<catalog_s3_dir>/ingest_stats.json``
-       — uploaded via the catalog's obstore after writing a temp local copy.
-
-    The file is a JSON array; each element represents one pipeline run.
-    If the file does not exist it is created.  If it already exists the new
-    record is appended so the full run history is preserved.
-
-    Fields written per run
-    ----------------------
-    run_id              ISO-8601 UTC timestamp of this run
-    inventory           inventory path or URI passed to the pipeline
-    inventory_file      individual data-file key within the manifest (or null)
-    since               --since cutoff (ISO string) or null
-    h3_resolution       H3 resolution used for spatial partitioning
-    source_items        number of STAC items read from the inventory
-    total_rows          total rows written (source_items × avg_fan_out)
-    unique_cells        number of distinct H3 cells with data
-    unique_years        number of distinct acquisition years with data
-    files_written       number of Parquet files registered in Iceberg
-    avg_fan_out         total_rows / source_items (rounded to 3 d.p.)
-    overhead_pct        (total_rows - source_items) / source_items × 100
-    fan_out_distribution  mapping of n_cells → item_count
-    """
-    record: dict = {
-        "run_id": datetime.now(tz=UTC).isoformat(timespec="seconds"),
-        "inventory": inventory_path,
-        "inventory_file": inventory_file,
-        "since": since.isoformat() if since else None,
-        "h3_resolution": h3_resolution,
+    return {
+        "chunk_key": chunk_key,
         "source_items": source_items,
-        "total_rows": total_rows,
-        "unique_cells": len({fm.grid_partition for fm in final_metas}),
-        "unique_years": len({fm.year for fm in final_metas}),
-        "files_written": len(final_metas),
-        "avg_fan_out": round(total_rows / source_items, 3) if source_items else 0,
-        "overhead_pct": round((total_rows - source_items) * 100 / source_items, 1)
-        if source_items
-        else 0,
-        "fan_out_distribution": {str(k): v for k, v in sorted(fan_out_counter.items())},
+        "fetched_items": len(items),
+        "fetch_failures": fetch_failures,
+        "groups_written": len(ndjson_keys),
+        "fan_out_counter": fan_out_counter,
+        "ndjson_keys": ndjson_keys,
     }
 
-    # ------------------------------------------------------------------
-    # Determine effective target: explicit override > catalog sibling
-    # ------------------------------------------------------------------
-    effective: str = report_location or (Path(catalog_path).parent / "ingest_stats.json").as_posix()
-    target_s3 = effective.startswith("s3://")
 
-    # Always write to a local staging file first
-    if target_s3:
-        import tempfile
+# ---------------------------------------------------------------------------
+# Phase 3 — Compact: NDJSON → GeoParquet
+# ---------------------------------------------------------------------------
 
-        _tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        local_stats_path = Path(_tmp.name)
-        _tmp.close()
-    else:
-        local_stats_path = Path(effective)
-        local_stats_path.parent.mkdir(parents=True, exist_ok=True)
 
-    records: list[dict] = []
-    if local_stats_path.exists():
+def _read_ndjson_files(store: object, keys: list[str]) -> list[dict]:
+    """Read and parse multiple NDJSON files from the store."""
+    items: list[dict] = []
+    for key in keys:
         try:
-            records = json.loads(local_stats_path.read_text())
-        except Exception:
-            records = []  # corrupt file — start fresh
+            raw = memoryview(obstore.get(store, key).bytes()).tobytes()
+        except FileNotFoundError:
+            continue
+        for line in raw.decode("utf-8").split("\n"):
+            line = line.strip()
+            if line:
+                items.append(orjson.loads(line))
+    return items
 
-    records.append(record)
-    local_stats_path.write_text(json.dumps(records, indent=2))
 
-    if target_s3:
-        # Upload to S3: derive bucket + key from the s3:// URI
-        import obstore
+def _dedup_items(items: list[dict]) -> list[dict]:
+    """Deduplicate by id, keeping the one with the most-recent `updated`."""
+    best: dict[str, dict] = {}
+    for item in items:
+        item_id = item.get("id", "")
+        updated = item.get("properties", {}).get("updated", "")
+        existing = best.get(item_id)
+        if existing is None or updated > (existing.get("properties", {}).get("updated", "")):
+            best[item_id] = item
+    return list(best.values())
 
-        no_scheme = effective.removeprefix("s3://")
-        s3_bucket, s3_key = no_scheme.split("/", 1)
-        import configparser
-        import os
 
-        from obstore.store import S3Store
+def _scan_ndjson(store: object, prefix: str) -> list[str]:
+    """List all .ndjson files under *prefix* in *store*."""
+    keys: list[str] = []
+    for batch in obstore.list(store, prefix=prefix):
+        for obj in batch:
+            k: str = obj["path"]
+            if k.endswith(".ndjson"):
+                keys.append(k)
+    return keys
 
-        key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-        secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-        token = os.environ.get("AWS_SESSION_TOKEN")
-        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
-        if not (key_id and secret):
-            cfg = configparser.ConfigParser()
-            cfg.read(os.path.expanduser("~/.aws/credentials"))
-            profile = os.environ.get("AWS_PROFILE", "default")
-            if profile in cfg:
-                key_id = cfg[profile].get("aws_access_key_id", key_id)
-                secret = cfg[profile].get("aws_secret_access_key", secret)
-                token = cfg[profile].get("aws_session_token", token) or token
-        sk: dict = dict(bucket=s3_bucket, region=region)
-        if key_id:
-            sk["aws_access_key_id"] = key_id
-        if secret:
-            sk["aws_secret_access_key"] = secret
-        if token:
-            sk["aws_session_token"] = token
-        rpt_store = S3Store(**sk)
-        obstore.put(rpt_store, s3_key, local_stats_path.read_bytes())
-        local_stats_path.unlink(missing_ok=True)
-        print(f"Ingest stats: {effective}")
+
+def _stream_compact(
+    cell: str,
+    year: str,
+    staging_store: object,
+    ndjson_keys: list[str],
+    compact_rows: int,
+    write_fn: Callable[[list[dict], str], int],
+    out_key_fn: Callable[[int], str],
+) -> dict[str, Any]:
+    """
+    Stream NDJSON → dedup → write GeoParquet in batches.
+
+    Only holds ``compact_rows`` items + a set of seen IDs in memory.
+    """
+    seen_ids: set[str] = set()
+    batch: list[dict] = []
+    input_count = 0
+    unique_count = 0
+    out_keys: list[str] = []
+    total_rows = 0
+    part_idx = 0
+
+    for key in ndjson_keys:
+        try:
+            raw = memoryview(obstore.get(staging_store, key).bytes()).tobytes()
+        except FileNotFoundError:
+            continue
+        for line in raw.decode("utf-8").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            input_count += 1
+            item = orjson.loads(line)
+            item_id = item.get("id", "")
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            unique_count += 1
+            batch.append(item)
+
+            if len(batch) >= compact_rows:
+                out_path = out_key_fn(part_idx)
+                n = write_fn(batch, out_path)
+                if n > 0:
+                    out_keys.append(out_path)
+                    total_rows += n
+                part_idx += 1
+                batch = []
+
+    if batch:
+        out_path = out_key_fn(part_idx)
+        n = write_fn(batch, out_path)
+        if n > 0:
+            out_keys.append(out_path)
+            total_rows += n
+
+    return {
+        "cell": cell,
+        "year": year,
+        "input_files": len(ndjson_keys),
+        "input_items": input_count,
+        "unique_items": unique_count,
+        "output_files": out_keys,
+        "output_rows": total_rows,
+    }
+
+
+def compact_cell_year(
+    cell: str,
+    year: str,
+    staging_store: object,
+    staging_prefix: str,
+    warehouse_root: str,
+    compact_rows: int = 100_000,
+) -> dict[str, Any]:
+    """Phase 3 worker (local filesystem): stream NDJSON → write GeoParquet."""
+    prefix = f"{staging_prefix}/{cell}/{year}/"
+    ndjson_keys = _scan_ndjson(staging_store, prefix)
+
+    if not ndjson_keys:
+        return _empty_compact_report(cell, year)
+
+    def _write_local(batch: list[dict], rel_path: str) -> int:
+        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        full = str(out_dir / rel_path)
+        n = _write_geoparquet(batch, full)
+        return n if n <= 0 else n
+
+    def _out_key(idx: int) -> str:
+        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
+        return str(out_dir / f"part_{idx:06d}.parquet")
+
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key
+    )
+
+
+def compact_cell_year_s3(
+    cell: str,
+    year: str,
+    staging_store: object,
+    staging_prefix: str,
+    warehouse_store: object,
+    compact_rows: int = 100_000,
+) -> dict[str, Any]:
+    """Phase 3 worker (S3): stream NDJSON → write GeoParquet to S3."""
+    prefix = f"{staging_prefix}/{cell}/{year}/"
+    ndjson_keys = _scan_ndjson(staging_store, prefix)
+
+    if not ndjson_keys:
+        return _empty_compact_report(cell, year)
+
+    def _write_s3(batch: list[dict], out_path: str) -> int:
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            n = _write_geoparquet(batch, tmp_path)
+            if n > 0:
+                data = Path(tmp_path).read_bytes()
+                obstore.put(warehouse_store, out_path, data)
+            return n
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    def _out_key(idx: int) -> str:
+        return f"grid_partition={cell}/year={year}/part_{idx:06d}.parquet"
+
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key
+    )
+
+
+def _empty_compact_report(cell: str, year: str) -> dict[str, Any]:
+    return {
+        "cell": cell,
+        "year": year,
+        "input_files": 0,
+        "input_items": 0,
+        "unique_items": 0,
+        "output_files": [],
+        "output_rows": 0,
+    }
+
+
+def _next_part_index_local(warehouse_root: str, cell: str, year: str) -> int:
+    part_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
+    if not part_dir.exists():
+        return 0
+    import re
+
+    pattern = re.compile(r"part_(\d+)\.parquet$")
+    indices = []
+    for f in part_dir.iterdir():
+        m = pattern.match(f.name)
+        if m:
+            indices.append(int(m.group(1)))
+    return (max(indices) + 1) if indices else 0
+
+
+def _next_part_index_s3(warehouse_store: object, cell: str, year: str) -> int:
+    import re
+
+    prefix = f"grid_partition={cell}/year={year}/"
+    pattern = re.compile(r"part_(\d+)\.parquet$")
+    indices = []
+    for batch in obstore.list(warehouse_store, prefix=prefix):
+        for obj in batch:
+            fname = obj["path"].rsplit("/", 1)[-1]
+            m = pattern.match(fname)
+            if m:
+                indices.append(int(m.group(1)))
+    return (max(indices) + 1) if indices else 0
+
+
+def compact_cell_year_delta(
+    cell: str,
+    year: str,
+    staging_store: object,
+    staging_prefix: str,
+    warehouse_root: str,
+    compact_rows: int = 100_000,
+) -> dict[str, Any]:
+    """Phase 3 delta worker (local): compact NDJSON → new GeoParquet (no overwrite)."""
+    prefix = f"{staging_prefix}/{cell}/{year}/"
+    ndjson_keys = _scan_ndjson(staging_store, prefix)
+
+    if not ndjson_keys:
+        return _empty_compact_report(cell, year)
+
+    start_idx = _next_part_index_local(warehouse_root, cell, year)
+
+    def _write_local(batch: list[dict], rel_path: str) -> int:
+        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        full = str(out_dir / rel_path)
+        n = _write_geoparquet(batch, full)
+        return n if n <= 0 else n
+
+    def _out_key(idx: int) -> str:
+        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
+        return str(out_dir / f"part_{start_idx + idx:06d}.parquet")
+
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key
+    )
+
+
+def compact_cell_year_delta_s3(
+    cell: str,
+    year: str,
+    staging_store: object,
+    staging_prefix: str,
+    warehouse_store: object,
+    compact_rows: int = 100_000,
+) -> dict[str, Any]:
+    """Phase 3 delta worker (S3): compact NDJSON → new GeoParquet (no overwrite)."""
+    prefix = f"{staging_prefix}/{cell}/{year}/"
+    ndjson_keys = _scan_ndjson(staging_store, prefix)
+
+    if not ndjson_keys:
+        return _empty_compact_report(cell, year)
+
+    start_idx = _next_part_index_s3(warehouse_store, cell, year)
+
+    def _write_s3(batch: list[dict], out_path: str) -> int:
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            n = _write_geoparquet(batch, tmp_path)
+            if n > 0:
+                data = Path(tmp_path).read_bytes()
+                obstore.put(warehouse_store, out_path, data)
+            return n
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    def _out_key(idx: int) -> str:
+        return f"grid_partition={cell}/year={year}/part_{start_idx + idx:06d}.parquet"
+
+    return _stream_compact(
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Register: rebuild Iceberg catalog + cleanup
+# ---------------------------------------------------------------------------
+
+
+def register_and_cleanup(
+    catalog_path: str,
+    warehouse_root: str,
+    staging_store: object,
+    staging_prefix: str,
+    upload: bool = True,
+    h3_resolution: int | None = None,
+    hash_index_path: str | None = None,
+) -> None:
+    """
+    Phase 4: rebuild Iceberg catalog from warehouse files, upload, cleanup staging.
+
+    1. Drop and recreate the Iceberg table.
+    2. Scan warehouse for all Parquet files.
+    3. Register via table.add_files().
+    4. Upload catalog.
+    5. Delete all staging files.
+
+    ``hash_index_path`` defaults to ``{warehouse_root}_id_hashes.parquet``.
+    """
+    import re
+
+    from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+
+    from earthcatalog.core.catalog import FULL_NAME, ICEBERG_SCHEMA, NAMESPACE, PARTITION_SPEC
+
+    if hash_index_path is None:
+        hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
+
+    catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+
+    try:
+        catalog.create_namespace(NAMESPACE)
+    except NamespaceAlreadyExistsError:
+        pass
+
+    try:
+        catalog.drop_table(FULL_NAME)
+        print("Dropped stale Iceberg table.")
+    except NoSuchTableError:
+        pass
+
+    props: dict[str, str] = {PROP_GRID_TYPE: "h3", PROP_HASH_INDEX_PATH: hash_index_path}
+    if h3_resolution is not None:
+        props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+
+    table = catalog.create_table(
+        identifier=FULL_NAME,
+        schema=ICEBERG_SCHEMA,
+        partition_spec=PARTITION_SPEC,
+        properties=props,
+    )
+
+    hive_re = re.compile(
+        r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+    )
+
+    all_paths: list[str] = []
+    if warehouse_root.startswith("s3://"):
+        no_scheme = warehouse_root.removeprefix("s3://")
+        _bucket, prefix = no_scheme.split("/", 1)
+        for batch in obstore.list(staging_store, prefix=prefix):
+            for obj in batch:
+                k: str = obj["path"]
+                if k.endswith(".parquet") and hive_re.search(k):
+                    all_paths.append(f"s3://{_bucket}/{k}")
     else:
-        print(f"Ingest stats: {local_stats_path}")
+        for f in Path(warehouse_root).glob("**/*.parquet"):
+            rel = f.relative_to(warehouse_root)
+            if hive_re.search(str(rel)):
+                all_paths.append(str(f))
+
+    if all_paths:
+        batch_size = 2000
+        for i in range(0, len(all_paths), batch_size):
+            table.add_files(all_paths[i : i + batch_size])
+        print(f"Registered {len(all_paths):,} files in Iceberg catalog.")
+
+    if upload:
+        upload_catalog(catalog_path)
+
+    cleanup_staging(staging_store, staging_prefix)
+
+
+def _update_hash_index_from_parquets(
+    new_parquet_paths: list[str],
+    hash_index_path: str,
+    warehouse_root: str,
+) -> None:
+    """
+    Read ``id`` column from newly registered parquet files, hash each ID,
+    merge into the existing hash index, and write back.
+
+    For S3 warehouse paths a bucket-level store is opened from the
+    warehouse_root URI.  For local paths no store is needed.
+    """
+    from earthcatalog.core.hash_index import merge_hashes_from_parquets, read_hashes, write_hashes
+
+    is_s3 = hash_index_path.startswith("s3://")
+
+    if is_s3:
+        no_scheme = hash_index_path.removeprefix("s3://")
+        hash_bucket, hash_key = no_scheme.split("/", 1)
+        from earthcatalog.core import store_config
+
+        hash_store = store_config.get_store()
+        print(f"Reading existing hash index: {hash_index_path}")
+        existing = read_hashes(hash_store, hash_key)
+    else:
+        from pathlib import Path
+
+        import pyarrow.parquet as pq
+
+        from earthcatalog.core.hash_index import _BATCH_SIZE
+
+        existing: set[bytes] = set()
+        if Path(hash_index_path).exists():
+            pf = pq.ParquetFile(hash_index_path)
+            for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash"]):
+                for h in batch.column("id_hash").to_pylist():
+                    existing.add(bytes(h))
+
+    print(f"  Existing hashes: {len(existing):,}")
+
+    # For S3 warehouse paths, we need a store that can read the new parquets.
+    # They live in the same bucket as the warehouse.
+    warehouse_store: object | None = None
+    if warehouse_root.startswith("s3://"):
+        from earthcatalog.core import store_config
+
+        warehouse_store = store_config.get_store()
+
+    updated, n_new = merge_hashes_from_parquets(new_parquet_paths, existing, store=warehouse_store)
+    print(f"  New hashes from {len(new_parquet_paths):,} parquet files: {n_new:,}")
+
+    if is_s3:
+        total = write_hashes(updated, hash_store, hash_key)
+        print(f"  Written: {hash_index_path} ({total:,} total hashes)")
+    else:
+        import io as _io
+
+        import pyarrow as pa
+        import pyarrow.parquet as _pq
+
+        sorted_hashes = sorted(updated)
+        arr = pa.array(sorted_hashes, type=pa.binary(16))
+        tbl = pa.table({"id_hash": arr})
+        buf = _io.BytesIO()
+        _pq.write_table(tbl, buf, compression="zstd")
+        Path(hash_index_path).write_bytes(buf.getvalue())
+        print(f"  Written: {hash_index_path} ({len(sorted_hashes):,} total hashes)")
+
+
+def register_delta(
+    catalog_path: str,
+    warehouse_root: str,
+    new_parquet_paths: list[str],
+    staging_store: object,
+    staging_prefix: str,
+    upload: bool = True,
+    h3_resolution: int | None = None,
+    hash_index_path: str | None = None,
+    update_hash_index: bool = False,
+) -> None:
+    """
+    Phase 4 delta: add new parquet files to existing Iceberg table (no drop).
+
+    Opens (or creates) the Iceberg table, calls ``table.add_files()``
+    with only the newly written parquets, then uploads the catalog.
+    Existing warehouse files are never touched.
+
+    When *update_hash_index* is True, the warehouse hash index is updated
+    by reading the ``id`` column from each newly written parquet file,
+    hashing each ID, and merging into the existing index.  This is Plan B:
+    read from the actual warehouse files that were just registered, so the
+    index exactly reflects what is in the catalog.
+
+    ``hash_index_path`` defaults to ``{warehouse_root}_id_hashes.parquet``.
+    """
+    from pyiceberg.exceptions import (
+        NamespaceAlreadyExistsError,
+        NoSuchNamespaceError,
+        NoSuchTableError,
+    )
+
+    from earthcatalog.core.catalog import FULL_NAME, ICEBERG_SCHEMA, NAMESPACE, PARTITION_SPEC
+
+    if hash_index_path is None:
+        hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
+
+    catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+
+    try:
+        catalog.create_namespace(NAMESPACE)
+    except (NamespaceAlreadyExistsError, NoSuchNamespaceError):
+        pass
+
+    props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+    if h3_resolution is not None:
+        props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+    props[PROP_HASH_INDEX_PATH] = hash_index_path
+
+    try:
+        table = catalog.load_table(FULL_NAME)
+        print(f"Opened existing Iceberg table {FULL_NAME}")
+        missing = {k: v for k, v in props.items() if k not in table.properties}
+        if missing:
+            with table.transaction() as tx:
+                tx.set_properties(**missing)
+    except NoSuchTableError:
+        table = catalog.create_table(
+            identifier=FULL_NAME,
+            schema=ICEBERG_SCHEMA,
+            partition_spec=PARTITION_SPEC,
+            properties=props,
+        )
+        print(f"Created new Iceberg table {FULL_NAME}")
+
+    if new_parquet_paths:
+        # Convert relative paths to full s3:// URIs for PyIceberg table.add_files().
+        # Phase 3 compact returns relative keys like "grid_partition=.../part_N.parquet".
+        # Local paths (absolute or in test scenarios) are left as-is.
+        full_paths = []
+        for p in new_parquet_paths:
+            if p.startswith("s3://"):
+                full_paths.append(p)  # already full S3 URI
+            elif p.startswith("/") or (len(p) > 1 and p[1] == ":"):
+                full_paths.append(p)  # local absolute path (Windows or Unix)
+            else:
+                # relative path — convert to full S3 URI
+                full_paths.append(f"{warehouse_root.rstrip('/')}/{p}")
+        new_parquet_paths = full_paths
+
+        batch_size = 2000
+        for i in range(0, len(new_parquet_paths), batch_size):
+            table.add_files(new_parquet_paths[i : i + batch_size])
+        print(f"Added {len(new_parquet_paths):,} new files to Iceberg catalog.")
+    else:
+        print("No new parquet files to register.")
+
+    if update_hash_index and new_parquet_paths:
+        _update_hash_index_from_parquets(
+            new_parquet_paths=new_parquet_paths,
+            hash_index_path=hash_index_path,
+            warehouse_root=warehouse_root,
+        )
+
+    if upload:
+        upload_catalog(catalog_path)
+
+    cleanup_staging(staging_store, staging_prefix)
+
+
+def cleanup_staging(staging_store: object, staging_prefix: str) -> int:
+    """Delete completion markers and pending files. Keeps chunks and NDJSON."""
+    deleted = 0
+    for batch in obstore.list(staging_store, prefix=f"{staging_prefix}/_completed/"):
+        for obj in batch:
+            k: str = obj["path"]
+            try:
+                obstore.delete(staging_store, k)
+                deleted += 1
+            except Exception:
+                pass
+    for batch in obstore.list(staging_store, prefix=f"{staging_prefix}/pending_chunks/"):
+        for obj in batch:
+            k: str = obj["path"]
+            try:
+                obstore.delete(staging_store, k)
+                deleted += 1
+            except Exception:
+                pass
+    print(f"Cleanup: deleted {deleted:,} staging files")
+    return deleted
+
+
+def _get_client(
+    create_client: Callable[[], object] | None = None,
+) -> object | None:
+    """Return a Dask client: use *create_client* if provided, else try get_client()."""
+    if create_client is not None:
+        return create_client()
+    try:
+        from dask.distributed import get_client
+
+        return get_client()
+    except (ImportError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -580,820 +1090,342 @@ def _write_ingest_stats(
 def run_backfill(
     inventory_path: str,
     catalog_path: str,
+    staging_store: object,
+    staging_prefix: str,
     warehouse_store: object,
     warehouse_root: str,
-    item_fetcher: object = None,
-    partitioner: object = None,
-    h3_resolution: int = 1,
-    chunk_size: int = 20_000,
-    max_workers_per_task: int = 16,
-    compact: bool = True,
-    compact_threshold: int = 2,
+    partitioner: object | None = None,
+    h3_resolution: int | None = None,
+    chunk_size: int = 100_000,
+    compact_rows: int = 100_000,
+    fetch_concurrency: int = 256,
     limit: int | None = None,
-    use_lock: bool = True,
     since: datetime | None = None,
-    report_location: str | None = None,
-    per_file_mini_runs: bool = True,
-    grid_config=None,
+    use_lock: bool = True,
+    upload: bool = True,
+    skip_inventory: bool = False,
+    skip_ingest: bool = False,
+    retry_pending: bool = False,
+    delta: bool = False,
+    create_client: Callable[[], object] | None = None,
+    hash_index_path: str | None = None,
+    update_hash_index: bool = False,
 ) -> None:
     """
-    Three-level Dask distributed backfill pipeline.
-
-    Level 0 — ``ingest_chunk`` tasks (one per *chunk_size* items):
-        Each Dask worker fetches STAC items, fans them out, and writes
-        GeoParquet files to *warehouse_store*.  Returns ``FileMetadata`` only.
-
-    Level 1 — ``compact_group`` tasks (one per ``(cell, year)`` bucket):
-        Only dispatched when *compact* is ``True`` and a bucket has ≥
-        *compact_threshold* part files.  Merges part files into one
-        consolidated file.
-
-    Level 2 — catalog registration (head node):
-        ``table.add_files()`` is called once with all final file paths →
-        exactly one Iceberg snapshot regardless of chunk count.
-
-    Spot resilience (per_file_mini_runs)
-    -------------------------------------
-    When *per_file_mini_runs* is ``True`` (default) **and** *inventory_path*
-    is an S3 Inventory ``manifest.json``, the pipeline processes each manifest
-    data file as an independent mini-run:
-
-    1. Read ``ingest_stats.json`` (at *report_location*) to find already-
-       processed data files → skip them.
-    2. For each remaining data file:
-
-       a. Acquire the S3 lock.
-       b. Download the catalog → open the Iceberg table.
-       c. Level 0: ingest the file's items.
-       d. Level 1: compact the file's buckets.
-       e. Level 2: ``table.add_files()`` + ``upload_catalog()``.
-       f. Append one record to ``ingest_stats.json`` (with
-          ``inventory_file`` set to the data-file key).
-       g. Release the lock.
-
-    If the spot instance is interrupted between step (e) and (g) the
-    catalog is already updated; on restart, step 1 detects the committed
-    record and skips the file.  At worst one data file is re-processed
-    (idempotent: dedup by ``id`` during compaction handles duplicate rows).
-
-    When *inventory_path* is not a manifest (CSV, CSV.gz, single Parquet),
-    *per_file_mini_runs* is ignored and the original monolithic behaviour
-    applies (one lock acquisition, one ``add_files`` call at the end).
+    Four-phase staging-based backfill pipeline.
 
     Parameters
     ----------
     inventory_path:
-        Local path or ``s3://`` URI to an S3 Inventory file
-        (CSV, CSV.gz, or Parquet) **or** an S3 Inventory ``manifest.json``.
+        Local path or s3:// URI to inventory (CSV, Parquet, or manifest.json).
     catalog_path:
-        Local path where the SQLite catalog is written.
+        Local path for SQLite catalog.
+    staging_store:
+        obstore-compatible store for staging (chunks + NDJSON).
+    staging_prefix:
+        Key prefix within staging_store (e.g. "ingest").
     warehouse_store:
-        ``obstore``-compatible store used by all workers for GeoParquet I/O.
+        obstore-compatible store for warehouse GeoParquet output.
+        Unused for local filesystem (warehouse_root is used directly).
     warehouse_root:
-        Filesystem root (local path) or S3 prefix (``s3://bucket/prefix``)
-        prepended to each ``FileMetadata.s3_key`` to form the absolute path
-        registered with ``table.add_files()``.
-    item_fetcher:
-        Callable ``(bucket, key) -> dict | None`` for fetching STAC JSON.
-        When ``None``, the default public-S3 fetcher is used.  Pass a custom
-        callable for unit tests.
+        Path or s3:// URI for the warehouse root (used by add_files).
     partitioner:
-        An :class:`~earthcatalog.core.partitioner.AbstractPartitioner`.
-        Defaults to ``H3Partitioner(resolution=h3_resolution)``.
+        H3Partitioner or similar.  When *None*, the partitioner is built from
+        *h3_resolution* (see below).
     h3_resolution:
-        H3 grid resolution used when *partitioner* is ``None``.
+        H3 resolution for the default partitioner.  When *None* the resolution
+        is read from the existing Iceberg table's properties.  If the table
+        does not exist yet and no resolution is given, a ``ValueError`` is
+        raised.
     chunk_size:
-        Number of inventory items per Level 0 task.
-    max_workers_per_task:
-        Thread-pool size used inside each ``ingest_chunk`` worker for
-        parallel item fetching.
-    compact:
-        When ``True`` (default), dispatch Level 1 compact tasks for any
-        bucket with ≥ *compact_threshold* part files.
-    compact_threshold:
-        Minimum part-file count for a bucket to be compacted.
-    limit:
-        Stop after ingesting this many ``.stac.json`` items.  ``None``
-        means process the entire inventory.
-    use_lock:
-        Wrap each mini-run (or the full run) in an ``S3Lock``.  Set to
-        ``False`` for tests.
-    since:
-        When set (timezone-aware UTC), only inventory rows with
-        ``last_modified_date >= since`` are ingested.
-    report_location:
-        Local path or ``s3://`` URI where ``ingest_stats.json`` is written.
-        When ``None``, co-located with the catalog.
-    per_file_mini_runs:
-        When ``True`` (default) and *inventory_path* is a manifest, process
-        each manifest data file as a separate mini-run with its own lock
-        cycle and catalog upload.  Set to ``False`` to use the original
-        monolithic behaviour regardless of inventory type.
+        Items per chunk Parquet in Phase 1.
+    compact_rows:
+        Max rows per output GeoParquet file in Phase 3.
+    skip_ingest:
+        If True, skip Phase 2 entirely and go straight to Phase 3 (Compact).
+        Phase 3 scans S3 for existing NDJSON files. Useful when Phase 2 already
+        completed but Phase 3 needs to be re-run (e.g. with bigger instances).
+    retry_pending:
+        If True, Phase 2 retries chunks that had fetch failures (stored in
+        pending_chunks/). If False (default), pending chunks are logged but
+        skipped — Phase 3 proceeds with whatever succeeded.
+    delta:
+        If True, run in delta mode: Phase 3 writes new parquets without
+        overwriting existing ones, and Phase 4 adds files to the existing
+        Iceberg table instead of dropping and recreating it.
+    create_client:
+        Optional callable that returns a Dask Client. Called lazily
+        right before Phase 2 (after Phase 1 completes). Used for
+        Coiled to avoid idle cluster timeout during long Phase 1 runs.
     """
     if partitioner is None:
-        partitioner = H3Partitioner(resolution=h3_resolution)
-
-    def _join_path(root: str, key: str) -> str:
-        if root.startswith("s3://"):
-            return root.rstrip("/") + "/" + key
-        return str(Path(root) / key)
-
-    def _run_one(
-        item_pairs: list[tuple[str, str]],
-        inv_file_key: str | None,
-        total_items_hint: int,
-    ) -> None:
-        """
-        Run the full three-level pipeline for *item_pairs* and register the
-        results into the Iceberg catalog.
-
-        Parameters
-        ----------
-        item_pairs:
-            List of ``(bucket, key)`` pairs to process.
-        inv_file_key:
-            The data-file key within the manifest (used in stats).  ``None``
-            for monolithic (non-manifest) runs.
-        total_items_hint:
-            Pre-counted number of items (used only for logging).
-        """
-        download_catalog(catalog_path)
-        catalog = open_catalog(
-            db_path=catalog_path,
-            warehouse_path=warehouse_root,
-        )
-        table = get_or_create_table(catalog, grid_config=grid_config)
-
-        # Level 0 ─ dispatch ingest_chunk tasks
-        level0_tasks = []
-        chunk: list[tuple[str, str]] = []
-        chunk_id = 0
-        total_items = 0
-
-        for bucket, key in item_pairs:
-            if not key.endswith(".stac.json"):
-                continue
-            chunk.append((bucket, key))
-            total_items += 1
-            if len(chunk) >= chunk_size:
-                level0_tasks.append(
-                    ingest_chunk(
-                        list(chunk),
-                        partitioner,
-                        warehouse_store,
-                        chunk_id,
-                        item_fetcher,
-                        max_workers_per_task,
-                    )
-                )
-                chunk.clear()
-                chunk_id += 1
-            if limit and total_items >= limit:
-                break
-
-        if chunk:
-            level0_tasks.append(
-                ingest_chunk(
-                    list(chunk),
-                    partitioner,
-                    warehouse_store,
-                    chunk_id,
-                    item_fetcher,
-                    max_workers_per_task,
-                )
-            )
-
-        if not level0_tasks:
-            print(f"  no .stac.json items found in {inv_file_key or 'chunk'}")
-            # Still write stats so the caller knows this file was processed.
-            _write_ingest_stats(
-                catalog_path=catalog_path,
-                inventory_path=inventory_path,
-                since=since,
-                source_items=0,
-                total_rows=0,
-                final_metas=[],
-                fan_out_counter=Counter(),
-                h3_resolution=h3_resolution,
-                report_location=report_location,
-                inventory_file=inv_file_key,
-            )
-            return
-
-        print(f"Level 0: {len(level0_tasks)} ingest_chunk tasks ({total_items} items)")
-        all_nested: tuple[tuple[list[FileMetadata], Counter], ...] = dask.compute(*level0_tasks)
-        all_metas: list[FileMetadata] = [fm for file_metas, _ in all_nested for fm in file_metas]
-        fan_out_counter: Counter[int] = sum((counter for _, counter in all_nested), Counter())
-        total_rows = sum(fm.row_count for fm in all_metas)
-        print(f"Level 0 done: {len(all_metas)} files, {total_rows} rows")
-
-        # Level 1 ─ compact_group tasks
-        final_metas: list[FileMetadata] = []
-
-        if compact:
-            buckets: dict[tuple[str, int | None], list[FileMetadata]] = defaultdict(list)
-            for fm in all_metas:
-                buckets[(fm.grid_partition, fm.year)].append(fm)
-
-            level1_tasks = []
-            level1_pass_through: list[FileMetadata] = []
-
-            for (cell, year), fms in buckets.items():
-                if len(fms) >= compact_threshold:
-                    year_str = str(year) if year is not None else "unknown"
-                    out_key = (
-                        f"grid_partition={cell}/year={year_str}/"
-                        f"compacted_{uuid.uuid4().hex[:8]}.parquet"
-                    )
-                    level1_tasks.append(compact_group(fms, out_key, warehouse_store))
-                else:
-                    level1_pass_through.extend(fms)
-
-            print(
-                f"Level 1: {len(level1_tasks)} compact tasks, "
-                f"{len(level1_pass_through)} files passed through"
-            )
-
-            if level1_tasks:
-                compacted: tuple[FileMetadata, ...] = dask.compute(*level1_tasks)
-                final_metas.extend(compacted)
-
-            final_metas.extend(level1_pass_through)
+        if h3_resolution is not None:
+            partitioner = H3Partitioner(resolution=h3_resolution)
         else:
-            final_metas = all_metas
+            from pyiceberg.exceptions import NoSuchTableError
 
-        # Level 2 ─ register all files in one Iceberg snapshot
-        final_paths = [_join_path(warehouse_root, fm.s3_key) for fm in final_metas]
+            from earthcatalog.core.catalog import FULL_NAME
 
-        if final_paths:
-            print(f"Level 2: registering {len(final_paths)} files in one snapshot")
-            table.add_files(final_paths)
+            catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+            try:
+                table = catalog.load_table(FULL_NAME)
+            except NoSuchTableError:
+                raise ValueError(
+                    "No existing table and no --h3-resolution given. "
+                    "Specify --h3-resolution for the initial backfill."
+                )
 
-        upload_catalog(catalog_path)
-
-        _write_ingest_stats(
-            catalog_path=catalog_path,
-            inventory_path=inventory_path,
-            since=since,
-            source_items=total_items,
-            total_rows=total_rows,
-            final_metas=final_metas,
-            fan_out_counter=fan_out_counter,
-            h3_resolution=h3_resolution,
-            report_location=report_location,
-            inventory_file=inv_file_key,
-        )
-
-        print(
-            f"\nMini-run done. {total_items} items → {total_rows} rows "
-            f"across {len(final_paths)} files"
-        )
-        print(f"Snapshots in catalog: {len(table.history())}")
-
-    # ------------------------------------------------------------------
-    # Decide: per-file mini-runs (manifest) vs monolithic
-    # ------------------------------------------------------------------
-    is_manifest = inventory_path.endswith("manifest.json")
-
-    if per_file_mini_runs and is_manifest:
-        # ── Spot-resilient path: one mini-run per manifest data file ──────
-        effective_report = report_location
-        if effective_report is None:
-            # Auto-derive sibling of catalog (same logic as _write_ingest_stats)
-            if catalog_path.startswith("s3://"):
-                cat_dir = catalog_path.rsplit("/", 1)[0]
-                effective_report = f"{cat_dir}/ingest_stats.json"
+            raw = table.properties.get(PROP_GRID_RESOLUTION)
+            if raw is not None:
+                partitioner = H3Partitioner(resolution=int(raw))
+                print(f"Auto-detected H3 resolution {int(raw)} from catalog")
             else:
-                effective_report = str(Path(catalog_path).parent / "ingest_stats.json")
+                partitioner = H3Partitioner(resolution=1)
+                print("No resolution property on table, defaulting to H3 resolution 1")
 
-        already_done = _load_processed_files(effective_report)
-        if already_done:
-            print(f"Checkpoint: {len(already_done)} data file(s) already processed — will skip")
+    resolved_resolution = (
+        partitioner.resolution if hasattr(partitioner, "resolution") else h3_resolution
+    )
 
-        _source_bucket, dest_store, data_keys = _list_manifest_files(inventory_path)
-        pending = [k for k in data_keys if k not in already_done]
-        skipped = len(data_keys) - len(pending)
-        print(
-            f"Manifest: {len(data_keys)} data files total, "
-            f"{skipped} already processed, {len(pending)} to go"
-        )
+    def _run() -> None:
+        # Phase 1 — Scheduler
+        print("\n" + "=" * 64)
+        print("Phase 1 — Scheduler: writing chunk files")
+        print("=" * 64)
 
-        for file_idx, data_key in enumerate(pending):
-            print(f"\n── File {file_idx + 1}/{len(pending)}: {data_key}")
-            # Collect (bucket, key) pairs from this one inventory file
-            item_pairs = [
-                (bkt, k)
-                for bkt, k in _iter_inventory_file_from_store(dest_store, data_key, since=since)
+        if skip_inventory:
+            existing_ids = _list_existing_chunks(staging_store, f"{staging_prefix}/chunks")
+            chunk_keys = [
+                f"{staging_prefix}/chunks/chunk_{cid:06d}.parquet" for cid in sorted(existing_ids)
             ]
-
-            def _mini_run(
-                pairs: list[tuple[str, str]] = item_pairs, key: str | None = data_key
-            ) -> None:
-                _run_one(pairs, inv_file_key=key, total_items_hint=len(pairs))
-
-            if use_lock:
-                with S3Lock(owner="backfill"):
-                    _mini_run()
-            else:
-                _mini_run()
-
-    else:
-        # ── Monolithic path: original behaviour ───────────────────────────
-        def _monolithic_run() -> None:
-            all_pairs: list[tuple[str, str]] = list(_iter_inventory(inventory_path, since=since))
-            _run_one(all_pairs, inv_file_key=None, total_items_hint=len(all_pairs))
-
-        if use_lock:
-            with S3Lock(owner="backfill"):
-                _monolithic_run()
+            print(f"Phase 1: --skip-inventory, using {len(chunk_keys)} existing chunks")
         else:
-            _monolithic_run()
-
-
-# ---------------------------------------------------------------------------
-# Scheduler context helpers
-# ---------------------------------------------------------------------------
-
-
-def _synchronous_context() -> object:
-    """Return a context manager that activates the Dask synchronous scheduler."""
-    return dask.config.set(scheduler="synchronous")
-
-
-def _local_cluster_context(n_workers: int, threads_per_worker: int = 1) -> object:
-    """
-    Return a context manager that starts a ``LocalCluster`` and connects a
-    ``Client`` to it.
-
-    The cluster and client are shut down when the context exits.
-    """
-    import contextlib
-
-    @contextlib.contextmanager
-    def _ctx() -> Generator[object, None, None]:
-        from dask.distributed import Client, LocalCluster
-
-        cluster = LocalCluster(
-            n_workers=n_workers,
-            threads_per_worker=threads_per_worker,
-        )
-        client = Client(cluster)
-        try:
-            print(
-                f"Dask dashboard: {client.dashboard_link}\n"
-                f"Workers: {n_workers}  threads/worker: {threads_per_worker}"
+            chunk_keys = write_chunks(
+                inventory_path=inventory_path,
+                staging_store=staging_store,
+                staging_prefix=f"{staging_prefix}/chunks",
+                chunk_size=chunk_size,
+                limit=limit,
+                since=since,
             )
-            yield client
-        finally:
-            client.close()
-            cluster.close()
 
-    return _ctx()
+        # Create Dask client once — shared by Phase 2 and Phase 3
+        client = _get_client(create_client)
 
+        # Phase 2 — Ingest
+        all_ndjson_keys: list[str] = []
 
-def _coiled_context(n_workers: int, vm_type: str | None = None, **extra_kwargs: object) -> object:
-    """
-    Return a context manager that starts a Coiled cloud cluster.
-
-    Requires ``coiled`` to be installed (``pip install coiled``).
-    Coiled credentials must be configured (``coiled login`` or
-    ``COILED_API_TOKEN`` environment variable).
-
-    Parameters
-    ----------
-    n_workers:
-        Number of Coiled cloud workers.
-    vm_type:
-        Cloud VM instance type (e.g. ``m6i.xlarge``).  Passed to
-        ``coiled.Cluster(vm_type=...)``.
-    **extra_kwargs:
-        Any additional keyword arguments forwarded verbatim to
-        ``coiled.Cluster()``.  For example ``software="my-env"``,
-        ``region="us-west-2"``, ``secret_env=["MY_SECRET"]``.
-    """
-    import contextlib
-
-    @contextlib.contextmanager
-    def _ctx() -> Generator[object, None, None]:
-        try:
-            import coiled
-        except ImportError:
-            raise ImportError("coiled is not installed.  Run: pip install coiled") from None
-
-        kwargs: dict = {"n_workers": n_workers, **extra_kwargs}
-        if vm_type is not None:
-            kwargs["vm_type"] = vm_type
-
-        from dask.distributed import Client
-
-        cluster = coiled.Cluster(**kwargs)
-        client = Client(cluster)
-        try:
-            print(f"Coiled dashboard: {client.dashboard_link}\nWorkers requested: {n_workers}")
-            yield client
-        finally:
-            client.close()
-            cluster.close()
-
-    return _ctx()
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-
-def _parse_coiled_extra(unknown_args: list[str]) -> dict:
-    """
-    Parse leftover ``--coiled-<name> <value>`` arguments into a kwargs dict.
-
-    Rules
-    -----
-    * Only args that start with ``--coiled-`` are accepted; others are ignored.
-    * The ``--coiled-`` prefix is stripped and hyphens are converted to
-      underscores to form the kwarg name.
-    * If the same key appears more than once the values are collected into a
-      list (e.g. ``--coiled-secret-env VAR1 --coiled-secret-env VAR2``
-      → ``{"secret_env": ["VAR1", "VAR2"]}``).
-
-    Parameters
-    ----------
-    unknown_args:
-        The leftover args list returned by ``parser.parse_known_args()``.
-
-    Returns
-    -------
-    dict
-        Kwargs to be forwarded to ``coiled.Cluster(**kwargs)``.
-    """
-    result: dict = {}
-    i = 0
-    while i < len(unknown_args):
-        token = unknown_args[i]
-        if token.startswith("--coiled-"):
-            key = token[len("--coiled-") :].replace("-", "_")
-            value = unknown_args[i + 1] if i + 1 < len(unknown_args) else None
-            if value is not None and not value.startswith("--"):
-                if key in result:
-                    existing = result[key]
-                    if isinstance(existing, list):
-                        existing.append(value)
-                    else:
-                        result[key] = [existing, value]
-                else:
-                    result[key] = value
-                i += 2
-            else:
-                # Boolean flag (no value)
-                result[key] = True
-                i += 1
+        if skip_ingest:
+            print("\n" + "=" * 64)
+            print("Phase 2 — Ingest: SKIPPED (--skip-ingest)")
+            print("=" * 64)
         else:
-            i += 1
-    return result
+            print("\n" + "=" * 64)
+            print("Phase 2 — Ingest: fetching items + writing NDJSON")
+            print("=" * 64)
 
+            pending_prefix = f"{staging_prefix}/pending_chunks"
+            ndjson_prefix = f"{staging_prefix}/staging"
 
-def main() -> None:
-    import argparse
+            completed_ids = _list_completed_chunk_ids(staging_store, ndjson_prefix, pending_prefix)
+            if completed_ids:
+                print(f"Phase 2: {len(completed_ids)} chunks already completed, skipping")
 
-    parser = argparse.ArgumentParser(
-        prog="python -m earthcatalog.pipelines.backfill",
-        description=(
-            "EarthCatalog Dask distributed backfill pipeline.\n\n"
-            "Ingests STAC items from an S3 Inventory file into a spatially-\n"
-            "partitioned Apache Iceberg table using a three-level Dask pipeline."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-scheduler choices
------------------
-  synchronous   Single-process, sequential.  Readable tracebacks.
-                Best for debugging with a small --limit.
+            pending_ids = _list_existing_chunks(staging_store, pending_prefix)
+            if pending_ids and not retry_pending:
+                print(
+                    f"Phase 2: {len(pending_ids)} pending chunks recorded (use --retry-pending to retry)"
+                )
 
-  local         dask.distributed.LocalCluster on this machine.
-                Use --workers to set the worker count (default: 4).
+            if retry_pending and pending_ids:
+                pending_keys = [
+                    f"{pending_prefix}/chunk_{cid:06d}.parquet" for cid in sorted(pending_ids)
+                ]
+                print(f"Phase 2: retrying {len(pending_ids)} pending chunks")
+                chunk_keys = pending_keys
 
-  coiled        Coiled cloud cluster.  Requires 'pip install coiled'
-                and a configured API token (coiled login).
-                Use --coiled-n-workers, --coiled-vm-type, and any
-                additional --coiled-<kwarg> flags to configure the cluster.
+            if completed_ids:
 
-examples
---------
-  # Debug 50 items in a single process
-  python -m earthcatalog.pipelines.backfill \\
-      --inventory /tmp/inventory.csv \\
-      --catalog   /tmp/catalog.db \\
-      --warehouse /tmp/warehouse \\
-      --scheduler synchronous --limit 50
+                def _chunk_id_from_key(key: str) -> int:
+                    fname = key.rsplit("/", 1)[-1]
+                    return int(fname.removeprefix("chunk_").removesuffix(".parquet"))
 
-  # Full local run with 4 workers
-  python -m earthcatalog.pipelines.backfill \\
-      --inventory /tmp/inventory.csv \\
-      --catalog   /tmp/catalog.db \\
-      --warehouse /tmp/warehouse \\
-      --scheduler local --workers 4 --chunk-size 500
+                chunk_keys = [
+                    ck for ck in chunk_keys if _chunk_id_from_key(ck) not in completed_ids
+                ]
+                print(f"Phase 2: {len(chunk_keys)} chunks remaining after skip")
 
-  # Coiled cloud run — explicit flags + pass-through kwargs
-  python -m earthcatalog.pipelines.backfill \\
-      --inventory  s3://my-bucket/inventory.parquet \\
-      --catalog    /tmp/catalog.db \\
-      --warehouse  /tmp/warehouse \\
-      --scheduler  coiled \\
-      --coiled-n-workers   20 \\
-      --coiled-vm-type     m6i.xlarge \\
-      --coiled-software    my-software-env \\
-      --coiled-region      us-west-2 \\
-      --coiled-secret-env  MY_SECRET_1 \\
-      --coiled-secret-env  MY_SECRET_2
-""",
-    )
+            n_tasks = len(chunk_keys)
 
-    # Required
-    parser.add_argument(
-        "--inventory",
-        required=True,
-        metavar="PATH",
-        help="Local path or s3:// URI to S3 Inventory file (CSV, CSV.gz, or Parquet).",
-    )
+            if n_tasks > 0:
+                if client is not None:
+                    from dask.distributed import as_completed as distributed_ac
 
-    # Catalog / warehouse
-    parser.add_argument(
-        "--catalog",
-        default="/tmp/earthcatalog.db",
-        metavar="PATH",
-        help="Local path for the SQLite Iceberg catalog (default: /tmp/earthcatalog.db).",
-    )
-    parser.add_argument(
-        "--warehouse",
-        default="/tmp/earthcatalog_warehouse",
-        metavar="PATH",
-        help="Local directory for GeoParquet warehouse files (default: /tmp/earthcatalog_warehouse).",
-    )
+                    print(f"Submitting {n_tasks} ingest tasks via client.map …")
+                    futures = client.map(
+                        ingest_chunk,
+                        chunk_keys,
+                        staging_store=staging_store,
+                        staging_prefix=f"{staging_prefix}/staging",
+                        pending_prefix=pending_prefix,
+                        partitioner=partitioner,
+                        fetch_concurrency=fetch_concurrency,
+                    )
+                    with tqdm.tqdm(total=n_tasks, desc="Phase 2", unit="chunk") as pbar:
+                        total_items = total_fetched = total_failures = total_groups = 0
+                        for future in distributed_ac(futures):
+                            r = future.result()
+                            total_items += r["source_items"]
+                            total_fetched += r["fetched_items"]
+                            total_failures += r["fetch_failures"]
+                            total_groups += r["groups_written"]
+                            all_ndjson_keys.extend(r.get("ndjson_keys", []))
+                            pbar.set_postfix(
+                                fetched=f"{total_fetched:,}",
+                                failed=total_failures,
+                                groups=total_groups,
+                                refresh=False,
+                            )
+                            pbar.update(1)
+                else:
+                    print(f"Processing {n_tasks} ingest tasks sequentially …")
+                    with tqdm.tqdm(total=n_tasks, desc="Phase 2", unit="chunk") as pbar:
+                        for ck in chunk_keys:
+                            r = ingest_chunk(
+                                chunk_key=ck,
+                                staging_store=staging_store,
+                                staging_prefix=f"{staging_prefix}/staging",
+                                pending_prefix=pending_prefix,
+                                partitioner=partitioner,
+                                fetch_concurrency=fetch_concurrency,
+                            )
+                            all_ndjson_keys.extend(r.get("ndjson_keys", []))
+                            pbar.update(1)
 
-    # Ingest parameters
-    parser.add_argument(
-        "--h3-resolution",
-        type=int,
-        default=1,
-        metavar="N",
-        help="H3 grid resolution for spatial partitioning (default: 1 = 842 global cells).",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=500,
-        metavar="N",
-        help="Number of STAC items per Level-0 Dask task (default: 500).",
-    )
-    parser.add_argument(
-        "--fetch-workers",
-        type=int,
-        default=16,
-        metavar="N",
-        help="Thread-pool size inside each ingest_chunk worker (default: 16).",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Stop after N items (useful for smoke-tests).",
-    )
-    parser.add_argument(
-        "--since",
-        default=None,
-        metavar="YYYY-MM-DD",
-        help=(
-            "Only process inventory items modified on or after this date (UTC). "
-            "Format: YYYY-MM-DD or ISO-8601.  Example: --since 2026-04-21"
-        ),
-    )
+        # Phase 3 — Compact
+        print("\n" + "=" * 64)
+        print("Phase 3 — Compact: NDJSON → GeoParquet")
+        print("=" * 64)
 
-    # Compaction
-    parser.add_argument(
-        "--no-compact",
-        action="store_true",
-        default=False,
-        help="Skip Level-1 compaction; leave one part file per (cell, year) per chunk.",
-    )
-    parser.add_argument(
-        "--compact-threshold",
-        type=int,
-        default=2,
-        metavar="N",
-        help="Compact buckets that have >= N part files (default: 2).",
-    )
+        ndjson_base = f"{staging_prefix}/staging"
+        buckets: dict[tuple[str, str], None] = {}
 
-    # Lock
-    parser.add_argument(
-        "--no-lock",
-        action="store_true",
-        default=False,
-        help="Disable the S3 distributed lock (for local/test runs).",
-    )
+        for nk in all_ndjson_keys:
+            parts = nk.split("/")
+            if len(parts) >= 3:
+                buckets[(parts[-3], parts[-2])] = None
 
-    # Spot resilience
-    parser.add_argument(
-        "--no-per-file-mini-runs",
-        action="store_true",
-        default=False,
-        help=(
-            "Disable per-file mini-run mode for manifest inventories. "
-            "Reverts to the original monolithic behaviour: one lock acquisition, "
-            "one table.add_files() call at the very end.  Use this only if you "
-            "are certain the run will not be interrupted (e.g. a short smoke test "
-            "on a non-spot machine)."
-        ),
-    )
+        if not buckets:
+            for batch in obstore.list(staging_store, prefix=f"{ndjson_base}/"):
+                for obj in batch:
+                    path: str = obj["path"]
+                    parts = path.split("/")
+                    if len(parts) >= 3 and parts[-1].endswith(".ndjson"):
+                        buckets[(parts[-3], parts[-2])] = None
 
-    # Report
-    parser.add_argument(
-        "--report-location",
-        default=None,
-        metavar="PATH_OR_URI",
-        help=(
-            "Local path or s3:// URI for ingest_stats.json. "
-            "Defaults to <catalog_dir>/ingest_stats.json for local catalogs "
-            "or s3://<cat-bucket>/<cat-prefix-dir>/ingest_stats.json for S3 catalogs."
-        ),
-    )
+        compact_results: list[dict] = []
 
-    # Scheduler
-    parser.add_argument(
-        "--scheduler",
-        choices=["synchronous", "local", "coiled"],
-        default="local",
-        help="Dask scheduler to use (default: local).",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        metavar="N",
-        help="Number of workers for --scheduler local (default: 4).",
-    )
-    parser.add_argument(
-        "--threads-per-worker",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Threads per worker for --scheduler local (default: 1).",
-    )
+        if not buckets:
+            print("No NDJSON groups to compact.")
+        else:
+            is_s3 = warehouse_root.startswith("s3://")
+            if delta:
+                compact_fn = compact_cell_year_delta_s3 if is_s3 else compact_cell_year_delta
+            else:
+                compact_fn = compact_cell_year_s3 if is_s3 else compact_cell_year
+            bucket_list = list(buckets.keys())
 
-    # Explicit coiled options (take precedence over pass-through kwargs)
-    coiled_group = parser.add_argument_group(
-        "coiled options (--scheduler coiled)",
-        description=(
-            "Explicit flags for common Coiled settings.  Any other --coiled-<name> <value> "
-            "argument is forwarded directly to coiled.Cluster(name=value) as a pass-through "
-            "kwarg.  Repeated flags (e.g. --coiled-secret-env) are collected into a list."
-        ),
-    )
-    coiled_group.add_argument(
-        "--coiled-n-workers",
-        type=int,
-        default=10,
-        metavar="N",
-        help="Number of Coiled cloud workers (default: 10).",
-    )
-    coiled_group.add_argument(
-        "--coiled-vm-type",
-        default=None,
-        metavar="INSTANCE_TYPE",
-        help="Cloud VM instance type (e.g. m6i.xlarge).",
-    )
+            print(f"Submitting {len(bucket_list)} compact tasks …")
 
-    args, unknown = parser.parse_known_args()
+            if client is not None:
+                from dask.distributed import as_completed as distributed_ac
 
-    since: datetime | None = None
-    if args.since:
-        since = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
+                common_kwargs: dict[str, Any] = {
+                    "staging_store": staging_store,
+                    "staging_prefix": f"{staging_prefix}/staging",
+                    "compact_rows": compact_rows,
+                }
+                if is_s3:
+                    common_kwargs["warehouse_store"] = warehouse_store
+                else:
+                    common_kwargs["warehouse_root"] = warehouse_root
 
-    # ------------------------------------------------------------------
-    # Build coiled kwargs: pass-through extras merged with explicit flags
-    # ------------------------------------------------------------------
-    coiled_extra = _parse_coiled_extra(unknown)
-    # Explicit --coiled-n-workers / --coiled-vm-type take precedence
-    coiled_extra.pop("n_workers", None)
-    coiled_extra.pop("vm_type", None)
+                def _compact_task(cell_year):
+                    cell, year = cell_year
+                    return compact_fn(cell=cell, year=year, **common_kwargs)
 
-    # ------------------------------------------------------------------
-    # Build stores from --catalog and --warehouse URIs
-    # ------------------------------------------------------------------
-    import configparser
-    import os
+                futures = client.map(_compact_task, bucket_list)
+                with tqdm.tqdm(total=len(bucket_list), desc="Phase 3", unit="partition") as pbar:
+                    for future in distributed_ac(futures):
+                        r = future.result()
+                        compact_results.append(r)
+                        pbar.set_postfix(
+                            rows=f"{r['output_rows']:,}",
+                            refresh=False,
+                        )
+                        pbar.update(1)
+            else:
+                for cell, year in tqdm.tqdm(bucket_list, desc="Phase 3", unit="partition"):
+                    kwargs = {
+                        "cell": cell,
+                        "year": year,
+                        "staging_store": staging_store,
+                        "staging_prefix": f"{staging_prefix}/staging",
+                        "compact_rows": compact_rows,
+                    }
+                    if is_s3:
+                        kwargs["warehouse_store"] = warehouse_store
+                    else:
+                        kwargs["warehouse_root"] = warehouse_root
+                    compact_results.append(compact_fn(**kwargs))
 
-    from obstore.store import LocalStore, S3Store
+            total_input = sum(r["input_items"] for r in compact_results)
+            total_unique = sum(r["unique_items"] for r in compact_results)
+            total_output = sum(r["output_rows"] for r in compact_results)
+            total_files = sum(len(r["output_files"]) for r in compact_results)
+            print(
+                f"Compact done: {total_input:,} items → {total_unique:,} unique "
+                f"→ {total_output:,} rows in {total_files:,} files"
+            )
 
-    def _make_s3_store(bucket: str, prefix: str = "") -> S3Store:
-        """Authenticated S3Store using env vars or ~/.aws/credentials."""
-        key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-        secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-        token = os.environ.get("AWS_SESSION_TOKEN")
-        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
-        if not (key_id and secret):
-            cfg = configparser.ConfigParser()
-            cfg.read(os.path.expanduser("~/.aws/credentials"))
-            profile = os.environ.get("AWS_PROFILE", "default")
-            if profile in cfg:
-                key_id = cfg[profile].get("aws_access_key_id", key_id)
-                secret = cfg[profile].get("aws_secret_access_key", secret)
-                token = cfg[profile].get("aws_session_token", token) or token
-        kwargs: dict = dict(bucket=bucket, region=region)
-        if prefix:
-            kwargs["prefix"] = prefix
-        if key_id:
-            kwargs["aws_access_key_id"] = key_id
-        if secret:
-            kwargs["aws_secret_access_key"] = secret
-        if token:
-            kwargs["aws_session_token"] = token
-        return S3Store(**kwargs)
+        # Phase 4 — Register + cleanup
+        print("\n" + "=" * 64)
+        if delta:
+            print("Phase 4 — Delta Register: add files to existing catalog")
+        else:
+            print("Phase 4 — Register: rebuild catalog + cleanup")
+        print("=" * 64)
 
-    catalog_s3 = args.catalog.startswith("s3://")
-    warehouse_s3 = args.warehouse.startswith("s3://")
+        if delta:
+            new_paths = []
+            for r in compact_results:
+                new_paths.extend(r.get("output_files", []))
+            register_delta(
+                catalog_path=catalog_path,
+                warehouse_root=warehouse_root,
+                new_parquet_paths=new_paths,
+                staging_store=staging_store,
+                staging_prefix=staging_prefix,
+                h3_resolution=resolved_resolution,
+                upload=upload,
+                hash_index_path=hash_index_path,
+                update_hash_index=update_hash_index,
+            )
+        else:
+            register_and_cleanup(
+                catalog_path=catalog_path,
+                warehouse_root=warehouse_root,
+                staging_store=staging_store,
+                staging_prefix=staging_prefix,
+                h3_resolution=resolved_resolution,
+                upload=upload,
+                hash_index_path=hash_index_path,
+            )
 
-    if warehouse_s3:
-        # s3://bucket/prefix/to/warehouse  →  bucket + prefix
-        wh_no_scheme = args.warehouse.removeprefix("s3://")
-        wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
-        warehouse_store = _make_s3_store(wh_bucket, prefix=wh_prefix)
-        warehouse_root = args.warehouse  # full s3:// URI; used by add_files
+    if use_lock:
+        from earthcatalog.core.lock import S3Lock
+
+        with S3Lock(owner="backfill-v2"):
+            _run()
     else:
-        warehouse_path = Path(args.warehouse)
-        warehouse_path.mkdir(parents=True, exist_ok=True)
-        warehouse_store = LocalStore(str(warehouse_path))
-        warehouse_root = str(warehouse_path)
-
-    if catalog_s3:
-        # s3://bucket/prefix/catalog.db  →  store on bucket, key = prefix/catalog.db
-        cat_no_scheme = args.catalog.removeprefix("s3://")
-        cat_bucket, cat_key = cat_no_scheme.split("/", 1)
-        from earthcatalog.core import store_config
-
-        store_config.set_store(_make_s3_store(cat_bucket))
-        store_config.set_catalog_key(cat_key)
-        store_config.set_lock_key(str(Path(cat_key).parent / ".lock"))
-        # download_catalog needs a local temp file
-        import tempfile
-
-        _catalog_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        catalog_local = _catalog_tmp.name
-        _catalog_tmp.close()
-    else:
-        Path(args.catalog).parent.mkdir(parents=True, exist_ok=True)
-        catalog_local = args.catalog
-
-    # ------------------------------------------------------------------
-    # Resolve report_location — explicit flag > auto-derived S3 sibling
-    # ------------------------------------------------------------------
-    if args.report_location:
-        report_location: str | None = args.report_location
-    elif catalog_s3:
-        # Auto-derive: co-locate with catalog.db on S3
-        cat_dir = args.catalog.rsplit("/", 1)[0]  # strip filename
-        report_location = f"{cat_dir}/ingest_stats.json"
-    else:
-        report_location = None  # _write_ingest_stats uses local catalog sibling
-
-    # ------------------------------------------------------------------
-    # Pick scheduler context
-    # ------------------------------------------------------------------
-    if args.scheduler == "synchronous":
-        ctx = _synchronous_context()
-    elif args.scheduler == "local":
-        ctx = _local_cluster_context(
-            n_workers=args.workers,
-            threads_per_worker=args.threads_per_worker,
-        )
-    else:  # coiled
-        ctx = _coiled_context(
-            n_workers=args.coiled_n_workers,
-            vm_type=args.coiled_vm_type,
-            **coiled_extra,
-        )
-
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
-    with ctx:
-        run_backfill(
-            inventory_path=args.inventory,
-            catalog_path=catalog_local,
-            warehouse_store=warehouse_store,
-            warehouse_root=warehouse_root,
-            h3_resolution=args.h3_resolution,
-            chunk_size=args.chunk_size,
-            max_workers_per_task=args.fetch_workers,
-            compact=not args.no_compact,
-            compact_threshold=args.compact_threshold,
-            limit=args.limit,
-            use_lock=not args.no_lock,
-            since=since,
-            report_location=report_location,
-            per_file_mini_runs=not args.no_per_file_mini_runs,
-        )
-
-
-if __name__ == "__main__":
-    main()
+        _run()

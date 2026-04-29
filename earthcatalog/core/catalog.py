@@ -17,7 +17,7 @@ from pyiceberg.transforms import IdentityTransform, YearTransform
 from pyiceberg.types import (
     BinaryType,
     DoubleType,
-    IntegerType,
+    LongType,
     NestedField,
     StringType,
     TimestamptzType,
@@ -36,32 +36,42 @@ PROP_GRID_TYPE = "earthcatalog.grid.type"
 PROP_GRID_RESOLUTION = "earthcatalog.grid.resolution"
 PROP_GRID_BOUNDARIES_PATH = "earthcatalog.grid.boundaries_path"
 PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
+PROP_HASH_INDEX_PATH = "earthcatalog.hash_index_path"
 
-# PyIceberg schema — mirrors earthcatalog/schema.py (PyArrow)
-# Field IDs must be stable; never reorder or reuse them.
+# PyIceberg schema — matches normalized rustac stac-geoparquet output.
+#
+# rustac emits the full STAC item as stac-geoparquet.  write_geoparquet()
+# post-processes the file: assets/links structs → JSON strings, null-typed
+# columns (collection) → dropped.  This schema must match that normalized form.
 ICEBERG_SCHEMA = Schema(
-    NestedField(1, "id", StringType(), required=True),
-    NestedField(2, "grid_partition", StringType(), required=True),
+    NestedField(1, "id", StringType(), required=False),
+    NestedField(2, "grid_partition", StringType(), required=False),
     NestedField(3, "geometry", BinaryType(), required=False),
     NestedField(4, "datetime", TimestamptzType(), required=False),
-    NestedField(5, "start_datetime", TimestamptzType(), required=False),
-    NestedField(6, "mid_datetime", TimestamptzType(), required=False),
-    NestedField(7, "end_datetime", TimestamptzType(), required=False),
-    NestedField(8, "created", TimestamptzType(), required=False),
-    NestedField(9, "updated", TimestamptzType(), required=False),
-    NestedField(10, "percent_valid_pixels", IntegerType(), required=False),
-    NestedField(11, "date_dt", IntegerType(), required=False),
-    NestedField(12, "latitude", DoubleType(), required=False),
-    NestedField(13, "longitude", DoubleType(), required=False),
-    NestedField(14, "platform", StringType(), required=False),
-    NestedField(15, "version", StringType(), required=False),
-    NestedField(16, "proj_code", StringType(), required=False),
-    NestedField(17, "sat_orbit_state", StringType(), required=False),
-    NestedField(18, "scene_1_id", StringType(), required=False),
-    NestedField(19, "scene_2_id", StringType(), required=False),
-    NestedField(20, "scene_1_frame", StringType(), required=False),
-    NestedField(21, "scene_2_frame", StringType(), required=False),
-    NestedField(22, "raw_stac", StringType(), required=False),
+    NestedField(5, "platform", StringType(), required=False),
+    NestedField(6, "percent_valid_pixels", LongType(), required=False),
+    NestedField(7, "date_dt", LongType(), required=False),
+    NestedField(8, "proj:code", StringType(), required=False),
+    NestedField(9, "assets", StringType(), required=False),
+    NestedField(10, "links", StringType(), required=False),
+    NestedField(11, "stac_version", StringType(), required=False),
+    NestedField(12, "type", StringType(), required=False),
+    NestedField(13, "start_datetime", TimestamptzType(), required=False),
+    NestedField(14, "version", StringType(), required=False),
+    NestedField(15, "sat:orbit_state", StringType(), required=False),
+    NestedField(16, "scene_1_id", StringType(), required=False),
+    NestedField(17, "scene_2_id", StringType(), required=False),
+    NestedField(18, "scene_1_frame", StringType(), required=False),
+    NestedField(19, "scene_2_frame", StringType(), required=False),
+    NestedField(20, "mid_datetime", StringType(), required=False),
+    NestedField(21, "created", TimestamptzType(), required=False),
+    NestedField(22, "updated", TimestamptzType(), required=False),
+    NestedField(23, "end_datetime", TimestamptzType(), required=False),
+    NestedField(24, "stac_extensions", StringType(), required=False),
+    NestedField(25, "collection", StringType(), required=False),
+    NestedField(26, "latitude", DoubleType(), required=False),
+    NestedField(27, "longitude", DoubleType(), required=False),
+    NestedField(28, "bbox", StringType(), required=False),
 )
 
 # Partition spec: grid cell (identity) + year of acquisition.
@@ -81,7 +91,7 @@ PARTITION_SPEC = PartitionSpec(
 )
 
 
-def open_catalog(db_path: str, warehouse_path: str) -> SqlCatalog:
+def open(db_path: str, warehouse_path: str) -> SqlCatalog:
     """
     Open (or create) a SQLite-backed Iceberg catalog.
 
@@ -107,16 +117,18 @@ def open_catalog(db_path: str, warehouse_path: str) -> SqlCatalog:
 
     # Only inject S3 properties when the warehouse is on S3.
     if warehouse_path.startswith("s3://"):
-        props.update(
-            {
-                "s3.region": region,
-                "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-                "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-            }
-        )
+        props["s3.region"] = region
+        key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
+        secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
         session_token = os.environ.get("AWS_SESSION_TOKEN", "")
-        if session_token:
-            props["s3.session-token"] = session_token
+        if key_id and secret:
+            props["s3.access-key-id"] = key_id
+            props["s3.secret-access-key"] = secret
+            if session_token:
+                props["s3.session-token"] = session_token
+        else:
+            # Public bucket — anonymous access
+            props["s3.anonymous"] = "true"
 
     return SqlCatalog(NAMESPACE, **props)
 
@@ -153,7 +165,7 @@ def upload_catalog(local_path: str) -> None:
     print(f"Catalog uploaded: {local_path} → {key}")
 
 
-def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
+def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
     """Return the stac_items table, creating it (and the namespace) if needed.
 
     Parameters
@@ -183,7 +195,6 @@ def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
 
     try:
         table = catalog.load_table(FULL_NAME)
-        # Backfill properties on existing tables that predate this feature.
         missing = {k: v for k, v in props.items() if k not in table.properties}
         if missing:
             with table.transaction() as tx:
@@ -196,3 +207,18 @@ def get_or_create_table(catalog: SqlCatalog, grid_config=None) -> object:
             partition_spec=PARTITION_SPEC,
             properties=props,
         )
+
+
+def info(table) -> object:
+    """Return a CatalogInfo for *table*.
+
+    Shortcut for :func:`earthcatalog.core.catalog_info.catalog_info`.
+    """
+    from .catalog_info import catalog_info
+
+    return catalog_info(table)
+
+
+# Backward-compatible aliases.
+open_catalog = open
+get_or_create_table = get_or_create

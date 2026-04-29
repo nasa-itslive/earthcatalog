@@ -6,7 +6,7 @@ on:
 
 permissions:
   contents: read
-  pages:    write
+  pages: write
   id-token: write
 
 jobs:
@@ -30,7 +30,10 @@ jobs:
         run: pip install uv
 
       - name: Install zensical and mkdocstrings
-        run: uv sync --group dev
+        run: uv sync --extra dev
+
+      - name: Inject build metadata
+        run: uv run python scripts/inject_build_metadata.py
 
       - name: Build docs
         run: uv run zensical build --clean --config-file zensical.toml

@@ -1,26 +1,24 @@
 """
-STAC item transformation: H3 fan-out + GeoParquet writing via rustac.
+STAC item transformation: H3 fan-out + stac-geoparquet writing via rustac.
 
 Public functions
 ----------------
 ``fan_out(items, partitioner)``
     Produce one synthetic STAC item per (source_item × grid_cell) pair.
-    Sanitises property names (``proj:code`` → ``proj_code``), rounds float
-    fields to int, and injects ``grid_partition`` into each item's properties.
+    Injects ``grid_partition`` into each item's properties.
 
 ``group_by_partition(fan_out_items)``
     Group the output of ``fan_out()`` by ``(grid_partition, year)`` so that
     each group can be written to exactly one Parquet file.  This is required
-    for Iceberg ``IdentityTransform`` + ``YearTransform`` partition pruning:
-    ``table.add_files()`` requires every registered file to contain exactly one
-    value for each partitioned column.
+    for Iceberg ``IdentityTransform`` + ``YearTransform`` partition pruning.
 
 ``write_geoparquet(fan_out_items, path)``
     Write a **single-partition** list of synthetic items to a GeoParquet file
-    using ``rustac.GeoparquetWriter``.  rustac handles all geo metadata — the
-    ``geo`` Parquet key and the ``geoarrow.wkb`` extension on the geometry
-    column.  Rows are sorted by ``(platform, datetime)`` before writing so that
-    Parquet row-group statistics are maximally useful for predicate pushdown.
+    using rustac.write(). rustac writes proper stac-geoparquet with:
+    - assets as struct column
+    - links as list column
+    - properties promoted to top-level columns
+    - geoarrow.wkb extension on geometry column
 
 Spatial predicate pushdown
 --------------------------
@@ -31,39 +29,18 @@ The correct usage pattern for spatial queries:
 2. Filter the Iceberg table via:
        WHERE grid_partition IN (<candidate_cells>)
    Iceberg's IdentityTransform partition pruning will skip all files whose
-   ``grid_partition`` value is not in the candidate set — zero row reads from
-   irrelevant cells.
-
-Schema alignment
-----------------
-rustac infers column types from the item dicts:
-  - Python ``int``  → Arrow ``int64``  (cast to ``int32`` to match Iceberg)
-  - STAC ``datetime``, ``start_datetime`` → ``timestamp[ms, tz=UTC]``
-    (cast to ``timestamp[us, tz=UTC]`` to match Iceberg TimestamptzType)
-  - Non-standard timestamps (``mid_datetime``) → ``string``
-    (cast via Arrow string→timestamp)
-  - Columns absent from a batch → filled with nulls of the target type
+   ``grid_partition`` value is not in the candidate set.
 """
 
 import asyncio
-import json
-import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import obstore
-import pyarrow as pa
-import pyarrow.parquet as pq
 import rustac
 
 from .partitioner import AbstractPartitioner
-from .schema import GEOMETRY_FIELDS
-from .schema import schema as ARROW_SCHEMA
-
-# ---------------------------------------------------------------------------
-# FileMetadata — tiny serialisable record returned by ingest / compact workers
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -99,90 +76,6 @@ class FileMetadata:
     file_size_bytes: int
 
 
-# ---------------------------------------------------------------------------
-# Target schema — derived from the canonical schema.py so there is one source
-# of truth.  Each entry is (name, Arrow type, nullable, is_geometry).
-# ---------------------------------------------------------------------------
-
-_COLUMNS: list[tuple[str, pa.DataType, bool, bool]] = [
-    (
-        f.name,
-        f.type,
-        f.nullable,
-        f.name in GEOMETRY_FIELDS,
-    )
-    for f in ARROW_SCHEMA
-]
-
-# Keep the old explicit list as a sanity reference — not used at runtime.
-# fmt: off
-_EXPECTED_NAMES = [
-    "id", "grid_partition", "geometry",
-    "datetime", "start_datetime", "mid_datetime", "end_datetime", "created", "updated",
-    "percent_valid_pixels", "date_dt",
-    "latitude", "longitude",
-    "platform", "version", "proj_code", "sat_orbit_state",
-    "scene_1_id", "scene_2_id", "scene_1_frame", "scene_2_frame",
-    "raw_stac",
-]
-# fmt: on
-assert [c[0] for c in _COLUMNS] == _EXPECTED_NAMES, "schema.py field order mismatch"
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _to_int(value: object) -> int | None:
-    """Round a float/int value to Python int, or None if missing."""
-    if value is None:
-        return None
-    return int(round(value))
-
-
-def _cast_col(col: pa.ChunkedArray | pa.Array, target: pa.DataType) -> pa.Array:
-    """
-    Cast *col* to *target*, handling null-typed columns and string→timestamp.
-    """
-    if isinstance(col, pa.ChunkedArray):
-        col = col.combine_chunks()
-    if col.type == target:
-        return col
-    if pa.types.is_null(col.type):
-        return pa.nulls(len(col), type=target)
-    return col.cast(target, safe=False)
-
-
-def _align_schema(raw: pa.Table, geo_meta: bytes) -> pa.Table:
-    """
-    Select / cast columns from a rustac-written table to our target layout.
-
-    ``geo_meta`` comes directly from the rustac Parquet file and is forwarded
-    to the output schema as-is — we never construct it ourselves.
-    """
-    cols: dict[str, pa.Array] = {}
-    fields: list[pa.Field] = []
-
-    for name, typ, nullable, is_geom in _COLUMNS:
-        if name in raw.schema.names:
-            col = _cast_col(raw.column(name), typ)
-        else:
-            col = pa.nulls(len(raw), type=typ)
-
-        cols[name] = col
-        fmeta = {b"ARROW:extension:name": b"geoarrow.wkb"} if is_geom else None
-        fields.append(pa.field(name, typ, nullable=nullable, metadata=fmeta))
-
-    schema_meta = {b"geo": geo_meta} if geo_meta else None
-    return pa.table(cols, schema=pa.schema(fields, metadata=schema_meta))
-
-
-async def _async_write(items: list[dict], path: str) -> None:
-    writer = await rustac.GeoparquetWriter.open(items, path)
-    await writer.finish()
-
-
 def _year_from_item(item: dict) -> int | None:
     """Extract the 4-digit year from a STAC item's datetime property, or None."""
     dt_str = item.get("properties", {}).get("datetime")
@@ -200,11 +93,6 @@ def _sort_key(item: dict) -> tuple[str, str]:
     return (props.get("platform") or "", props.get("datetime") or "")
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 def fan_out(
     stac_items: list[dict],
     partitioner: AbstractPartitioner,
@@ -212,9 +100,10 @@ def fan_out(
     """
     Produce one synthetic STAC item per (source_item × grid_cell) pair.
 
-    Each synthetic item carries sanitised, flattened properties (including
-    ``grid_partition``) so that ``rustac.GeoparquetWriter`` promotes them
-    directly to top-level GeoParquet columns.
+    Each synthetic item is the original STAC item with ``grid_partition``
+    injected into its ``properties``.  All original fields (assets, links,
+    collection, …) are preserved as-is so that rustac.write() can emit a
+    complete stac-geoparquet file with the native rustac schema.
 
     Items with unparseable or empty geometry are silently skipped.
     """
@@ -229,40 +118,9 @@ def fan_out(
         except Exception:
             continue
 
-        base_props = {
-            "datetime": props.get("datetime"),
-            "start_datetime": props.get("start_datetime"),
-            "mid_datetime": props.get("mid_datetime"),
-            "end_datetime": props.get("end_datetime"),
-            "created": props.get("created"),
-            "updated": props.get("updated"),
-            "percent_valid_pixels": _to_int(props.get("percent_valid_pixels")),
-            "date_dt": _to_int(props.get("date_dt")),
-            "latitude": props.get("latitude"),
-            "longitude": props.get("longitude"),
-            "platform": props.get("platform"),
-            "version": props.get("version"),
-            "proj_code": props.get("proj:code"),
-            "sat_orbit_state": props.get("sat:orbit_state"),
-            "scene_1_id": props.get("scene_1_id"),
-            "scene_2_id": props.get("scene_2_id"),
-            "scene_1_frame": props.get("scene_1_frame"),
-            "scene_2_frame": props.get("scene_2_frame"),
-            "raw_stac": json.dumps(item),
-        }
-
         for key in keys:
-            result.append(
-                {
-                    "type": "Feature",
-                    "stac_version": item.get("stac_version", "1.0.0"),
-                    "id": item["id"],
-                    "geometry": item["geometry"],
-                    "properties": {**base_props, "grid_partition": key},
-                    "links": [],
-                    "assets": {},
-                }
-            )
+            synthetic = {**item, "properties": {**props, "grid_partition": key}}
+            result.append(synthetic)
 
     return result
 
@@ -311,6 +169,90 @@ def group_by_partition(
     return groups
 
 
+def _normalize_for_iceberg(table) -> object:
+    """
+    Post-process a rustac-written PyArrow table for PyIceberg V2 compatibility.
+
+    rustac emits:
+    - ``assets``: struct (keys = asset names) → cast to JSON string
+    - ``links``: list<struct<href, rel, …>> → cast to JSON string
+    - ``bbox``: struct<xmin, ymin, xmax, ymax> → cast to [xmin, ymin, xmax, ymax] JSON array
+    - ``collection``: null type (PyIceberg V2 rejects pa.null()) → drop column
+    - ``type``/``stac_version``: dictionary<string> → PyIceberg warns but accepts
+
+    The geo metadata (ARROW:extension:name on geometry) is preserved because
+    we only replace specific columns, not the file itself.
+    """
+    import json
+
+    import pyarrow as pa
+
+    def _to_json(col):
+        return pa.array(
+            [json.dumps(v.as_py()) if v.is_valid else None for v in col],
+            type=pa.string(),
+        )
+
+    def _bbox_struct_to_array(col):
+        """Convert struct<xmin,ymin,xmax,ymax> → JSON array string [xmin,ymin,xmax,ymax]."""
+        field_names = {col.type.field(i).name for i in range(col.type.num_fields)}
+        if field_names >= {"xmin", "ymin", "xmax", "ymax"}:
+            return pa.array(
+                [
+                    json.dumps(
+                        [v.as_py()["xmin"], v.as_py()["ymin"], v.as_py()["xmax"], v.as_py()["ymax"]]
+                    )
+                    if v.is_valid
+                    else None
+                    for v in col
+                ],
+                type=pa.string(),
+            )
+        return _to_json(col)
+
+    def _try_cast_float_to_int(col):
+        """Cast a float64/double column to int32 if all non-null values are whole numbers."""
+        import pyarrow.compute as pc
+
+        floored = pc.floor(col)
+        if pc.all(pc.or_(pc.is_null(col), pc.equal(col, floored))).as_py():
+            return col.cast(pa.int32())
+        return col
+
+    cols = {}
+    fields = []
+    for i, name in enumerate(table.schema.names):
+        col = table.column(name)
+        orig_field = table.schema.field(name)
+        if pa.types.is_dictionary(col.type):
+            # Cast dictionary-encoded columns to plain string so Iceberg
+            # can read partition values (e.g. grid_partition) directly.
+            decoded = col.cast(pa.string())
+            cols[name] = decoded
+            fields.append(pa.field(name, pa.string(), metadata=orig_field.metadata))
+        elif pa.types.is_struct(col.type):
+            converted = _bbox_struct_to_array(col) if name == "bbox" else _to_json(col)
+            cols[name] = converted
+            fields.append(pa.field(name, pa.string(), metadata=orig_field.metadata))
+        elif pa.types.is_list(col.type):
+            cols[name] = _to_json(col)
+            fields.append(pa.field(name, pa.string(), metadata=orig_field.metadata))
+        elif col.type == pa.null():
+            pass  # drop — PyIceberg V2 cannot represent null type
+        elif col.type in (pa.float64(), pa.float32()):
+            # Never downcast coordinate columns — whole-number lat/lon values
+            # (e.g. longitude=0.0) would be cast to int32, breaking the schema.
+            casted = col if name in ("latitude", "longitude") else _try_cast_float_to_int(col)
+            cols[name] = casted
+            fields.append(pa.field(name, casted.type, metadata=orig_field.metadata))
+        else:
+            cols[name] = col
+            fields.append(orig_field)
+
+    schema = pa.schema(fields, metadata=table.schema.metadata)
+    return pa.table(cols, schema=schema)
+
+
 def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
     """
     Write fan-out STAC items to a GeoParquet file using rustac.
@@ -322,35 +264,53 @@ def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
     partitions the resulting file will violate the Iceberg ``IdentityTransform``
     constraint and ``table.add_files()`` will raise a ``ValueError``.
 
-    rustac.GeoparquetWriter produces:
-    - a ``geo`` key in the Parquet file metadata
-    - ``geoarrow.wkb`` extension type on the geometry column
-
-    After writing, the output is aligned to our 22-column target schema (type
-    casts, missing-column fill with nulls) and the ``geo`` metadata is
-    forwarded unchanged from the rustac temp file to the final file.
+    rustac writes the full stac-geoparquet schema.  A post-processing step
+    casts struct/list columns (assets, links) to JSON strings and drops null-
+    typed columns (collection) so the file is compatible with PyIceberg V2
+    ``add_files()``.
 
     Returns the number of rows written (0 if the input list is empty).
     """
     if not fan_out_items:
         return 0
 
-    tmp = path + ".rustac_tmp"
-    try:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_async_write(fan_out_items, tmp))
-        finally:
-            loop.close()
+    import pyarrow.parquet as pq
 
-        raw = pq.ParquetFile(tmp).read()
-        geo_meta = pq.ParquetFile(tmp).metadata.metadata.get(b"geo", b"")
-        aligned = _align_schema(raw, geo_meta)
-        pq.write_table(aligned, path)
-        return len(aligned)
+    async def _write():
+        await rustac.write(path, fan_out_items)
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_write())
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        loop.close()
+
+    # Post-process: cast assets/links → JSON strings, drop null columns,
+    # cast whole-number floats → int32.  Field metadata (e.g. geoarrow.wkb
+    # extension on geometry) is preserved by _normalize_for_iceberg.
+    # File-level keys written by rustac (geo, stac-geoparquet) live in the
+    # Parquet file metadata, not the Arrow schema metadata.  We carry them
+    # into the Arrow schema so pq.write_table re-encodes them.
+    # Use ParquetFile to read the single file exactly — avoids PyArrow's
+    # Hive-partition directory discovery which breaks inside partitioned layouts.
+    pf = pq.ParquetFile(path)
+    file_meta = pf.metadata.metadata
+    table = pf.read()
+    table = _normalize_for_iceberg(table)
+    preserve_keys = (b"geo", b"stac-geoparquet")
+    extra = {k: v for k, v in file_meta.items() if k in preserve_keys}
+    if extra:
+        merged = {**(table.schema.metadata or {}), **extra}
+        table = table.replace_schema_metadata(merged)
+    # Write via a file object rather than a path string to prevent PyArrow's
+    # Parquet reader/writer from treating the parent directory as a Hive-
+    # partitioned dataset (which causes schema-merge errors inside layouts
+    # like grid_partition=X/year=Y/).  S3 paths never reach this code path —
+    # write_geoparquet_s3 writes to a local temp file then uploads via obstore.
+    with open(path, "wb") as _fh:
+        pq.write_table(table, _fh, compression="zstd")
+
+    return len(fan_out_items)
 
 
 def write_geoparquet_s3(

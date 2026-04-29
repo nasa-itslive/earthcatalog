@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "earthcatalog"
-version = "0.1.0"
+version = "0.5.1"
 description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
 requires-python = ">=3.12"
 dependencies = [
@@ -20,6 +20,24 @@ dependencies = [
   "duckdb",
   "dask[distributed]",
   "coiled",
+  "orjson",
+  "xxhash",
+  "tqdm",
+  "pandas",
+]
+
+[project.optional-dependencies]
+dev = [
+  "jupyterlab",
+  "dask-labextension",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-xdist",
+  "ruff",
+  "mypy",
+  "pre-commit",
+  "zensical",
+  "mkdocstrings[python]",
 ]
 
 [project.urls]
@@ -37,13 +55,11 @@ earthcatalog = "earthcatalog.cli:main"
 where = ["."]
 include = ["earthcatalog*"]
 
-[dependency-groups]
-dev = ["pytest", "ruff", "mypy", "zensical", "mkdocstrings[python]"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
   "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
+  "e2e: heavy pipeline tests skipped in pre-commit (run with pytest -m e2e)",
 ]
 
 [tool.ruff]

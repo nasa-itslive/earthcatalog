@@ -45,15 +45,18 @@ ITEMS = [
             "sat:orbit_state": "descending",
         },
         "links": [],
-        "assets": {},
+        "assets": {
+            "data": {"href": f"s3://fake-bucket/duck-item-{i:04d}.tif", "type": "image/tiff"}
+        },
     }
     for i in range(4)
 ]
 
 
-@pytest.fixture()
-def populated_table(tmp_path):
+@pytest.fixture(scope="module")
+def populated_table(tmp_path_factory):
     """Build and populate an Iceberg table; return (table, duckdb_connection)."""
+    tmp_path = tmp_path_factory.mktemp("duckdb")
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
     cat = open_catalog(db_path=db, warehouse_path=wh)
@@ -152,13 +155,17 @@ class TestDuckDBQuery:
         ).fetchall()
         assert len(rows) > 0
 
-    def test_raw_stac_json_parseable_in_duckdb(self, populated_table):
-        """raw_stac stored as JSON string must be parseable by DuckDB json_extract."""
+    def test_assets_json_parseable_in_duckdb(self, populated_table):
+        """assets stored as JSON string must be parseable by DuckDB json_extract."""
         tbl, con = populated_table
         rows = con.execute(
-            f"SELECT json_extract(raw_stac, '$.id') "
-            f"FROM iceberg_scan('{tbl.metadata_location}') LIMIT 5"
+            f"SELECT assets "
+            f"FROM iceberg_scan('{tbl.metadata_location}') "
+            f"WHERE assets IS NOT NULL LIMIT 5"
         ).fetchall()
         assert len(rows) > 0
+        import json
+
         for (val,) in rows:
-            assert val is not None
+            parsed = json.loads(val)
+            assert isinstance(parsed, dict)

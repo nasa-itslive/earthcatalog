@@ -1,0 +1,95 @@
+# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
+name: Consolidate
+
+on:
+  # schedule:
+  #   - cron: "0 4 1 * *" # 04:00 UTC on the 1st of every month
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Min files per partition to trigger consolidation"
+        required: false
+        default: "2"
+      dry_run:
+        description: "Dry run (report only, no changes)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  WAREHOUSE: s3://its-live-data/test-space/stac/catalog/warehouse
+
+jobs:
+  consolidate:
+    name: Consolidate warehouse partitions
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download catalog
+        run: |
+          uv run python -c "
+          from obstore.store import S3Store
+          from earthcatalog.core import store_config
+          from earthcatalog.core.catalog import download_catalog
+
+          store = S3Store(bucket='its-live-data', region='us-west-2')
+          store_config.set_store(store)
+          store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+          download_catalog('/tmp/earthcatalog.db')
+          "
+
+      - name: Catalog info (before)
+        run: |
+          uv run python scripts/info.py \
+            --catalog /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
+
+      - name: Consolidate small parquet files
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          uv run python scripts/consolidate.py \
+            --warehouse ${{ env.WAREHOUSE }} \
+            --catalog /tmp/earthcatalog.db \
+            --threshold "${{ github.event.inputs.threshold || '2' }}" \
+            --use-lock \
+            $DRY_RUN_FLAG
+
+      - name: Catalog info (after)
+        if: always()
+        run: |
+          uv run python scripts/info.py \
+            --catalog /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Consolidation Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Threshold: ${{ github.event.inputs.threshold || '2' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: ${{ github.event.inputs.dry_run || 'false' }}" >> "$GITHUB_STEP_SUMMARY"

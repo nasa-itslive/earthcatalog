@@ -20,7 +20,6 @@ from obstore.store import MemoryStore
 
 from earthcatalog.core.transform import (
     FileMetadata,
-    _to_int,
     fan_out,
     group_by_partition,
     write_geoparquet,
@@ -62,10 +61,12 @@ BASE_ITEM = {
         "version": "2.0",
         "start_datetime": "2021-06-14T00:00:00Z",
         "mid_datetime": "2021-06-14T12:00:00Z",
-        "end_datetime": "2021-06-15T00:00:00Z",
     },
-    "links": [],
-    "assets": {},
+    "assets": {
+        "data": {"href": "s3://bucket/data.tif", "title": "Data"},
+        "thumbnail": {"href": "s3://bucket/thumb.png"},
+    },
+    "links": [{"href": "http://example.com", "rel": "canonical"}],
 }
 
 POINT_ITEM = {
@@ -107,25 +108,6 @@ def partitioner():
 
 
 # ---------------------------------------------------------------------------
-# _to_int helper
-# ---------------------------------------------------------------------------
-
-
-class TestToInt:
-    def test_rounds_float(self):
-        assert _to_int(5.0) == 5
-
-    def test_rounds_up(self):
-        assert _to_int(5.6) == 6
-
-    def test_none_returns_none(self):
-        assert _to_int(None) is None
-
-    def test_already_int(self):
-        assert _to_int(42) == 42
-
-
-# ---------------------------------------------------------------------------
 # fan_out()
 # ---------------------------------------------------------------------------
 
@@ -156,27 +138,12 @@ class TestFanOut:
         cells = [r["properties"]["grid_partition"] for r in rows]
         assert len(cells) == len(set(cells))
 
-    def test_colon_sanitisation(self, partitioner):
+    def test_original_item_preserved(self, partitioner):
         rows = fan_out([BASE_ITEM], partitioner)
-        props = rows[0]["properties"]
-        assert "proj_code" in props
-        assert "sat_orbit_state" in props
-        assert "proj:code" not in props
-        assert "sat:orbit_state" not in props
-
-    def test_int_rounding(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
-        for row in rows:
-            assert isinstance(row["properties"]["percent_valid_pixels"], int)
-            assert isinstance(row["properties"]["date_dt"], int)
-            assert row["properties"]["percent_valid_pixels"] == 80
-            assert row["properties"]["date_dt"] == 5
-
-    def test_raw_stac_is_json_string(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
-        raw = json.loads(rows[0]["properties"]["raw_stac"])
-        assert raw["id"] == BASE_ITEM["id"]
-        assert raw["properties"]["platform"] == "sentinel-1"
+        assert rows[0]["id"] == BASE_ITEM["id"]
+        assert rows[0]["geometry"] == BASE_ITEM["geometry"]
+        assert rows[0]["assets"] == BASE_ITEM.get("assets", {})
+        assert rows[0]["links"] == BASE_ITEM.get("links", [])
 
     def test_point_geometry_handled(self):
         """Point geometry should produce exactly one row (single H3 cell)."""
@@ -244,37 +211,12 @@ class TestWriteGeoparquet:
         out = str(tmp_path / "out.parquet")
         write_geoparquet(fan_out([BASE_ITEM], partitioner), out)
         t = pq.read_table(out)
-        required = {
-            "id",
-            "grid_partition",
-            "geometry",
-            "datetime",
-            "platform",
-            "proj_code",
-            "sat_orbit_state",
-            "percent_valid_pixels",
-            "date_dt",
-            "raw_stac",
-        }
-        assert required.issubset(set(t.schema.names))
-
-    def test_int_fields_are_int32(self, tmp_path, partitioner):
-        out = str(tmp_path / "out.parquet")
-        write_geoparquet(fan_out([BASE_ITEM], partitioner), out)
-        t = pq.read_table(out)
-        assert t.schema.field("percent_valid_pixels").type == pa.int32()
-        assert t.schema.field("date_dt").type == pa.int32()
-
-    def test_int_fields_not_float_values(self, tmp_path, partitioner):
-        out = str(tmp_path / "out.parquet")
-        write_geoparquet(fan_out([BASE_ITEM], partitioner), out)
-        t = pq.read_table(out)
-        for val in t.column("percent_valid_pixels").to_pylist():
-            if val is not None:
-                assert isinstance(val, int)
-        for val in t.column("date_dt").to_pylist():
-            if val is not None:
-                assert isinstance(val, int)
+        # rustac columns: id, grid_partition, assets, links, geometry, datetime, etc.
+        assert "id" in t.schema.names
+        assert "grid_partition" in t.schema.names
+        assert "assets" in t.schema.names
+        assert "links" in t.schema.names
+        assert "geometry" in t.schema.names
 
     def test_datetime_is_timestamp(self, tmp_path, partitioner):
         out = str(tmp_path / "out.parquet")
@@ -295,9 +237,11 @@ class TestWriteGeoparquet:
         out = str(tmp_path / "out.parquet")
         write_geoparquet(fan_out([minimal], partitioner), out)
         t = pq.read_table(out)
-        assert t.schema.field("platform").type == pa.string()
-        for val in t.column("platform").to_pylist():
-            assert val is None
+        # rustac only includes columns present in at least one item
+        # id is always present
+        assert "id" in t.schema.names
+        assert "datetime" in t.schema.names
+        assert "geometry" in t.schema.names
 
     def test_no_rustac_tmp_file_left(self, tmp_path, partitioner):
         """Temporary rustac file must be cleaned up after write."""
@@ -466,15 +410,16 @@ class TestWriteGeoparquetS3:
         geo = json.loads(pf.metadata.metadata[b"geo"])
         assert geo["primary_column"] == "geometry"
 
-    def test_int_fields_are_int32(self, store, partitioner):
+    def test_numeric_fields_present(self, store, partitioner):
         import obstore as obs
 
         rows = fan_out([BASE_ITEM], partitioner)
         write_geoparquet_s3(rows, store, "test/out.parquet")
         raw = bytes(obs.get(store, "test/out.parquet").bytes())
         tbl = pq.ParquetFile(io.BytesIO(raw)).read()
-        assert tbl.schema.field("percent_valid_pixels").type == pa.int32()
-        assert tbl.schema.field("date_dt").type == pa.int32()
+        # rustac includes percent_valid_pixels and date_dt (as double since source was float)
+        assert "percent_valid_pixels" in tbl.schema.names
+        assert "date_dt" in tbl.schema.names
 
     def test_geoarrow_extension_on_geometry(self, store, partitioner):
         import obstore as obs
