@@ -1,14 +1,21 @@
 # Progress
 
-## 2026-05-01 — Branch created, assessment written
+## 2026-05-01 — Phase A ✓, Phase B ✓
 
-**Done:**
-- Created `improvements` branch from `main`
-- Completed full codebase assessment → `assessment.md`
-- Created TODO.md and PROGRESS.md
-- Currently: Phase A — store_config elimination
+**Phase A — store_config eliminated:**
+- `catalog.py`: `download_catalog`/`upload_catalog` accept explicit store+key params
+- `lock.py`: `S3Lock` accepts explicit store+key params
+- `EarthCatalog`: added `lock()`, `download_catalog()`, `upload_catalog()` methods
+- All backward compat preserved; 309 tests pass
 
-**Next:**
-- Phase A: Thread store/catalog_key/lock_key through EarthCatalog explicitly
-- Phase B: Design and implement `catalog.ingest()`
-- Verify all tests pass after each phase
+**Phase B — unified `catalog.ingest()` API:**
+- `EarthCatalog.ingest()`: handles both full (drop+recreate) and delta (append) modes
+- `catalog.ingest()` module-level convenience wrapper
+- Exported from `earthcatalog.core`
+- Hash index update, inventory reading, rustac GeoParquet writing all preserved
+- 309 tests pass
+
+## Next
+- Phase D: Deduplicate `_h3_boundary_cells` and hash index update code
+- Phase C: Abstract storage I/O (eliminate local/S3 pairs)
+- Verify all tests pass

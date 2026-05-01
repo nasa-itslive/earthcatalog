@@ -25,8 +25,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from shapely.geometry import mapping
-
 from earthcatalog.core.catalog import (
     PROP_GRID_BOUNDARIES_PATH,
     PROP_GRID_ID_FIELD,
@@ -284,35 +282,12 @@ class CatalogInfo:
     # ------------------------------------------------------------------
 
     def _h3_cells(self, geom) -> list[str]:
-        import h3
-        from shapely.geometry import Point
+        from shapely import wkb
+
+        from earthcatalog.grids.h3_partitioner import H3Partitioner
 
         res = self.grid_resolution if self.grid_resolution is not None else 1
-        if isinstance(geom, Point):
-            return [h3.latlng_to_cell(geom.y, geom.x, res)]
-        return list(set(h3.geo_to_cells(mapping(geom), res)) | self._h3_boundary_cells(geom, res))
-
-    @staticmethod
-    def _h3_boundary_cells(geom, resolution: int) -> set[str]:
-        import h3
-        from shapely.geometry import MultiPolygon, Polygon
-
-        cells: set[str] = set()
-        for poly in geom.geoms if isinstance(geom, MultiPolygon) else [geom]:
-            if not isinstance(poly, Polygon):
-                continue
-            coords = list(poly.exterior.coords)
-            for (lon0, lat0), (lon1, lat1) in zip(coords, coords[1:]):
-                dist = ((lon1 - lon0) ** 2 + (lat1 - lat0) ** 2) ** 0.5
-                n = max(2, int(dist / 0.1))
-                for i in range(n):
-                    t = i / n
-                    cells.add(
-                        h3.latlng_to_cell(
-                            lat0 + t * (lat1 - lat0), lon0 + t * (lon1 - lon0), resolution
-                        )
-                    )
-        return cells
+        return H3Partitioner(resolution=res).get_intersecting_keys(wkb.dumps(geom))
 
     def _geojson_keys(self, geom) -> list[str]:
         if not self.boundaries_path:
