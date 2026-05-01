@@ -143,12 +143,10 @@ def main() -> None:
                 for k in sorted(changed)
             ],
             "added": [
-                {"key": k, "size": new_keys[k][2], "md5": new_keys[k][1]}
-                for k in sorted(added)
+                {"key": k, "size": new_keys[k][2], "md5": new_keys[k][1]} for k in sorted(added)
             ],
             "removed": [
-                {"key": k, "size": old_keys[k][2], "md5": old_keys[k][1]}
-                for k in sorted(removed)
+                {"key": k, "size": old_keys[k][2], "md5": old_keys[k][1]} for k in sorted(removed)
             ],
         }
         with open(args.output, "w") as f:

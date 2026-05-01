@@ -62,6 +62,7 @@ def _list_parquets(store: S3Store) -> list[str]:
 # Step 1: inventory chunks → /tmp/inventory_ids.parquet  (id, bucket, key)
 # ---------------------------------------------------------------------------
 
+
 def step1_inventory(store: S3Store) -> None:
     if Path(INV_IDS_OUT).exists():
         n = pq.ParquetFile(INV_IDS_OUT).metadata.num_rows
@@ -90,6 +91,7 @@ def step1_inventory(store: S3Store) -> None:
 # ---------------------------------------------------------------------------
 # Step 2: warehouse GeoParquet → /tmp/warehouse_ids.parquet  (id,)
 # ---------------------------------------------------------------------------
+
 
 async def _fetch_wh_ids_async(store: S3Store, key: str) -> list[str]:
     raw = memoryview((await obstore.get_async(store, key)).bytes()).tobytes()
@@ -129,7 +131,9 @@ def _dedup_parquet(path: str) -> None:
     if n_unique < n_before:
         print(f"  Deduping {path}: {n_before:,} -> {n_unique:,} ({n_before - n_unique:,} dupes)")
         tmp = path + ".dedup"
-        con.execute(f"COPY (SELECT DISTINCT id FROM read_parquet('{path}')) TO '{tmp}' (FORMAT PARQUET)")
+        con.execute(
+            f"COPY (SELECT DISTINCT id FROM read_parquet('{path}')) TO '{tmp}' (FORMAT PARQUET)"
+        )
         con.close()
         Path(tmp).rename(path)
     else:
@@ -144,7 +148,6 @@ def step2_warehouse(store: S3Store) -> None:
         _dedup_parquet(WH_IDS_OUT)
         return
 
-
     keys = _list_parquets(store)
     print(f"  Fetching {len(keys):,} warehouse parquet files (concurrent) ...")
     all_ids = asyncio.run(_fetch_all_wh_async(store, keys, concurrency=64))
@@ -156,6 +159,7 @@ def step2_warehouse(store: S3Store) -> None:
 # ---------------------------------------------------------------------------
 # Step 3: pgstac CSV → /tmp/pgstac_ids.parquet  (id, bucket, key)
 # ---------------------------------------------------------------------------
+
 
 def step3_pgstac(pgstac_path: str) -> None:
     if Path(PG_IDS_OUT).exists():
@@ -195,6 +199,7 @@ def step3_pgstac(pgstac_path: str) -> None:
 # Step 4: DuckDB merge
 # ---------------------------------------------------------------------------
 
+
 def step4_merge() -> None:
     import duckdb
 
@@ -209,22 +214,40 @@ def step4_merge() -> None:
     print(f"  pgSTAC rows:      {pg_n:,}")
     print(f"  Warehouse rows:   {wh_n:,}")
 
-    con.execute(f"CREATE VIEW inv AS SELECT DISTINCT id, bucket, key FROM read_parquet('{INV_IDS_OUT}')")
+    con.execute(
+        f"CREATE VIEW inv AS SELECT DISTINCT id, bucket, key FROM read_parquet('{INV_IDS_OUT}')"
+    )
     con.execute(f"CREATE VIEW wh AS SELECT DISTINCT id FROM read_parquet('{WH_IDS_OUT}')")
-    con.execute(f"CREATE VIEW pg AS SELECT DISTINCT id, bucket, key FROM read_parquet('{PG_IDS_OUT}')")
+    con.execute(
+        f"CREATE VIEW pg AS SELECT DISTINCT id, bucket, key FROM read_parquet('{PG_IDS_OUT}')"
+    )
 
     print()
     print("=" * 64)
     print("Set comparison")
     print("=" * 64)
 
-    inv_only = con.execute("SELECT COUNT(*) FROM inv WHERE id NOT IN (SELECT id FROM pg) AND id NOT IN (SELECT id FROM wh)").fetchone()[0]
-    pg_only = con.execute("SELECT COUNT(*) FROM pg WHERE id NOT IN (SELECT id FROM inv) AND id NOT IN (SELECT id FROM wh)").fetchone()[0]
-    wh_only = con.execute("SELECT COUNT(*) FROM wh WHERE id NOT IN (SELECT id FROM inv) AND id NOT IN (SELECT id FROM pg)").fetchone()[0]
-    inv_pg = con.execute("SELECT COUNT(*) FROM inv i WHERE i.id IN (SELECT id FROM pg) AND i.id NOT IN (SELECT id FROM wh)").fetchone()[0]
-    inv_wh = con.execute("SELECT COUNT(*) FROM inv i WHERE i.id NOT IN (SELECT id FROM pg) AND i.id IN (SELECT id FROM wh)").fetchone()[0]
-    pg_wh = con.execute("SELECT COUNT(*) FROM pg p WHERE p.id NOT IN (SELECT id FROM inv) AND p.id IN (SELECT id FROM wh)").fetchone()[0]
-    all_three = con.execute("SELECT COUNT(*) FROM inv i WHERE i.id IN (SELECT id FROM pg) AND i.id IN (SELECT id FROM wh)").fetchone()[0]
+    inv_only = con.execute(
+        "SELECT COUNT(*) FROM inv WHERE id NOT IN (SELECT id FROM pg) AND id NOT IN (SELECT id FROM wh)"
+    ).fetchone()[0]
+    pg_only = con.execute(
+        "SELECT COUNT(*) FROM pg WHERE id NOT IN (SELECT id FROM inv) AND id NOT IN (SELECT id FROM wh)"
+    ).fetchone()[0]
+    wh_only = con.execute(
+        "SELECT COUNT(*) FROM wh WHERE id NOT IN (SELECT id FROM inv) AND id NOT IN (SELECT id FROM pg)"
+    ).fetchone()[0]
+    inv_pg = con.execute(
+        "SELECT COUNT(*) FROM inv i WHERE i.id IN (SELECT id FROM pg) AND i.id NOT IN (SELECT id FROM wh)"
+    ).fetchone()[0]
+    inv_wh = con.execute(
+        "SELECT COUNT(*) FROM inv i WHERE i.id NOT IN (SELECT id FROM pg) AND i.id IN (SELECT id FROM wh)"
+    ).fetchone()[0]
+    pg_wh = con.execute(
+        "SELECT COUNT(*) FROM pg p WHERE p.id NOT IN (SELECT id FROM inv) AND p.id IN (SELECT id FROM wh)"
+    ).fetchone()[0]
+    all_three = con.execute(
+        "SELECT COUNT(*) FROM inv i WHERE i.id IN (SELECT id FROM pg) AND i.id IN (SELECT id FROM wh)"
+    ).fetchone()[0]
 
     print(f"  Inventory only:          {inv_only:,}")
     print(f"  pgSTAC only:             {pg_only:,}")

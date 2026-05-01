@@ -15,8 +15,14 @@
 - Hash index update, inventory reading, rustac GeoParquet writing all preserved
 - 309 tests pass
 
+## Done
+- Phase A: store_config globals eliminated (catalog.py, lock.py, EarthCatalog)
+- Phase B: catalog.ingest() unified API (full + delta, hash index, inventory)
+- Phase C: Uniform Obstore I/O — all compact/register functions use stores,
+  no local/S3 branching (-37 lines)
+- Phase D: Deduplicated _h3_boundary_cells, _update_hash_index_from_parquets
+
 ## Remaining
-- Phase C: Abstract storage I/O (eliminate local/S3 pairs in backfill.py)
-- Phase E: Remove dead code / archive one-off scripts  
-- Phase F: Adopt shared test fixtures across test files (deferred — low impact)
+- Phase E: Remove dead one-off scripts (audit_inventory, compare_catalogs, etc.)
+- Phase F: Adopt shared test fixtures for simple cases (deferred)
 - Phase G: Documentation update
