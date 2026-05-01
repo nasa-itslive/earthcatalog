@@ -91,13 +91,36 @@ PARTITION_SPEC = PartitionSpec(
 )
 
 
-def open(db_path: str, warehouse_path: str) -> SqlCatalog:
+def open(
+    db_path: str | None = None,
+    warehouse_path: str | None = None,
+    store: object | None = None,
+    base: str | None = None,
+    anonymous: bool | None = None,
+) -> SqlCatalog | object:
     """
-    Open (or create) a SQLite-backed Iceberg catalog.
+    Open (or create) an EarthCatalog.
 
-    When ``warehouse_path`` is an ``s3://`` URI, PyIceberg uses PyArrow's S3
-    filesystem to write Iceberg metadata files.  PyArrow auto-resolves the
-    bucket region via a HEAD request unless the region is supplied explicitly.
+    **New simplified API (returns EarthCatalog):**
+
+        from earthcatalog.core import catalog
+        from obstore.store import S3Store
+
+        store = S3Store(bucket='its-live-data', region='us-west-2')
+        ec = catalog.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
+
+    The *base* path should contain:
+        - earthcatalog.db           (SQLite catalog)
+        - warehouse/                (GeoParquet files)
+        - warehouse_id_hashes.parquet (optional hash index)
+
+    **Legacy API (returns SqlCatalog for backward compatibility):**
+
+        c = catalog.open(db_path='/tmp/catalog.db', warehouse_path='/tmp/warehouse')
+
+    When ``warehouse_path`` or ``base`` is an ``s3://`` URI, PyIceberg uses
+    PyArrow's S3 filesystem to write Iceberg metadata files.  PyArrow auto-resolves
+    the bucket region via a HEAD request unless the region is supplied explicitly.
     On non-EC2 machines (or with restricted IAM policies) that HEAD request
     fails with ``Not a valid bucket name: ''``.
 
@@ -105,32 +128,125 @@ def open(db_path: str, warehouse_path: str) -> SqlCatalog:
     1. ``AWS_DEFAULT_REGION`` environment variable
     2. ``AWS_REGION`` environment variable
     3. Hard-coded fallback ``us-west-2`` (ITS_LIVE bucket location)
+
+    Args:
+        db_path: Local path for SQLite catalog (legacy API)
+        warehouse_path: S3 or local path for Parquet warehouse (legacy API)
+        store: obstore Store instance (new API)
+        base: S3 or local base path containing earthcatalog.db and warehouse/ (new API)
+        anonymous: Force anonymous S3 access (use True for public buckets).
+                  Auto-detected for S3Store with skip_signature=True when None.
+
+    Returns:
+        EarthCatalog for new API, SqlCatalog for legacy API
     """
     import os
+    import tempfile
+    import uuid
+    from pathlib import Path
+
+    from .earthcatalog import EarthCatalog
+
+    # Detect which API is being used
+    using_new_api = store is not None and base is not None
+    using_legacy_api = db_path is not None and warehouse_path is not None
+
+    if using_new_api and using_legacy_api:
+        raise ValueError(
+            "Cannot mix new API (store + base) with legacy API (db_path + warehouse_path). "
+            "Use either: catalog.open(store=S3Store(...), base='s3://.../catalog') "
+            "OR: catalog.open(db_path='...', warehouse_path='...')"
+        )
+
+    if not using_new_api and not using_legacy_api:
+        raise ValueError(
+            "Must provide either (store + base) OR (db_path + warehouse_path). "
+            "For new API: catalog.open(store=S3Store(...), base='s3://.../catalog') "
+            "For legacy API: catalog.open(db_path='...', warehouse_path='...')"
+        )
+
+    # Auto-detect anonymous mode for S3Store with skip_signature=True
+    if anonymous is None and using_new_api:
+        # Check if store config has skip_signature (indicates public bucket intent)
+        if hasattr(store, "config"):
+            skip_sig = store.config.get("skip_signature")
+            if skip_sig in (True, "true"):
+                anonymous = True
+
+    if using_legacy_api:
+        # Legacy API - return SqlCatalog directly
+        _db_path = db_path
+        _warehouse_path = warehouse_path
+    else:
+        # New API - derive paths from base
+        # base = s3://its-live-data/test-space/stac/catalog
+        # catalog_db = base/earthcatalog.db
+        # warehouse = base/warehouse
+        _warehouse_path = f"{base}/warehouse"
+
+        # Catalog key relative to store root
+        # If base is s3://bucket/prefix/catalog, catalog key is prefix/catalog/earthcatalog.db
+        if base.startswith("s3://"):
+            # Remove s3:// prefix and split to get bucket + key
+            rest = base[5:]
+            parts = rest.split("/", 1)
+            catalog_key = f"{parts[1]}/earthcatalog.db" if len(parts) > 1 else "earthcatalog.db"
+        else:
+            # Local path
+            catalog_key = str(Path(base) / "earthcatalog.db")
+
+        # Download catalog.db to temp location
+        _db_path = str(Path(tempfile.gettempdir()) / f"earthcatalog_{uuid.uuid4().hex[:8]}.db")
+        try:
+            import obstore
+
+            result = obstore.get(store, catalog_key)
+            Path(_db_path).write_bytes(bytes(result.bytes()))
+        except FileNotFoundError:
+            # No existing catalog - will create fresh
+            pass
 
     region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
 
     props: dict = {
-        "uri": f"sqlite:///{db_path}",
-        "warehouse": warehouse_path,
+        "uri": f"sqlite:///{_db_path}",
+        "warehouse": _warehouse_path,
     }
 
     # Only inject S3 properties when the warehouse is on S3.
-    if warehouse_path.startswith("s3://"):
+    if _warehouse_path.startswith("s3://"):
         props["s3.region"] = region
-        key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
-        secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-        session_token = os.environ.get("AWS_SESSION_TOKEN", "")
-        if key_id and secret:
-            props["s3.access-key-id"] = key_id
-            props["s3.secret-access-key"] = secret
-            if session_token:
-                props["s3.session-token"] = session_token
-        else:
-            # Public bucket — anonymous access
-            props["s3.anonymous"] = "true"
 
-    return SqlCatalog(NAMESPACE, **props)
+        # Check if we should use anonymous access
+        if anonymous:
+            # Public bucket — force anonymous access
+            # PyArrow requires endpoint URL for anonymous S3 access
+            props["s3.anonymous"] = "true"
+            props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
+        else:
+            # Use credentials if available
+            key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
+            secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+            session_token = os.environ.get("AWS_SESSION_TOKEN", "")
+            if key_id and secret:
+                props["s3.access-key-id"] = key_id
+                props["s3.secret-access-key"] = secret
+                if session_token:
+                    props["s3.session-token"] = session_token
+            else:
+                # No credentials — anonymous access
+                props["s3.anonymous"] = "true"
+                props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
+
+    sql_catalog = SqlCatalog(NAMESPACE, **props)
+
+    # For new API, return EarthCatalog facade
+    if using_new_api:
+        table = get_or_create(sql_catalog)
+        info_obj = info(table)
+        return EarthCatalog(catalog=sql_catalog, table=table, info=info_obj, store=store)
+
+    return sql_catalog
 
 
 # ---------------------------------------------------------------------------
@@ -138,31 +254,49 @@ def open(db_path: str, warehouse_path: str) -> SqlCatalog:
 # ---------------------------------------------------------------------------
 
 
-def download_catalog(local_path: str) -> None:
+def download_catalog(
+    local_path: str,
+    store: object | None = None,
+    catalog_key: str | None = None,
+) -> None:
     """
-    Pull catalog.db from the configured store to local_path before a job starts.
+    Pull catalog.db from *store* to *local_path* before a job starts.
+
+    When *store* and *catalog_key* are ``None`` (default), falls back to the
+    global :mod:`earthcatalog.core.store_config` — this path is deprecated.
+
     If the key does not exist (first run), does nothing — a fresh catalog
     will be created by open_catalog / get_or_create_table.
     """
-    store = store_config.get_store()
-    key = store_config.get_catalog_key()
+    if store is None or catalog_key is None:
+        store = store_config.get_store()
+        catalog_key = store_config.get_catalog_key()
     try:
-        result = obstore.get(store, key)
+        result = obstore.get(store, catalog_key)
         Path(local_path).write_bytes(bytes(result.bytes()))
-        print(f"Catalog downloaded: {key} → {local_path}")
+        print(f"Catalog downloaded: {catalog_key} → {local_path}")
     except FileNotFoundError:
-        print(f"No existing catalog at '{key}' — will create fresh.")
+        print(f"No existing catalog at '{catalog_key}' — will create fresh.")
 
 
-def upload_catalog(local_path: str) -> None:
+def upload_catalog(
+    local_path: str,
+    store: object | None = None,
+    catalog_key: str | None = None,
+) -> None:
     """
-    Push the updated catalog.db back to the configured store after all writes.
+    Push the updated catalog.db to *store* after all writes.
+
+    When *store* and *catalog_key* are ``None`` (default), falls back to the
+    global :mod:`earthcatalog.core.store_config` — this path is deprecated.
+
     The caller must hold the S3Lock before calling this.
     """
-    store = store_config.get_store()
-    key = store_config.get_catalog_key()
-    obstore.put(store, key, Path(local_path).read_bytes())
-    print(f"Catalog uploaded: {local_path} → {key}")
+    if store is None or catalog_key is None:
+        store = store_config.get_store()
+        catalog_key = store_config.get_catalog_key()
+    obstore.put(store, catalog_key, Path(local_path).read_bytes())
+    print(f"Catalog uploaded: {local_path} → {catalog_key}")
 
 
 def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:

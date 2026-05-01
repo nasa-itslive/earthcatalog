@@ -19,7 +19,10 @@ Example::
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import io
+import struct
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from shapely.geometry import mapping
@@ -33,14 +36,99 @@ from earthcatalog.core.catalog import (
 
 
 def _parse_dt(value: str | datetime) -> datetime:
+    """Parse a datetime string or datetime object into a timezone-aware datetime.
+
+    Supports flexible input formats:
+    - Full ISO: "2020-01-15T10:30:00Z", "2020-01-15"
+    - Year-month: "2020-01" → "2020-01-01T00:00:00Z"
+    - Year only: "2020" → "2020-01-01T00:00:00Z"
+    """
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+    # Try standard ISO format first
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    except ValueError:
+        pass
+
+    # Try partial date formats
+    value = value.strip()
+
+    # Year-month format: "2020-01"
+    if len(value) == 7 and value.count("-") == 1:
+        try:
+            year, month = value.split("-")
+            return datetime(int(year), int(month), 1, tzinfo=UTC)
+        except ValueError:
+            pass  # Fall through to error message
+
+    # Year only format: "2020"
+    if len(value) == 4 and value.isdigit():
+        try:
+            return datetime(int(value), 1, 1, tzinfo=UTC)
+        except ValueError:
+            pass  # Fall through to error message
+
+    # If all else fails, raise
+    raise ValueError(
+        f"Unable to parse datetime: {value!r}. "
+        "Supported formats: ISO 8601 (e.g., '2020-01-15', '2020-01-15T10:30:00Z'), "
+        "year-month (e.g., '2020-01'), or year only (e.g., '2020')."
+    )
+
+
+def _parquet_row_count_from_store(store, obstore_key: str) -> int:
+    """Read row count from a remote Parquet file's footer only — no full download."""
+    import obstore
+    import pyarrow.parquet as pq
+
+    head_result = obstore.head(store, obstore_key)
+    file_size = head_result["size"] if isinstance(head_result, dict) else head_result.size
+
+    # Parquet footer suffix: 4-byte metadata length + 4-byte magic "PAR1"
+    suffix = obstore.get_range(store, obstore_key, start=file_size - 8, end=file_size)
+    if hasattr(suffix, "to_bytes"):
+        suffix = suffix.to_bytes()
+    elif not isinstance(suffix, bytes):
+        suffix = bytes(suffix)
+    metadata_len = struct.unpack("<i", suffix[:4])[0]
+
+    footer = obstore.get_range(
+        store,
+        obstore_key,
+        start=file_size - 8 - metadata_len,
+        end=file_size,
+    )
+    if hasattr(footer, "to_bytes"):
+        footer = footer.to_bytes()
+    elif not isinstance(footer, bytes):
+        footer = bytes(footer)
+
+    return pq.ParquetFile(io.BytesIO(footer)).metadata.num_rows
+
+
+def _build_stats_cache(table) -> list[dict]:
+    """Aggregate per-(partition, year) stats from Iceberg manifests. No Parquet I/O."""
+    agg: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0, 0])
+    for task in table.scan().plan_files():
+        f = task.file
+        key = (f.partition[0], f.partition[1] + 1970)
+        agg[key][0] += f.record_count
+        agg[key][1] += 1
+        agg[key][2] += f.file_size_in_bytes
+
+    return [
+        {
+            "grid_partition": cell,
+            "year": year,
+            "row_count": rows,
+            "file_count": files,
+            "total_bytes": total_bytes,
+        }
+        for (cell, year), (rows, files, total_bytes) in sorted(agg.items())
+    ]
 
 
 @dataclass
@@ -54,6 +142,12 @@ class CatalogInfo:
     grid_resolution: int | None
     boundaries_path: str | None
     id_field: str | None
+    _cached_stats: list[dict] | None = field(default=None, repr=False)
+    _cached_top_cells: list[dict] | None = field(default=None, repr=False)
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
 
     def cells_for_geometry(self, geom) -> list[str]:
         """Return the partition keys that intersect *geom*."""
@@ -62,6 +156,18 @@ class CatalogInfo:
         if self.grid_type == "geojson":
             return self._geojson_keys(geom)
         raise ValueError(f"Unknown grid type: {self.grid_type!r}")
+
+    def cell_list_sql(self, geom) -> str:
+        """Return a SQL fragment suitable for ``WHERE grid_partition IN (...)``."""
+        cells = self.cells_for_geometry(geom)
+        if not cells:
+            return "grid_partition IN (NULL)"
+        quoted = ", ".join(f"'{c}'" for c in cells)
+        return f"grid_partition IN ({quoted})"
+
+    # ------------------------------------------------------------------
+    # File paths
+    # ------------------------------------------------------------------
 
     def file_paths(
         self,
@@ -72,12 +178,8 @@ class CatalogInfo:
     ) -> list[str]:
         """Return Parquet file paths for partitions intersecting *geom*.
 
-        Uses Iceberg partition pruning (zero I/O on irrelevant files) and
-        returns paths suitable for DuckDB's ``read_parquet()``.
-
-        When *start_datetime* and/or *end_datetime* are provided, Iceberg
-        projects the filter onto the ``year`` partition so entire year
-        partitions are skipped without reading manifests.
+        Uses Iceberg partition pruning (zero I/O on irrelevant files).
+        Datetime filters are pushed down to the ``year`` partition.
         """
         from pyiceberg.expressions import And, GreaterThanOrEqual, In, LessThanOrEqual
 
@@ -85,62 +187,101 @@ class CatalogInfo:
         if not cells:
             return []
 
-        row_filter = In("grid_partition", cells)
+        expr = In("grid_partition", cells)
         if start_datetime is not None:
-            row_filter = And(row_filter, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))
+            expr = And(expr, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))
         if end_datetime is not None:
-            row_filter = And(row_filter, LessThanOrEqual("datetime", _parse_dt(end_datetime)))
+            expr = And(expr, LessThanOrEqual("datetime", _parse_dt(end_datetime)))
 
-        scan = table.scan(row_filter=row_filter)
-        return [task.file.file_path for task in scan.plan_files()]
+        return [task.file.file_path for task in table.scan(row_filter=expr).plan_files()]
+
+    # ------------------------------------------------------------------
+    # Stats / counts  (all manifest-only, no Parquet data reads)
+    # ------------------------------------------------------------------
+
+    def _ensure_stats(self, table) -> list[dict]:
+        """Populate and return the stats cache (single manifest scan)."""
+        if self._cached_stats is None:
+            self._cached_stats = _build_stats_cache(table)
+            # Derive top-cells cache for free while we have the data
+            if self._cached_top_cells is None:
+                cell_agg: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+                for s in self._cached_stats:
+                    cell_agg[s["grid_partition"]][0] += s["row_count"]
+                    cell_agg[s["grid_partition"]][1] += s["file_count"]
+                self._cached_top_cells = sorted(
+                    [
+                        {"grid_partition": cell, "row_count": rows, "file_count": files}
+                        for cell, (rows, files) in cell_agg.items()
+                    ],
+                    key=lambda d: d["row_count"],
+                    reverse=True,
+                )
+        return self._cached_stats
 
     def stats(self, table) -> list[dict]:
-        """Return per-partition row counts and file sizes from Iceberg metadata.
+        """Per-partition row counts and file sizes from Iceberg manifests.
 
-        Reads manifest files only — no Parquet data is opened.  Each dict
-        contains ``grid_partition``, ``year``, ``row_count``, ``file_count``,
-        and ``total_bytes`` aggregated across all files in that partition.
-
-        Example::
-
-            info = catalog_info(table)
-            for s in info.stats(table):
-                print(s)
-            # {'grid_partition': '8206d7fffffffff', 'year': 2022,
-            #  'row_count': 1500, 'file_count': 1, 'total_bytes': 32000}
+        Each dict contains ``grid_partition``, ``year``, ``row_count``,
+        ``file_count``, and ``total_bytes``. Results are cached.
         """
-        from collections import defaultdict
+        return self._ensure_stats(table)
 
-        agg: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0, 0])
-        for task in table.scan().plan_files():
-            f = task.file
-            cell = f.partition[0]
-            year = f.partition[1] + 1970
-            recs = f.record_count
-            size = f.file_size_in_bytes
-            key = (cell, year)
-            agg[key][0] += recs
-            agg[key][1] += 1
-            agg[key][2] += size
+    def top_cells(self, table, limit: int = 5) -> list[dict]:
+        """Top partitions by row count (cached alongside :meth:`stats`).
 
-        return [
-            {
-                "grid_partition": cell,
-                "year": year,
-                "row_count": rows,
-                "file_count": files,
-                "total_bytes": bytes_,
-            }
-            for (cell, year), (rows, files, bytes_) in sorted(agg.items())
-        ]
+        Returns dicts with ``grid_partition``, ``row_count``, and ``file_count``.
+        """
+        self._ensure_stats(table)  # populates both caches in one pass
+        return self._cached_top_cells[:limit]  # type: ignore[index]
 
-    def cell_list_sql(self, geom) -> str:
-        """Return a SQL fragment suitable for ``WHERE grid_partition IN (...)``."""
-        cells = self.cells_for_geometry(geom)
-        if not cells:
-            return "grid_partition IN (NULL)"
-        quoted = ", ".join(f"'{c}'" for c in cells)
-        return f"grid_partition IN ({quoted})"
+    def total_files(self, table) -> int:
+        """Total Parquet file count from Iceberg snapshot manifests."""
+        return sum(s["file_count"] for s in self._ensure_stats(table))
+
+    def unique_item_count(self, table, store, default_hash_index_path: str | None = None) -> int:
+        """Row count of the hash-index Parquet file (footer read only).
+
+        Reads only the remote footer — not the full file. Returns 0 if the
+        hash index is not found.
+
+        Args:
+            table: PyIceberg Table instance
+            store: obstore Store instance (for S3 paths)
+            default_hash_index_path: Optional default path to try if table property is not set.
+                                   Typically derived from warehouse path (e.g., ``s3://.../catalog/warehouse_id_hashes.parquet``).
+        """
+        import pyarrow.parquet as pq
+
+        hash_index_path = table.properties.get("earthcatalog.hash_index_path")
+        if hash_index_path is None:
+            hash_index_path = default_hash_index_path
+        if not hash_index_path:
+            return 0
+
+        try:
+            if hash_index_path.startswith("s3://"):
+                if not store:
+                    return 0
+                _, _, rest = hash_index_path.partition("s3://")
+                obstore_key = rest.split("/", 1)[1] if "/" in rest else ""
+                if not obstore_key:
+                    return 0
+                return _parquet_row_count_from_store(store, obstore_key)
+
+            # Local path
+            from pathlib import Path
+
+            if not Path(hash_index_path).exists():
+                return 0
+            return pq.ParquetFile(hash_index_path).metadata.num_rows
+
+        except Exception:
+            return 0
+
+    # ------------------------------------------------------------------
+    # Grid internals
+    # ------------------------------------------------------------------
 
     def _h3_cells(self, geom) -> list[str]:
         import h3
@@ -149,9 +290,7 @@ class CatalogInfo:
         res = self.grid_resolution if self.grid_resolution is not None else 1
         if isinstance(geom, Point):
             return [h3.latlng_to_cell(geom.y, geom.x, res)]
-        interior = set(h3.geo_to_cells(mapping(geom), res))
-        boundary = self._h3_boundary_cells(geom, res)
-        return list(interior | boundary)
+        return list(set(h3.geo_to_cells(mapping(geom), res)) | self._h3_boundary_cells(geom, res))
 
     @staticmethod
     def _h3_boundary_cells(geom, resolution: int) -> set[str]:
@@ -159,8 +298,7 @@ class CatalogInfo:
         from shapely.geometry import MultiPolygon, Polygon
 
         cells: set[str] = set()
-        polys = geom.geoms if isinstance(geom, MultiPolygon) else [geom]
-        for poly in polys:
+        for poly in geom.geoms if isinstance(geom, MultiPolygon) else [geom]:
             if not isinstance(poly, Polygon):
                 continue
             coords = list(poly.exterior.coords)
@@ -169,9 +307,11 @@ class CatalogInfo:
                 n = max(2, int(dist / 0.1))
                 for i in range(n):
                     t = i / n
-                    lat = lat0 + t * (lat1 - lat0)
-                    lon = lon0 + t * (lon1 - lon0)
-                    cells.add(h3.latlng_to_cell(lat, lon, resolution))
+                    cells.add(
+                        h3.latlng_to_cell(
+                            lat0 + t * (lat1 - lat0), lon0 + t * (lon1 - lon0), resolution
+                        )
+                    )
         return cells
 
     def _geojson_keys(self, geom) -> list[str]:
@@ -184,11 +324,10 @@ class CatalogInfo:
 
         from earthcatalog.grids.geojson_partitioner import GeoJSONPartitioner
 
-        partitioner = GeoJSONPartitioner(
+        return GeoJSONPartitioner(
             boundaries_path=self.boundaries_path,
             id_field=self.id_field or "id",
-        )
-        return partitioner.get_intersecting_keys(wkb.dumps(geom))
+        ).get_intersecting_keys(wkb.dumps(geom))
 
     def __repr__(self) -> str:  # pragma: no cover
         if self.grid_type == "h3":
@@ -202,8 +341,8 @@ class CatalogInfo:
 def catalog_info(table) -> CatalogInfo:
     """Build a CatalogInfo from an open PyIceberg Table.
 
-    Falls back to sensible defaults for catalogs that predate table-property
-    support (grid_type="h3", grid_resolution=1).
+    Falls back to sensible defaults for pre-property catalogs
+    (grid_type="h3", grid_resolution=1).
     """
     props = table.properties
     grid_type = props.get(PROP_GRID_TYPE, "h3")

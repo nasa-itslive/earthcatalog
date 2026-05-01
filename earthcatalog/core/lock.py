@@ -41,21 +41,31 @@ class S3Lock:
     """
     Atomic lockfile using obstore conditional writes (If-None-Match: *).
 
-    Reads the store and lock key from store_config at acquire time, so
-    changing the store before entering the context is all that's needed
-    to switch backends (S3, local, memory).
+    When *store* and *key* are provided explicitly they are used directly;
+    otherwise falls back to the global :mod:`earthcatalog.core.store_config`
+    (deprecated path).
 
     Stale locks (older than ttl_hours) are automatically overridden.
     """
 
-    def __init__(self, owner: str, ttl_hours: int = 12) -> None:
+    def __init__(
+        self,
+        owner: str,
+        ttl_hours: int = 12,
+        store: object | None = None,
+        key: str | None = None,
+    ) -> None:
         """
         Args:
             owner:     Human-readable name for the lock holder (e.g. "backfill").
             ttl_hours: Age after which a lock is considered stale and overridable.
+            store:     Optional explicit obstore store (avoids store_config globals).
+            key:       Optional explicit lock key (avoids store_config globals).
         """
         self._owner = owner
         self._ttl = ttl_hours
+        self._explicit_store = store
+        self._explicit_key = key
 
     def __enter__(self) -> "S3Lock":
         self.acquire()
@@ -66,10 +76,14 @@ class S3Lock:
 
     @property
     def _store(self) -> object:
+        if self._explicit_store is not None:
+            return self._explicit_store
         return store_config.get_store()
 
     @property
     def _key(self) -> str:
+        if self._explicit_key is not None:
+            return self._explicit_key
         return store_config.get_lock_key()
 
     def acquire(self) -> None:

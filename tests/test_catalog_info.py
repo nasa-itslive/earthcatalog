@@ -401,3 +401,261 @@ class TestFilePathsDatetime:
         info = catalog_info(tbl)
         paths = info.file_paths(tbl, box(170, -10, 175, 0), start_datetime="2022-01-01")
         assert paths == []
+
+
+# ---------------------------------------------------------------------------
+# Datetime parsing
+# ---------------------------------------------------------------------------
+
+
+class TestDatetimeParsing:
+    """Test flexible datetime parsing for search_files."""
+
+    def test_parse_full_iso_date(self):
+        """Full ISO date strings should parse correctly."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        dt = _parse_dt("2020-06-15")
+        assert dt.year == 2020
+        assert dt.month == 6
+        assert dt.day == 15
+        assert dt.tzinfo == UTC
+
+    def test_parse_iso_datetime_with_timezone(self):
+        """ISO datetime with timezone should preserve tz."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        dt = _parse_dt("2020-06-15T10:30:00Z")
+        assert dt.year == 2020
+        assert dt.month == 6
+        assert dt.day == 15
+        assert dt.hour == 10
+        assert dt.minute == 30
+        assert dt.tzinfo == UTC
+
+    def test_parse_year_month_format(self):
+        """Year-month format like '2020-01' should parse to start of month."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        dt = _parse_dt("2020-06")
+        assert dt.year == 2020
+        assert dt.month == 6
+        assert dt.day == 1  # First day of month
+        assert dt.hour == 0
+        assert dt.minute == 0
+        assert dt.tzinfo == UTC
+
+    def test_parse_year_only_format(self):
+        """Year-only format like '2020' should parse to start of year."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        dt = _parse_dt("2020")
+        assert dt.year == 2020
+        assert dt.month == 1  # January
+        assert dt.day == 1  # First day
+        assert dt.tzinfo == UTC
+
+    def test_parse_datetime_object(self):
+        """Datetime objects should be returned with UTC timezone if naive."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        dt = _parse_dt(datetime(2020, 6, 15, 10, 30))
+        assert dt.year == 2020
+        assert dt.month == 6
+        assert dt.day == 15
+        assert dt.tzinfo == UTC
+
+    def test_parse_aware_datetime_preserves_tz(self):
+        """Aware datetime objects should preserve their timezone."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        dt = _parse_dt(datetime(2020, 6, 15, 10, 30, tzinfo=UTC))
+        assert dt.tzinfo == UTC
+
+    def test_parse_invalid_format_raises_error(self):
+        """Invalid datetime strings should raise ValueError."""
+        from earthcatalog.core.catalog_info import _parse_dt
+
+        with pytest.raises(ValueError, match="Unable to parse datetime"):
+            _parse_dt("not-a-date")
+
+        with pytest.raises(ValueError, match="Unable to parse datetime"):
+            _parse_dt("2020-13")  # Invalid month
+
+    def test_file_paths_with_year_month_format(self, tmp_path):
+        """file_paths should work with year-month format."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+
+        # Using year-month format
+        paths = info.file_paths(tbl, pt, start_datetime="2021-01")
+        years_in_result = {
+            task.file.partition[1] + 1970
+            for task in tbl.scan().plan_files()
+            if task.file.file_path in paths
+        }
+        # Should only include 2021 and later
+        for y in years_in_result:
+            assert y >= 2021
+
+    def test_file_paths_with_year_only_format(self, tmp_path):
+        """file_paths should work with year-only format."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+        pt = Point(-49, 66.5)
+
+        # Using year-only format
+        paths = info.file_paths(tbl, pt, start_datetime="2022")
+        years_in_result = {
+            task.file.partition[1] + 1970
+            for task in tbl.scan().plan_files()
+            if task.file.file_path in paths
+        }
+        # Should only include 2022
+        for y in years_in_result:
+            assert y >= 2022
+
+
+# ---------------------------------------------------------------------------
+# total_files, unique_item_count, top_cells
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogInfoStatsMethods:
+    """Test new statistics methods on CatalogInfo."""
+
+    def test_total_files_counts_parquet_files(self, tmp_path):
+        """total_files should return count of Parquet files in warehouse."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+
+        count = info.total_files(tbl)
+
+        # Count should match actual file count
+        actual_count = sum(1 for _ in tbl.scan().plan_files())
+        assert count == actual_count
+        assert count > 0
+
+    def test_total_files_empty_table(self, h3_table):
+        """total_files should return 0 for empty table."""
+        info = catalog_info(h3_table)
+        count = info.total_files(h3_table)
+        assert count == 0
+
+    def test_unique_item_count_no_hash_index(self, h3_table):
+        """unique_item_count should return 0 when hash index not available."""
+        info = catalog_info(h3_table)
+        count = info.unique_item_count(h3_table, store=None)
+        assert count == 0
+
+    def test_unique_item_count_with_hash_index(self, tmp_path):
+        """unique_item_count should read from hash index parquet."""
+        import pyarrow.parquet as pq
+
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+
+        # Create a hash index file
+        hash_index_path = str(tmp_path / "warehouse_id_hashes.parquet")
+        import pyarrow as pa
+
+        # Create a simple hash index with 10 unique items
+        table = pa.table({"item_id_hash": [i for i in range(10)]})
+        pq.write_table(table, hash_index_path)
+
+        # Set the hash index path in table properties
+        with tbl.transaction() as tx:
+            tx.set_properties(**{"earthcatalog.hash_index_path": hash_index_path})
+
+        info = catalog_info(tbl)
+        count = info.unique_item_count(tbl, store=None)
+        assert count == 10
+
+    def test_unique_item_count_local_file_not_found(self, tmp_path):
+        """unique_item_count should return 0 when file doesn't exist."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+
+        # Set non-existent hash index path
+        with tbl.transaction() as tx:
+            tx.set_properties(
+                **{"earthcatalog.hash_index_path": str(tmp_path / "nonexistent.parquet")}
+            )
+
+        info = catalog_info(tbl)
+        count = info.unique_item_count(tbl, store=None)
+        assert count == 0
+
+    def test_unique_item_count_uses_default_path(self, tmp_path):
+        """unique_item_count should use default_hash_index_path when table property is not set."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+
+        # Create a hash index file at the default location
+        hash_index_path = str(tmp_path / "warehouse_id_hashes.parquet")
+        table = pa.table({"item_id_hash": [i for i in range(42)]})
+        pq.write_table(table, hash_index_path)
+
+        # Don't set the table property - test default path
+        info = catalog_info(tbl)
+
+        # Without default path, should return 0
+        count_no_default = info.unique_item_count(tbl, store=None)
+        assert count_no_default == 0
+
+        # With default path, should return the actual count
+        count_with_default = info.unique_item_count(
+            tbl, store=None, default_hash_index_path=hash_index_path
+        )
+        assert count_with_default == 42
+
+    def test_top_cells_returns_sorted_partitions(self, tmp_path):
+        """top_cells should return partitions sorted by row count."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022, 2023])
+        info = catalog_info(tbl)
+
+        top = info.top_cells(tbl, limit=5)
+
+        assert len(top) <= 5
+        # Should be sorted by row_count descending
+        for i in range(len(top) - 1):
+            assert top[i]["row_count"] >= top[i + 1]["row_count"]
+
+        # Each entry should have required keys
+        for cell in top:
+            assert "grid_partition" in cell
+            assert "row_count" in cell
+            assert "file_count" in cell
+
+    def test_top_cells_empty_table(self, h3_table):
+        """top_cells should return empty list for empty table."""
+        info = catalog_info(h3_table)
+        top = info.top_cells(h3_table, limit=5)
+        assert top == []
+
+    def test_top_cells_caches_results(self, tmp_path):
+        """top_cells should cache results to avoid repeated scans."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
+        info = catalog_info(tbl)
+
+        # First call
+        top1 = info.top_cells(tbl, limit=5)
+        # Second call should use cache
+        top2 = info.top_cells(tbl, limit=5)
+
+        assert top1 == top2
+        # Cache should be set
+        assert info._cached_top_cells is not None
+
+    def test_top_cells_respects_limit(self, tmp_path):
+        """top_cells should respect the limit parameter."""
+        tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022, 2023, 2024])
+        info = catalog_info(tbl)
+
+        top3 = info.top_cells(tbl, limit=3)
+        top10 = info.top_cells(tbl, limit=10)
+
+        assert len(top3) <= 3
+        # top10 should have at least as many as top3
+        assert len(top10) >= len(top3)

@@ -880,29 +880,30 @@ def _update_hash_index_from_parquets(
     new_parquet_paths: list[str],
     hash_index_path: str,
     warehouse_root: str,
+    store: object | None = None,
 ) -> None:
     """
     Read ``id`` column from newly registered parquet files, hash each ID,
     merge into the existing hash index, and write back.
 
-    For S3 warehouse paths a bucket-level store is opened from the
-    warehouse_root URI.  For local paths no store is needed.
+    When *store* is ``None`` (default), falls back to the global
+    :mod:`earthcatalog.core.store_config` — this path is deprecated.
     """
     from earthcatalog.core.hash_index import merge_hashes_from_parquets, read_hashes, write_hashes
+
+    if store is None:
+        from earthcatalog.core import store_config
+
+        store = store_config.get_store()
 
     is_s3 = hash_index_path.startswith("s3://")
 
     if is_s3:
         no_scheme = hash_index_path.removeprefix("s3://")
         hash_bucket, hash_key = no_scheme.split("/", 1)
-        from earthcatalog.core import store_config
-
-        hash_store = store_config.get_store()
         print(f"Reading existing hash index: {hash_index_path}")
-        existing = read_hashes(hash_store, hash_key)
+        existing = read_hashes(store, hash_key)
     else:
-        from pathlib import Path
-
         import pyarrow.parquet as pq
 
         from earthcatalog.core.hash_index import _BATCH_SIZE
@@ -916,31 +917,18 @@ def _update_hash_index_from_parquets(
 
     print(f"  Existing hashes: {len(existing):,}")
 
-    # For S3 warehouse paths, we need a store that can read the new parquets.
-    # They live in the same bucket as the warehouse.
-    warehouse_store: object | None = None
-    if warehouse_root.startswith("s3://"):
-        from earthcatalog.core import store_config
-
-        warehouse_store = store_config.get_store()
-
-    updated, n_new = merge_hashes_from_parquets(new_parquet_paths, existing, store=warehouse_store)
+    updated, n_new = merge_hashes_from_parquets(new_parquet_paths, existing, store=store)
     print(f"  New hashes from {len(new_parquet_paths):,} parquet files: {n_new:,}")
 
     if is_s3:
-        total = write_hashes(updated, hash_store, hash_key)
+        total = write_hashes(updated, store, hash_key)
         print(f"  Written: {hash_index_path} ({total:,} total hashes)")
     else:
-        import io as _io
-
-        import pyarrow as pa
-        import pyarrow.parquet as _pq
-
         sorted_hashes = sorted(updated)
         arr = pa.array(sorted_hashes, type=pa.binary(16))
         tbl = pa.table({"id_hash": arr})
-        buf = _io.BytesIO()
-        _pq.write_table(tbl, buf, compression="zstd")
+        buf = io.BytesIO()
+        pq.write_table(tbl, buf, compression="zstd")
         Path(hash_index_path).write_bytes(buf.getvalue())
         print(f"  Written: {hash_index_path} ({len(sorted_hashes):,} total hashes)")
 
