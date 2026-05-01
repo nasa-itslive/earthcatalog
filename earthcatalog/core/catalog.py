@@ -6,6 +6,7 @@ a job starts).  All table writes go through PyIceberg so every Parquet file
 is properly registered, schema-validated, and partition-tracked.
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import obstore
@@ -173,6 +174,8 @@ def open(
             if skip_sig in (True, "true"):
                 anonymous = True
 
+    catalog_key: str | None = None
+
     if using_legacy_api:
         # Legacy API - return SqlCatalog directly
         _db_path = db_path
@@ -244,7 +247,13 @@ def open(
     if using_new_api:
         table = get_or_create(sql_catalog)
         info_obj = info(table)
-        return EarthCatalog(catalog=sql_catalog, table=table, info=info_obj, store=store)
+        return EarthCatalog(
+            catalog=sql_catalog,
+            table=table,
+            info=info_obj,
+            store=store,
+            catalog_key=catalog_key,
+        )
 
     return sql_catalog
 
@@ -351,6 +360,56 @@ def info(table) -> object:
     from .catalog_info import catalog_info
 
     return catalog_info(table)
+
+
+def ingest(
+    inventory_path: str,
+    *,
+    store: object | None = None,
+    base: str | None = None,
+    mode: str = "auto",
+    chunk_size: int = 10000,
+    limit: int | None = None,
+    since: datetime | None = None,
+    update_hash_index: bool = False,
+) -> dict:
+    """Open an EarthCatalog and ingest STAC items from an inventory.
+
+    Convenience wrapper around ``EarthCatalog.ingest()`` for callers that
+    only have a store and base path.
+
+    Parameters
+    ----------
+    inventory_path:
+        Path or ``s3://`` URI to an S3 Inventory file.
+    store:
+        An obstore-compatible store (``S3Store``, ``LocalStore``, etc.).
+    base:
+        Base path containing ``earthcatalog.db`` and ``warehouse/``.
+    mode:
+        ``"auto"``, ``"full"``, or ``"delta"``.  See ``EarthCatalog.ingest``.
+    chunk_size:
+        Items per fetch batch.
+    limit:
+        Max items to process.
+    since:
+        Only process items modified after this datetime.
+    update_hash_index:
+        Update the warehouse hash index after ingest.
+
+    Returns
+    -------
+    dict with keys ``items_processed``, ``rows_written``, ``files_registered``.
+    """
+    ec = open(store=store, base=base)
+    return ec.ingest(
+        inventory_path=inventory_path,
+        mode=mode,
+        chunk_size=chunk_size,
+        limit=limit,
+        since=since,
+        update_hash_index=update_hash_index,
+    )
 
 
 # Backward-compatible aliases.

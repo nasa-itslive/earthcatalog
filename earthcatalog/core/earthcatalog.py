@@ -38,7 +38,13 @@ class EarthCatalog:
     """
 
     def __init__(
-        self, catalog: object, table: Table, info: CatalogInfo, store: object | None = None
+        self,
+        catalog: object,
+        table: Table,
+        info: CatalogInfo,
+        store: object | None = None,
+        *,
+        catalog_key: str | None = None,
     ):
         """Initialize an EarthCatalog facade.
 
@@ -47,11 +53,14 @@ class EarthCatalog:
             table: PyIceberg Table instance
             info: CatalogInfo with grid metadata
             store: obstore Store instance (for reading hash index from S3)
+            catalog_key: Key within *store* where catalog.db is persisted.
+                         Required for ingest() which needs to upload changes.
         """
         self._catalog = catalog
         self._table = table
         self._info = info
         self._store = store
+        self._catalog_key = catalog_key
 
     def search_files(
         self,
@@ -121,6 +130,223 @@ class EarthCatalog:
                 default_hash_index_path = warehouse.rstrip("/") + "_id_hashes.parquet"
 
         return self._info.unique_item_count(self._table, self._store, default_hash_index_path)
+
+    def ingest(
+        self,
+        inventory_path: str,
+        *,
+        mode: str = "auto",
+        chunk_size: int = 10000,
+        limit: int | None = None,
+        since: datetime | None = None,
+        update_hash_index: bool = False,
+    ) -> dict:
+        """Ingest STAC items from an S3 Inventory into the catalog.
+
+        Unified entry point replacing both ``backfill.run_backfill`` and
+        ``incremental.run``.  Handles full backfill (drop+recreate table)
+        and delta append (add files to existing table).
+
+        The caller is responsible for holding an S3Lock around this call
+        when running against a shared store (use ``self.lock()``).
+
+        Parameters
+        ----------
+        inventory_path:
+            Path or ``s3://`` URI to an S3 Inventory file (CSV, Parquet,
+            or ``manifest.json``).
+        mode:
+            ``"auto"``  — delta if the table already has data, else full.
+            ``"full"``  — drop+recreate Iceberg table, start fresh.
+            ``"delta"`` — append new files to the existing table.
+        chunk_size:
+            Items per fetch batch.  Each batch is fetched from S3 in
+            parallel, fanned out through the grid partitioner, written
+            as GeoParquet files, and registered with Iceberg.
+        limit:
+            Stop after processing this many STAC items (for testing).
+        since:
+            Only process inventory rows whose ``last_modified_date`` is
+            >= this datetime (timezone-aware UTC).
+        update_hash_index:
+            When True, read the ``id`` column from newly registered
+            warehouse parquet files, hash each ID, and merge into the
+            warehouse hash index (``*_id_hashes.parquet``).
+
+        Returns
+        -------
+        dict with keys ``items_processed``, ``rows_written``, and
+        ``files_registered``.
+
+        Example
+        -------
+        ::
+
+            store = S3Store(bucket="its-live-data", region="us-west-2")
+            ec = catalog.open(store=store, base="s3://my-bucket/catalog")
+            ec.ingest("s3://bucket/inventory/delta.parquet", mode="delta")
+        """
+        import uuid
+        from concurrent.futures import ThreadPoolExecutor
+
+        from earthcatalog.core.hash_index import (
+            merge_hashes_from_parquets,
+            read_hashes,
+            write_hashes,
+        )
+        from earthcatalog.core.transform import (
+            fan_out,
+            group_by_partition,
+            write_geoparquet_s3,
+        )
+        from earthcatalog.grids import build_partitioner
+        from earthcatalog.pipelines.incremental import _fetch_item, _iter_inventory
+
+        # --- resolve mode ---
+        if mode == "auto":
+            try:
+                n = sum(s["row_count"] for s in self._info.stats(self._table))
+                mode = "delta" if n > 0 else "full"
+            except Exception:
+                mode = "full"
+
+        is_delta = mode == "delta"
+
+        # --- build partitioner from table properties ---
+        from earthcatalog.config import GridConfig
+
+        grid_cfg = GridConfig(
+            type=self._info.grid_type,
+            resolution=self._info.grid_resolution,
+            boundaries_path=self._info.boundaries_path,
+            id_field=self._info.id_field,
+        )
+        partitioner = build_partitioner(grid_cfg)
+
+        # --- paths ---
+        warehouse_root = self._catalog.properties.get("warehouse", "")
+        uri = self._catalog.properties.get("uri", "")
+        local_db = uri.removeprefix("sqlite:///") if uri else "/tmp/earthcatalog.db"
+
+        if self._store and self._catalog_key:
+            self.download_catalog(local_db)
+
+        # ----------------------------------------------------------------
+        # Full mode: drop + recreate table
+        # ----------------------------------------------------------------
+        if not is_delta:
+            from pyiceberg.exceptions import NoSuchTableError
+
+            from earthcatalog.core.catalog import (
+                FULL_NAME,
+                NAMESPACE,
+                get_or_create,
+            )
+
+            try:
+                self._catalog.drop_table(FULL_NAME)
+            except NoSuchTableError:
+                pass
+            try:
+                self._catalog.create_namespace(NAMESPACE)
+            except Exception:
+                pass
+            self._table = get_or_create(self._catalog, grid_config=grid_cfg)
+
+        # ----------------------------------------------------------------
+        # Ingest loop
+        # ----------------------------------------------------------------
+        total_items = 0
+        total_rows = 0
+        written_keys: list[str] = []
+        batch: list[tuple[str, str]] = []
+
+        def _flush(chunk: list[tuple[str, str]]) -> None:
+            nonlocal total_rows
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                items = list(filter(None, pool.map(lambda bc: _fetch_item(*bc), chunk)))
+
+            if not items:
+                return
+
+            fo = fan_out(items, partitioner)
+            if not fo:
+                return
+
+            for (cell, year), group_items in group_by_partition(fo).items():
+                year_str = str(year) if year is not None else "unknown"
+                part_tag = uuid.uuid4().hex[:8]
+                s3_key = f"grid_partition={cell}/year={year_str}/part_{part_tag}.parquet"
+                n, _ = write_geoparquet_s3(group_items, self._store, s3_key)
+                if n > 0:
+                    written_keys.append(s3_key)
+                    total_rows += n
+
+        print(f"Ingesting from: {inventory_path}")
+        for bucket, key in _iter_inventory(inventory_path, since=since):
+            if not key.endswith(".stac.json"):
+                continue
+            batch.append((bucket, key))
+            total_items += 1
+            if len(batch) >= chunk_size:
+                _flush(batch)
+                batch.clear()
+            if limit and total_items >= limit:
+                break
+
+        if batch:
+            _flush(batch)
+
+        # ----------------------------------------------------------------
+        # Register with Iceberg
+        # ----------------------------------------------------------------
+        if written_keys:
+            full_paths = [f"{warehouse_root.rstrip('/')}/{k}" for k in written_keys]
+            batch_sz = 2000
+            for i in range(0, len(full_paths), batch_sz):
+                self._table.add_files(full_paths[i : i + batch_sz])
+            print(f"Registered {len(full_paths)} files in Iceberg catalog.")
+
+        # ----------------------------------------------------------------
+        # Hash index update
+        # ----------------------------------------------------------------
+        if update_hash_index and written_keys:
+            hash_index_path = self._table.properties.get("earthcatalog.hash_index_path")
+            if not hash_index_path:
+                hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
+                with self._table.transaction() as tx:
+                    tx.set_properties(**{"earthcatalog.hash_index_path": hash_index_path})
+
+            if hash_index_path.startswith("s3://"):
+                import re as _re
+
+                m = _re.match(r"s3://([^/]+)/(.+)", hash_index_path)
+                if m:
+                    hash_key = m.group(2)
+                    existing = read_hashes(self._store, hash_key)
+                    print(f"  Existing hashes: {len(existing):,}")
+                    updated, n_new = merge_hashes_from_parquets(
+                        full_paths, existing, store=self._store
+                    )
+                    print(f"  New hashes: {n_new:,} from {len(full_paths)} files")
+                    write_hashes(updated, self._store, hash_key)
+            else:
+                print("WARN: hash index update skipped — only s3:// paths supported")
+
+        # ----------------------------------------------------------------
+        # Upload catalog
+        # ----------------------------------------------------------------
+        if self._store and self._catalog_key:
+            self.upload_catalog(local_db)
+
+        result = {
+            "items_processed": total_items,
+            "rows_written": total_rows,
+            "files_registered": len(written_keys),
+        }
+        print(f"Done. {total_items} items → {total_rows} rows in {len(written_keys)} files")
+        return result
 
     # ------------------------------------------------------------------
     # Catalog lifecycle helpers (use EarthCatalog's store, not globals)
