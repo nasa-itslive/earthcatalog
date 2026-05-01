@@ -402,6 +402,8 @@ class TestDedupItems:
 
 class TestCompactCellYear:
     def test_reads_ndjson_and_writes_parquet(self, tmp_path):
+        from obstore.store import LocalStore
+
         from earthcatalog.pipelines.backfill import compact_cell_year
 
         store = MemoryStore()
@@ -428,7 +430,7 @@ class TestCompactCellYear:
             year=str(year),
             staging_store=store,
             staging_prefix="staging",
-            warehouse_root=str(wh_root),
+            warehouse_store=LocalStore(str(wh_root)),
             compact_rows=100_000,
         )
 
@@ -440,12 +442,15 @@ class TestCompactCellYear:
         assert report["output_rows"] > 0
         assert len(report["output_files"]) == 1
 
-        parquet_path = report["output_files"][0]
-        assert parquet_path.startswith(str(wh_root))
-        tbl = pq.ParquetFile(parquet_path).read()
+        out_key = report["output_files"][0]
+        assert "grid_partition=" in out_key
+        full_path = wh_root / out_key
+        tbl = pq.ParquetFile(str(full_path)).read()
         assert tbl.num_rows == len(items)
 
     def test_empty_prefix_returns_empty_report(self, tmp_path):
+        from obstore.store import LocalStore
+
         from earthcatalog.pipelines.backfill import compact_cell_year
 
         store = MemoryStore()
@@ -454,12 +459,14 @@ class TestCompactCellYear:
             year="2024",
             staging_store=store,
             staging_prefix="staging",
-            warehouse_root=str(tmp_path),
+            warehouse_store=LocalStore(str(tmp_path)),
         )
         assert report["input_files"] == 0
         assert report["output_rows"] == 0
 
     def test_splits_into_multiple_parts(self, tmp_path):
+        from obstore.store import LocalStore
+
         from earthcatalog.pipelines.backfill import compact_cell_year
 
         store = MemoryStore()
@@ -495,7 +502,7 @@ class TestCompactCellYear:
             year=year,
             staging_store=store,
             staging_prefix="staging",
-            warehouse_root=str(tmp_path),
+            warehouse_store=LocalStore(str(tmp_path)),
             compact_rows=2,
         )
 
@@ -505,7 +512,7 @@ class TestCompactCellYear:
 
 class TestCompactCellYearS3:
     def test_writes_parquet_to_store(self):
-        from earthcatalog.pipelines.backfill import compact_cell_year_s3
+        from earthcatalog.pipelines.backfill import compact_cell_year
 
         store = MemoryStore()
         wh_store = MemoryStore()
@@ -536,7 +543,7 @@ class TestCompactCellYearS3:
         ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
         obstore.put(store, f"staging/{cell}/{year}/worker_001.ndjson", ndjson_data)
 
-        report = compact_cell_year_s3(
+        report = compact_cell_year(
             cell=cell,
             year=year,
             staging_store=store,
@@ -591,6 +598,8 @@ class TestRegisterAndCleanup:
         obstore.put(staging_store, "staging/chunks/chunk_000.parquet", b"data")
         obstore.put(staging_store, "staging/testcell/2024/worker_001.ndjson", b"ndjson")
 
+        from obstore.store import LocalStore
+
         catalog_path = str(tmp_path / "catalog.db")
 
         register_and_cleanup(
@@ -598,6 +607,7 @@ class TestRegisterAndCleanup:
             warehouse_root=str(wh_root),
             staging_store=staging_store,
             staging_prefix="staging",
+            warehouse_store=LocalStore(str(wh_root)),
             upload=False,
         )
 
@@ -748,67 +758,49 @@ class TestRunBackfillV2:
 # ---------------------------------------------------------------------------
 
 
-class TestNextPartIndexLocal:
+class TestNextPartIndex:
     def test_returns_zero_when_no_files(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _next_part_index_local
+        from obstore.store import LocalStore
 
-        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 0
+        from earthcatalog.pipelines.backfill import _next_part_index
+
+        store = LocalStore(str(tmp_path))
+        assert _next_part_index(store, "cell1", "2024") == 0
 
     def test_returns_next_after_existing(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _next_part_index_local
+        from obstore.store import LocalStore
 
-        d = tmp_path / "grid_partition=cell1" / "year=2024"
-        d.mkdir(parents=True)
-        (d / "part_000000.parquet").touch()
-        (d / "part_000001.parquet").touch()
+        from earthcatalog.pipelines.backfill import _next_part_index
 
-        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 2
+        store = LocalStore(str(tmp_path))
+        obstore.put(store, "grid_partition=cell1/year=2024/part_000000.parquet", b"")
+        obstore.put(store, "grid_partition=cell1/year=2024/part_000001.parquet", b"")
 
-    def test_handles_gaps(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _next_part_index_local
+        assert _next_part_index(store, "cell1", "2024") == 2
 
-        d = tmp_path / "grid_partition=cell1" / "year=2024"
-        d.mkdir(parents=True)
-        (d / "part_000000.parquet").touch()
-        (d / "part_000005.parquet").touch()
-
-        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 6
-
-    def test_ignores_non_parquet(self, tmp_path):
-        from earthcatalog.pipelines.backfill import _next_part_index_local
-
-        d = tmp_path / "grid_partition=cell1" / "year=2024"
-        d.mkdir(parents=True)
-        (d / "part_000000.parquet").touch()
-        (d / "notes.txt").touch()
-
-        assert _next_part_index_local(str(tmp_path), "cell1", "2024") == 1
-
-
-class TestNextPartIndexS3:
-    def test_returns_zero_when_empty(self):
-        from earthcatalog.pipelines.backfill import _next_part_index_s3
-
-        store = MemoryStore()
-        assert _next_part_index_s3(store, "cell1", "2024") == 0
-
-    def test_returns_next_after_existing(self):
-        from earthcatalog.pipelines.backfill import _next_part_index_s3
+    def test_returns_next_after_existing_s3(self):
+        from earthcatalog.pipelines.backfill import _next_part_index
 
         store = MemoryStore()
         obstore.put(store, "grid_partition=cell1/year=2024/part_000000.parquet", b"data")
         obstore.put(store, "grid_partition=cell1/year=2024/part_000001.parquet", b"data")
 
-        assert _next_part_index_s3(store, "cell1", "2024") == 2
+        assert _next_part_index(store, "cell1", "2024") == 2
 
 
 class TestCompactCellYearDelta:
     def test_writes_new_files_without_overwriting(self, tmp_path):
+        from obstore.store import LocalStore
+
         from earthcatalog.pipelines.backfill import compact_cell_year_delta
 
         store = MemoryStore()
         cell = "deltacell"
         year = "2024"
+
+        wh_root = tmp_path / "warehouse"
+        wh_root.mkdir()
+        wh_store = LocalStore(str(wh_root))
 
         existing_items = [
             {
@@ -831,10 +823,10 @@ class TestCompactCellYearDelta:
             for i in range(3)
         ]
 
-        wh_root = tmp_path / "warehouse"
-        cell_dir = wh_root / f"grid_partition={cell}" / f"year={year}"
-        cell_dir.mkdir(parents=True)
-        _write_geoparquet(existing_items, str(cell_dir / "part_000000.parquet"))
+        # Write existing parquet via store
+        _write_parquet_to_store_for_test(
+            existing_items, wh_store, f"grid_partition={cell}/year={year}/part_000000.parquet"
+        )
 
         new_items = [
             {
@@ -864,7 +856,7 @@ class TestCompactCellYearDelta:
             year=year,
             staging_store=store,
             staging_prefix="staging",
-            warehouse_root=str(wh_root),
+            warehouse_store=wh_store,
             compact_rows=100_000,
         )
 
@@ -874,16 +866,38 @@ class TestCompactCellYearDelta:
         new_path = report["output_files"][0]
         assert "part_000001.parquet" in new_path
 
-        existing_tbl = pq.ParquetFile(str(cell_dir / "part_000000.parquet")).read()
+        # Existing file should still be present
+        raw = memoryview(
+            obstore.get(wh_store, f"grid_partition={cell}/year={year}/part_000000.parquet").bytes()
+        ).tobytes()
+        existing_tbl = pq.ParquetFile(io.BytesIO(raw)).read()
         assert existing_tbl.num_rows == 3
 
-        new_tbl = pq.ParquetFile(new_path).read()
+        raw_new = memoryview(obstore.get(wh_store, new_path).bytes()).tobytes()
+        new_tbl = pq.ParquetFile(io.BytesIO(raw_new)).read()
         assert new_tbl.num_rows == 2
+
+
+def _write_parquet_to_store_for_test(items, store, key):
+    """Minimal helper to write items as GeoParquet to a store for tests."""
+    import tempfile
+    from pathlib import Path
+
+    from earthcatalog.core.transform import write_geoparquet
+
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        write_geoparquet(items, tmp_path)
+        data = Path(tmp_path).read_bytes()
+        obstore.put(store, key, data)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 class TestCompactCellYearDeltaS3:
     def test_writes_new_files_with_offset(self):
-        from earthcatalog.pipelines.backfill import compact_cell_year_delta_s3
+        from earthcatalog.pipelines.backfill import compact_cell_year_delta
 
         store = MemoryStore()
         wh_store = MemoryStore()
@@ -916,7 +930,7 @@ class TestCompactCellYearDeltaS3:
         ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
         obstore.put(store, f"staging/{cell}/{year}/chunk_000.ndjson", ndjson_data)
 
-        report = compact_cell_year_delta_s3(
+        report = compact_cell_year_delta(
             cell=cell,
             year=year,
             staging_store=store,

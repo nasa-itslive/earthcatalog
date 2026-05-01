@@ -15,7 +15,8 @@
 - Hash index update, inventory reading, rustac GeoParquet writing all preserved
 - 309 tests pass
 
-## Next
-- Phase D: Deduplicate `_h3_boundary_cells` and hash index update code
-- Phase C: Abstract storage I/O (eliminate local/S3 pairs)
-- Verify all tests pass
+## Remaining
+- Phase C: Abstract storage I/O (eliminate local/S3 pairs in backfill.py)
+- Phase E: Remove dead code / archive one-off scripts  
+- Phase F: Adopt shared test fixtures across test files (deferred — low impact)
+- Phase G: Documentation update

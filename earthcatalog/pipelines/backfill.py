@@ -609,38 +609,27 @@ def _stream_compact(
     }
 
 
+def _write_parquet_to_store(batch: list[dict], store: object, key: str) -> int:
+    """Write a single-partition item batch as GeoParquet to *store* at *key*.
+
+    Writes to a temporary file via :func:`~earthcatalog.core.transform.write_geoparquet`,
+    then uploads the bytes through obstore.  The temp file is always cleaned up.
+    """
+    if not batch:
+        return 0
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        n = _write_geoparquet(batch, tmp_path)
+        if n > 0:
+            data = Path(tmp_path).read_bytes()
+            obstore.put(store, key, data)
+        return n
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 def compact_cell_year(
-    cell: str,
-    year: str,
-    staging_store: object,
-    staging_prefix: str,
-    warehouse_root: str,
-    compact_rows: int = 100_000,
-) -> dict[str, Any]:
-    """Phase 3 worker (local filesystem): stream NDJSON → write GeoParquet."""
-    prefix = f"{staging_prefix}/{cell}/{year}/"
-    ndjson_keys = _scan_ndjson(staging_store, prefix)
-
-    if not ndjson_keys:
-        return _empty_compact_report(cell, year)
-
-    def _write_local(batch: list[dict], rel_path: str) -> int:
-        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        full = str(out_dir / rel_path)
-        n = _write_geoparquet(batch, full)
-        return n if n <= 0 else n
-
-    def _out_key(idx: int) -> str:
-        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
-        return str(out_dir / f"part_{idx:06d}.parquet")
-
-    return _stream_compact(
-        cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key
-    )
-
-
-def compact_cell_year_s3(
     cell: str,
     year: str,
     staging_store: object,
@@ -648,30 +637,23 @@ def compact_cell_year_s3(
     warehouse_store: object,
     compact_rows: int = 100_000,
 ) -> dict[str, Any]:
-    """Phase 3 worker (S3): stream NDJSON → write GeoParquet to S3."""
+    """Phase 3 worker: stream NDJSON → write GeoParquet to *warehouse_store*."""
     prefix = f"{staging_prefix}/{cell}/{year}/"
     ndjson_keys = _scan_ndjson(staging_store, prefix)
 
     if not ndjson_keys:
         return _empty_compact_report(cell, year)
 
-    def _write_s3(batch: list[dict], out_path: str) -> int:
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            n = _write_geoparquet(batch, tmp_path)
-            if n > 0:
-                data = Path(tmp_path).read_bytes()
-                obstore.put(warehouse_store, out_path, data)
-            return n
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+    key_prefix = f"grid_partition={cell}/year={year}"
+
+    def _write_fn(batch: list[dict], key: str) -> int:
+        return _write_parquet_to_store(batch, warehouse_store, key)
 
     def _out_key(idx: int) -> str:
-        return f"grid_partition={cell}/year={year}/part_{idx:06d}.parquet"
+        return f"{key_prefix}/part_{idx:06d}.parquet"
 
     return _stream_compact(
-        cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_fn, _out_key
     )
 
 
@@ -687,22 +669,12 @@ def _empty_compact_report(cell: str, year: str) -> dict[str, Any]:
     }
 
 
-def _next_part_index_local(warehouse_root: str, cell: str, year: str) -> int:
-    part_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
-    if not part_dir.exists():
-        return 0
-    import re
+def _next_part_index(warehouse_store: object, cell: str, year: str) -> int:
+    """Return the next available part index for a (cell, year) partition.
 
-    pattern = re.compile(r"part_(\d+)\.parquet$")
-    indices = []
-    for f in part_dir.iterdir():
-        m = pattern.match(f.name)
-        if m:
-            indices.append(int(m.group(1)))
-    return (max(indices) + 1) if indices else 0
-
-
-def _next_part_index_s3(warehouse_store: object, cell: str, year: str) -> int:
+    Scans the store for existing ``part_NNNNNN.parquet`` files and returns
+    ``max(N) + 1`` (or 0 if none exist).
+    """
     import re
 
     prefix = f"grid_partition={cell}/year={year}/"
@@ -722,68 +694,27 @@ def compact_cell_year_delta(
     year: str,
     staging_store: object,
     staging_prefix: str,
-    warehouse_root: str,
-    compact_rows: int = 100_000,
-) -> dict[str, Any]:
-    """Phase 3 delta worker (local): compact NDJSON → new GeoParquet (no overwrite)."""
-    prefix = f"{staging_prefix}/{cell}/{year}/"
-    ndjson_keys = _scan_ndjson(staging_store, prefix)
-
-    if not ndjson_keys:
-        return _empty_compact_report(cell, year)
-
-    start_idx = _next_part_index_local(warehouse_root, cell, year)
-
-    def _write_local(batch: list[dict], rel_path: str) -> int:
-        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        full = str(out_dir / rel_path)
-        n = _write_geoparquet(batch, full)
-        return n if n <= 0 else n
-
-    def _out_key(idx: int) -> str:
-        out_dir = Path(warehouse_root) / f"grid_partition={cell}" / f"year={year}"
-        return str(out_dir / f"part_{start_idx + idx:06d}.parquet")
-
-    return _stream_compact(
-        cell, year, staging_store, ndjson_keys, compact_rows, _write_local, _out_key
-    )
-
-
-def compact_cell_year_delta_s3(
-    cell: str,
-    year: str,
-    staging_store: object,
-    staging_prefix: str,
     warehouse_store: object,
     compact_rows: int = 100_000,
 ) -> dict[str, Any]:
-    """Phase 3 delta worker (S3): compact NDJSON → new GeoParquet (no overwrite)."""
+    """Phase 3 delta worker: compact NDJSON → new GeoParquet (no overwrite)."""
     prefix = f"{staging_prefix}/{cell}/{year}/"
     ndjson_keys = _scan_ndjson(staging_store, prefix)
 
     if not ndjson_keys:
         return _empty_compact_report(cell, year)
 
-    start_idx = _next_part_index_s3(warehouse_store, cell, year)
+    start_idx = _next_part_index(warehouse_store, cell, year)
+    key_prefix = f"grid_partition={cell}/year={year}"
 
-    def _write_s3(batch: list[dict], out_path: str) -> int:
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            n = _write_geoparquet(batch, tmp_path)
-            if n > 0:
-                data = Path(tmp_path).read_bytes()
-                obstore.put(warehouse_store, out_path, data)
-            return n
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+    def _write_fn(batch: list[dict], key: str) -> int:
+        return _write_parquet_to_store(batch, warehouse_store, key)
 
     def _out_key(idx: int) -> str:
-        return f"grid_partition={cell}/year={year}/part_{start_idx + idx:06d}.parquet"
+        return f"{key_prefix}/part_{start_idx + idx:06d}.parquet"
 
     return _stream_compact(
-        cell, year, staging_store, ndjson_keys, compact_rows, _write_s3, _out_key
+        cell, year, staging_store, ndjson_keys, compact_rows, _write_fn, _out_key
     )
 
 
@@ -792,11 +723,44 @@ def compact_cell_year_delta_s3(
 # ---------------------------------------------------------------------------
 
 
+def _list_warehouse_keys(
+    warehouse_store: object,
+    warehouse_root: str,
+) -> list[str]:
+    """List all hive-style GeoParquet keys in *warehouse_store*.
+
+    Returns full paths suitable for ``table.add_files()`` by prepending
+    *warehouse_root* to each relative store key.
+    """
+    import re
+
+    hive_re = re.compile(
+        r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+    )
+    root = warehouse_root.rstrip("/")
+
+    # For S3 stores the list prefix is the warehouse path within the bucket.
+    # For LocalStore the store is already scoped to the warehouse root.
+    prefix = ""
+    if warehouse_root.startswith("s3://"):
+        _bucket, _, path = warehouse_root.removeprefix("s3://").partition("/")
+        prefix = path.rstrip("/") + "/"
+
+    paths: list[str] = []
+    for batch in obstore.list(warehouse_store, prefix=prefix):
+        for obj in batch:
+            k: str = obj["path"]
+            if k.endswith(".parquet") and hive_re.search(k):
+                paths.append(f"{root}/{k}")
+    return paths
+
+
 def register_and_cleanup(
     catalog_path: str,
     warehouse_root: str,
     staging_store: object,
     staging_prefix: str,
+    warehouse_store: object | None = None,
     upload: bool = True,
     h3_resolution: int | None = None,
     hash_index_path: str | None = None,
@@ -811,9 +775,10 @@ def register_and_cleanup(
     5. Delete all staging files.
 
     ``hash_index_path`` defaults to ``{warehouse_root}_id_hashes.parquet``.
-    """
-    import re
 
+    When *warehouse_store* is provided it is used for store-based listing
+    instead of local filesystem glob (which was the pre-Phase-C fallback).
+    """
     from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
     from earthcatalog.core.catalog import FULL_NAME, ICEBERG_SCHEMA, NAMESPACE, PARTITION_SPEC
@@ -845,24 +810,20 @@ def register_and_cleanup(
         properties=props,
     )
 
-    hive_re = re.compile(
-        r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
-    )
-
-    all_paths: list[str] = []
-    if warehouse_root.startswith("s3://"):
-        no_scheme = warehouse_root.removeprefix("s3://")
-        _bucket, prefix = no_scheme.split("/", 1)
-        for batch in obstore.list(staging_store, prefix=prefix):
-            for obj in batch:
-                k: str = obj["path"]
-                if k.endswith(".parquet") and hive_re.search(k):
-                    all_paths.append(f"s3://{_bucket}/{k}")
+    if warehouse_store is not None:
+        all_paths = _list_warehouse_keys(warehouse_store, warehouse_root)
     else:
-        for f in Path(warehouse_root).glob("**/*.parquet"):
-            rel = f.relative_to(warehouse_root)
-            if hive_re.search(str(rel)):
-                all_paths.append(str(f))
+        # Fallback: local filesystem glob (legacy path)
+        import re as _re
+
+        all_paths = [
+            str(f)
+            for f in Path(warehouse_root).glob("**/*.parquet")
+            if _re.search(
+                r"grid_partition=[^/]+/year=[^/]+/[^/]+\.parquet$",
+                str(f.relative_to(warehouse_root)),
+            )
+        ]
 
     if all_paths:
         batch_size = 2000
@@ -1300,27 +1261,19 @@ def run_backfill(
         if not buckets:
             print("No NDJSON groups to compact.")
         else:
-            is_s3 = warehouse_root.startswith("s3://")
-            if delta:
-                compact_fn = compact_cell_year_delta_s3 if is_s3 else compact_cell_year_delta
-            else:
-                compact_fn = compact_cell_year_s3 if is_s3 else compact_cell_year
+            compact_fn = compact_cell_year_delta if delta else compact_cell_year
             bucket_list = list(buckets.keys())
+            common_kwargs: dict[str, Any] = {
+                "staging_store": staging_store,
+                "staging_prefix": f"{staging_prefix}/staging",
+                "compact_rows": compact_rows,
+                "warehouse_store": warehouse_store,
+            }
 
             print(f"Submitting {len(bucket_list)} compact tasks …")
 
             if client is not None:
                 from dask.distributed import as_completed as distributed_ac
-
-                common_kwargs: dict[str, Any] = {
-                    "staging_store": staging_store,
-                    "staging_prefix": f"{staging_prefix}/staging",
-                    "compact_rows": compact_rows,
-                }
-                if is_s3:
-                    common_kwargs["warehouse_store"] = warehouse_store
-                else:
-                    common_kwargs["warehouse_root"] = warehouse_root
 
                 def _compact_task(cell_year):
                     cell, year = cell_year
@@ -1341,14 +1294,8 @@ def run_backfill(
                     kwargs = {
                         "cell": cell,
                         "year": year,
-                        "staging_store": staging_store,
-                        "staging_prefix": f"{staging_prefix}/staging",
-                        "compact_rows": compact_rows,
+                        **common_kwargs,
                     }
-                    if is_s3:
-                        kwargs["warehouse_store"] = warehouse_store
-                    else:
-                        kwargs["warehouse_root"] = warehouse_root
                     compact_results.append(compact_fn(**kwargs))
 
             total_input = sum(r["input_items"] for r in compact_results)
@@ -1389,6 +1336,7 @@ def run_backfill(
                 warehouse_root=warehouse_root,
                 staging_store=staging_store,
                 staging_prefix=staging_prefix,
+                warehouse_store=warehouse_store,
                 h3_resolution=resolved_resolution,
                 upload=upload,
                 hash_index_path=hash_index_path,
