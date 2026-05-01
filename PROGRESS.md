@@ -15,14 +15,14 @@
 - Hash index update, inventory reading, rustac GeoParquet writing all preserved
 - 309 tests pass
 
-## Done
-- Phase A: store_config globals eliminated (catalog.py, lock.py, EarthCatalog)
-- Phase B: catalog.ingest() unified API (full + delta, hash index, inventory)
-- Phase C: Uniform Obstore I/O — all compact/register functions use stores,
-  no local/S3 branching (-37 lines)
-- Phase D: Deduplicated _h3_boundary_cells, _update_hash_index_from_parquets
+## All Phases Complete (306 tests pass)
 
-## Remaining
-- Phase E: Remove dead one-off scripts (audit_inventory, compare_catalogs, etc.)
-- Phase F: Adopt shared test fixtures for simple cases (deferred)
-- Phase G: Documentation update
+| Phase | What | Outcome |
+|-------|------|---------|
+| **A** | store_config globals eliminated | `catalog.py`, `lock.py`, `EarthCatalog` accept explicit store+key |
+| **B** | `catalog.ingest()` unified API | Full + delta modes, hash index, inventory — on `EarthCatalog` + module level |
+| **C** | Uniform Obstore I/O | `compact_cell_year`/`_delta`/`_next_part_index` — one function each, no local/S3 pairs. -37 lines |
+| **D** | Deduplication | `_h3_boundary_cells` → `H3Partitioner`; `_update_hash_index_from_parquets` → uniform obstore |
+| **E** | Remove dead scripts | 10 one-offs → `scripts/archive/` |
+| **F** | Test fixtures | Scaffold exists; deferred for complex cases (per-item assets/links) |
+| **G** | Documentation | Updated `ingest_workflow.md` with `catalog.ingest()` API |

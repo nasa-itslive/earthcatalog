@@ -6,7 +6,6 @@ Get earthcatalog up and running in five minutes.
 
 ## Prerequisites
 
-- [mamba](https://mamba.readthedocs.io/) (or conda) for environment management
 - Python 3.12+
 - AWS credentials (only needed to write to a private S3 bucket; reading ITS_LIVE data is public)
 
@@ -15,114 +14,152 @@ Get earthcatalog up and running in five minutes.
 ## 1. Install
 
 ```bash
-# Create the conda environment
-mamba env create -f environment.yml
-mamba activate itslive-ingest
-
-# Install earthcatalog in editable mode
-pip install -e .
+pip install earthcatalog
 ```
 
-Or with [uv](https://docs.astral.sh/uv/):
+Or for development with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync
-uv run earthcatalog --help
+git clone https://github.com/nasa-itslive/earthcatalog.git
+cd earthcatalog
+uv sync --extra dev
 ```
 
 ---
 
-## 2. Generate a test inventory
+## 2. Open a catalog
 
-```bash
-python -m earthcatalog.tools.make_test_inventory \
-    --prefix test-space/velocity_image_pair/nisar/v02 \
-    --limit  500 \
-    --output /tmp/test_inventory.csv
+The `catalog` module is the main entry point.  You provide an obstore-compatible
+store and a base path; EarthCatalog wires everything together.
+
+```python
+from earthcatalog.core import catalog
+from obstore.store import S3Store
+
+store = S3Store(bucket="its-live-data", region="us-west-2")
+ec = catalog.open(
+    store=store,
+    base="s3://its-live-data/test-space/stac/catalog",
+)
+print(ec)
+# EarthCatalog(grid_type='h3', resolution=1)
 ```
 
-This reads the ITS_LIVE public S3 bucket (no credentials needed) and writes
-a CSV with `bucket` + `key` columns pointing to `.stac.json` files.
+The store handles all I/O — `S3Store`, `LocalStore`, and `MemoryStore` are
+interchangeable.  No special handling for different URI schemes needed.
 
 ---
 
-## 3. Run the incremental pipeline
+## 3. Full ingestion
 
-=== "With flags"
+Ingest STAC items from an S3 Inventory file into a fresh catalog:
 
-    ```bash
-    earthcatalog incremental \
-        --inventory  /tmp/test_inventory.csv \
-        --catalog    /tmp/catalog.db \
-        --warehouse  /tmp/warehouse \
-        --limit      500
-    ```
+```python
+ec.ingest(
+    "s3://my-bucket/inventory/full.parquet",
+    mode="full",
+    chunk_size=10000,
+    update_hash_index=True,
+)
+```
 
-=== "With a config file"
-
-    ```yaml title="config/h3_r1.yaml"
-    catalog:
-      db_path:   /tmp/catalog.db
-      warehouse: /tmp/warehouse
-
-    grid:
-      type:       h3
-      resolution: 1
-
-    ingest:
-      chunk_size:  500
-      max_workers: 8
-    ```
-
-    ```bash
-    earthcatalog incremental \
-        --config    config/h3_r1.yaml \
-        --inventory /tmp/test_inventory.csv
-    ```
+- **`mode="full"`**: drops any existing Iceberg table and recreates it
+- Files are written to the warehouse store in hive-style layout:
+  `grid_partition={cell}/year={year}/part_{uuid}.parquet`
+- rustac writes valid stac-geoparquet with proper geo metadata
+- The optional `limit` parameter caps the number of items (useful for testing)
 
 ---
 
-## 4. Query with DuckDB
+## 4. Delta ingestion
+
+Append new items to an existing catalog without overwriting:
+
+```python
+ec.ingest(
+    "s3://my-bucket/inventory/delta_2026-04-28.parquet",
+    mode="delta",
+    update_hash_index=True,
+)
+```
+
+- **`mode="delta"`**: opens the existing Iceberg table and adds files
+- New part files are numbered sequentially after existing ones per partition
+- The hash index is updated with new item IDs (deduplicates across runs)
+- Inventory rows have a `last_modified_date` column for `since=` filtering:
+  ```python
+  from datetime import UTC, datetime, timedelta
+  ec.ingest(inventory, mode="delta", since=datetime.now(UTC) - timedelta(days=2))
+  ```
+
+---
+
+## 5. Quick search
+
+Use Iceberg partition pruning to find files intersecting a geometry:
+
+```python
+from shapely.geometry import box
+
+greenland = box(-60, 60, -20, 85)
+paths = ec.search_files(greenland, start_datetime="2020-01-01")
+print(f"{len(paths)} files intersect Greenland")
+```
+
+The result is a list of file paths suitable for DuckDB:
 
 ```python
 import duckdb
-from earthcatalog.core.catalog import open_catalog, get_or_create_table
-
-catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
-table   = get_or_create_table(catalog)
 
 con = duckdb.connect()
 con.execute("INSTALL iceberg; LOAD iceberg;")
 
 df = con.execute(f"""
-    SELECT id, platform, grid_partition, datetime
-    FROM iceberg_scan('{table.metadata_location}')
-    WHERE platform = 'sentinel-2'
+    SELECT id, platform, datetime, percent_valid_pixels
+    FROM iceberg_scan('{ec.table.metadata_location}')
+    WHERE grid_partition IN (
+        SELECT DISTINCT grid_partition
+        FROM read_parquet({paths!r})
+    )
+    AND percent_valid_pixels > 50
     LIMIT 20
 """).df()
-
 print(df)
+```
+
+Or use the convenience method to generate the SQL cell filter:
+
+```python
+cell_filter = ec.cell_list_sql(greenland)
+# → "grid_partition IN ('8206d7fffffffff', '820677fffffffff', ...)"
 ```
 
 ---
 
-## 5. Inspect the warehouse layout
+## 6. Inspect the catalog
 
-```bash
-find /tmp/warehouse -name "*.parquet" | head -10
-# grid_partition=820957fffffffff/year=2021/part_000000_abc.parquet
-# grid_partition=820957fffffffff/year=2022/part_000000_def.parquet
-# ...
+```python
+# Per-partition stats (from Iceberg manifests, no Parquet I/O)
+for s in ec.stats()[:3]:
+    print(f"{s['grid_partition']}/{s['year']}: {s['row_count']} rows")
+
+# Unique item count (from hash index)
+print(f"Unique items: {ec.unique_item_count():,}")
 ```
 
-Each file covers exactly one `(H3 cell, year)` bucket — matching the
-Iceberg `IdentityTransform(grid_partition)` + `YearTransform(datetime)` partition spec.
+Or from the command line:
+
+```bash
+python scripts/info.py \
+    --catalog   /tmp/catalog.db \
+    --warehouse /tmp/warehouse
+```
 
 ---
 
 ## Next steps
 
-- [Architecture](../architecture.md) — understand how the pipeline works
+- [Architecture](../architecture.md) — how the pipeline works
 - [Configuration](../configuration.md) — full YAML reference
-- [Backfill pipeline](../pipelines/backfill.md) — process the full historical catalog with Dask
-- [Operations: Ingest Guide](../operations/ingest_guide.md) — production runbook
+- [Operations: Ingest Workflow](../operations/ingest_workflow.md) — production runbook
+- [Query Catalog](../operations/query_catalog.md) — DuckDB + rustac + CQL2 examples
