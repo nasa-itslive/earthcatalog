@@ -889,6 +889,8 @@ def _update_hash_index_from_parquets(
     When *store* is ``None`` (default), falls back to the global
     :mod:`earthcatalog.core.store_config` — this path is deprecated.
     """
+    from obstore.store import LocalStore
+
     from earthcatalog.core.hash_index import merge_hashes_from_parquets, read_hashes, write_hashes
 
     if store is None:
@@ -896,41 +898,23 @@ def _update_hash_index_from_parquets(
 
         store = store_config.get_store()
 
-    is_s3 = hash_index_path.startswith("s3://")
-
-    if is_s3:
+    if hash_index_path.startswith("s3://"):
         no_scheme = hash_index_path.removeprefix("s3://")
-        hash_bucket, hash_key = no_scheme.split("/", 1)
-        print(f"Reading existing hash index: {hash_index_path}")
-        existing = read_hashes(store, hash_key)
+        _hash_bucket, hash_key = no_scheme.split("/", 1)
+        hash_store = store
     else:
-        import pyarrow.parquet as pq
+        hash_store = LocalStore(str(Path(hash_index_path).parent))
+        hash_key = Path(hash_index_path).name
 
-        from earthcatalog.core.hash_index import _BATCH_SIZE
-
-        existing: set[bytes] = set()
-        if Path(hash_index_path).exists():
-            pf = pq.ParquetFile(hash_index_path)
-            for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash"]):
-                for h in batch.column("id_hash").to_pylist():
-                    existing.add(bytes(h))
-
+    print(f"Reading existing hash index: {hash_index_path}")
+    existing = read_hashes(hash_store, hash_key)
     print(f"  Existing hashes: {len(existing):,}")
 
     updated, n_new = merge_hashes_from_parquets(new_parquet_paths, existing, store=store)
     print(f"  New hashes from {len(new_parquet_paths):,} parquet files: {n_new:,}")
 
-    if is_s3:
-        total = write_hashes(updated, store, hash_key)
-        print(f"  Written: {hash_index_path} ({total:,} total hashes)")
-    else:
-        sorted_hashes = sorted(updated)
-        arr = pa.array(sorted_hashes, type=pa.binary(16))
-        tbl = pa.table({"id_hash": arr})
-        buf = io.BytesIO()
-        pq.write_table(tbl, buf, compression="zstd")
-        Path(hash_index_path).write_bytes(buf.getvalue())
-        print(f"  Written: {hash_index_path} ({len(sorted_hashes):,} total hashes)")
+    total = write_hashes(updated, hash_store, hash_key)
+    print(f"  Written: {hash_index_path} ({total:,} total hashes)")
 
 
 def register_delta(
