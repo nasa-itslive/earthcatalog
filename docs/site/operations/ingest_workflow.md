@@ -8,6 +8,39 @@ The ingest workflow runs daily to process new ITS_LIVE granules from the S3 Inve
 
 **Schedule:** 04:00 UTC daily (after `daily_delta` at 02:00 UTC)
 
+## Two APIs
+
+EarthCatalog provides two ingest paths:
+
+### 1. Unified API: `catalog.ingest()`
+
+Simple, single-function entry point for both full backfill and delta:
+
+```python
+from earthcatalog.core import catalog
+from obstore.store import S3Store
+
+store = S3Store(bucket="its-live-data", region="us-west-2")
+ec = catalog.open(store=store, base="s3://my-bucket/catalog")
+
+# Full backfill: drop + recreate table
+ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
+
+# Delta: append new files to existing table
+ec.ingest("s3://bucket/inventory/delta.parquet", mode="delta",
+          update_hash_index=True)
+```
+
+Key features:
+- Mode auto-detection (`mode="auto"` → delta if table has data)
+- Consistent store-based I/O (no local/S3 branching)
+- Optional hash index update (`update_hash_index=True`)
+- `since` parameter for datetime-based filtering
+
+### 2. Fault-tolerant pipeline: `scripts/run_backfill.py`
+
+4-phase pipeline designed for spot-instance resilience:
+
 | Step | Action | Output |
 |------|--------|--------|
 | 1 | `daily_delta.yml` produces new delta inventory | `s3://…/delta/pending/delta_YYYY-MM-DD.parquet` |
