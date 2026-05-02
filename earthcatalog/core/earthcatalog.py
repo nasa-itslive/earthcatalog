@@ -7,6 +7,7 @@ discovery into a single object.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -347,6 +348,167 @@ class EarthCatalog:
         }
         print(f"Done. {total_items} items → {total_rows} rows in {len(written_keys)} files")
         return result
+
+    def bulk_ingest(
+        self,
+        inventory_path: str,
+        *,
+        mode: str = "auto",
+        chunk_size: int = 100_000,
+        compact_rows: int = 100_000,
+        limit: int | None = None,
+        since: datetime | None = None,
+        update_hash_index: bool = False,
+        staging_prefix: str | None = None,
+        create_client: Callable[[], object] | None = None,
+        skip_inventory: bool = False,
+        skip_ingest: bool = False,
+        retry_pending: bool = False,
+    ) -> None:
+        """Ingest large inventories using a distributed Dask cluster.
+
+        Thin wrapper around the 4-phase staging pipeline
+        (:func:`~earthcatalog.pipelines.backfill.run_backfill`) that derives
+        catalog path, warehouse root, and partitioner from this EarthCatalog.
+
+        Unlike :meth:`ingest` (single-node, ``ThreadPoolExecutor``), this method
+        is designed for large backfills on Dask/Coiled.  It writes chunk files
+        to a staging prefix, fetches items via async S3 I/O in parallel, writes
+        NDJSON intermediates, compacts to GeoParquet, and registers files with
+        Iceberg — all with spot-instance resilience (completion markers,
+        pending-chunk retry, skip-inventory recovery).
+
+        Parameters
+        ----------
+        inventory_path:
+            Path or ``s3://`` URI to an S3 Inventory file (CSV, Parquet,
+            or ``manifest.json``).
+        mode:
+            ``"auto"``  — delta if the table already has data, else full.
+            ``"full"``  — drop+recreate Iceberg table, then re-register all
+                          warehouse files (start fresh).
+            ``"delta"`` — append new files to the existing Iceberg table.
+        chunk_size:
+            Items per chunk parquet in Phase 1.
+        compact_rows:
+            Max rows per GeoParquet output file in Phase 3.
+        limit:
+            Stop after processing this many STAC items (for testing).
+        since:
+            Only process inventory rows whose ``last_modified_date`` is >=
+            this datetime (timezone-aware UTC).
+        update_hash_index:
+            When True, merge new item IDs into the warehouse hash index.
+        staging_prefix:
+            S3 key prefix for chunks + NDJSON + completion markers.
+            Auto-generated from the current date when not provided.
+        create_client:
+            Optional callable that returns a Dask Client.  Called lazily
+            after Phase 1 completes (avoids idle cluster timeout during
+            the inventory scan).  Pass ``lambda: coiled.Client(...)`` for
+            Coiled spot clusters.
+        skip_inventory:
+            If True, skip Phase 1 and reuse existing chunks in staging.
+            Useful when re-running after a crash.
+        skip_ingest:
+            If True, skip Phase 2 and go straight to Phase 3 (compact).
+            Useful when NDJSON from a prior run is ready but compact
+            needs bigger instances.
+        retry_pending:
+            If True, re-process chunks that had fetch failures in a
+            prior run (stored in ``pending_chunks/``).
+
+        Example
+        -------
+        ::
+
+            from earthcatalog.core import catalog
+            from obstore.store import S3Store
+
+            store = S3Store(bucket="its-live-data", region="us-west-2")
+            ec = catalog.open(store=store, base="s3://my-bucket/catalog")
+            ec.bulk_ingest(
+                "s3://bucket/inventory/full.parquet",
+                mode="full",
+                create_client=lambda: coiled.Client(n_workers=100),
+            )
+        """
+        from datetime import UTC
+        from datetime import datetime as _dt
+
+        from earthcatalog.config import GridConfig
+        from earthcatalog.grids import build_partitioner
+        from earthcatalog.pipelines.backfill import run_backfill
+
+        # --- derive paths from EarthCatalog state ---
+        warehouse_root = self._catalog.properties.get("warehouse", "")
+        uri = self._catalog.properties.get("uri", "")
+        local_db = uri.removeprefix("sqlite:///")
+
+        # --- build partitioner from table properties ---
+        grid_cfg = GridConfig(
+            type=self._info.grid_type,
+            resolution=self._info.grid_resolution,
+            boundaries_path=self._info.boundaries_path,
+            id_field=self._info.id_field,
+        )
+        partitioner = build_partitioner(grid_cfg)
+
+        # --- auto-generate staging prefix ---
+        if staging_prefix is None:
+            date_str = _dt.now(UTC).strftime("%Y%m%d")
+            staging_prefix = f"bulk_ingest/{date_str}"
+
+        # --- resolve mode ---
+        delta = True
+        if mode == "full":
+            delta = False
+        elif mode == "auto":
+            try:
+                n = sum(s["row_count"] for s in self._info.stats(self._table))
+                delta = n > 0
+            except Exception:
+                delta = False
+
+        # --- download catalog ---
+        if self._store and self._catalog_key:
+            self.download_catalog(local_db)
+
+        # --- bridge: set store_config so run_backfill internals can find them ---
+        from earthcatalog.core import store_config
+
+        old_store = store_config.get_store()
+        old_key = store_config.get_catalog_key()
+        try:
+            store_config.set_store(self._store)
+            if self._catalog_key:
+                store_config.set_catalog_key(self._catalog_key)
+
+            run_backfill(
+                inventory_path=inventory_path,
+                catalog_path=local_db,
+                staging_store=self._store,
+                staging_prefix=staging_prefix,
+                warehouse_store=self._store,
+                warehouse_root=warehouse_root,
+                partitioner=partitioner,
+                chunk_size=chunk_size,
+                compact_rows=compact_rows,
+                limit=limit,
+                since=since,
+                use_lock=False,
+                upload=True,
+                skip_inventory=skip_inventory,
+                skip_ingest=skip_ingest,
+                retry_pending=retry_pending,
+                delta=delta,
+                create_client=create_client,
+                update_hash_index=update_hash_index,
+                hash_index_path=self._table.properties.get("earthcatalog.hash_index_path"),
+            )
+        finally:
+            store_config.set_store(old_store)
+            store_config.set_catalog_key(old_key)
 
     # ------------------------------------------------------------------
     # Catalog lifecycle helpers (use EarthCatalog's store, not globals)
