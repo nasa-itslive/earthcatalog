@@ -80,11 +80,10 @@ permalink = true
 [nav]
 Home = "index.md"
 "Quick Start" = "quickstart.md"
-Architecture = "architecture.md"
 Configuration = "configuration.md"
 
 [nav.Pipelines]
-Architecture = "architecture.md"
+Architecture = "pipelines/architecture.md"
 Incremental = "pipelines/incremental.md"
 Backfill = "pipelines/backfill.md"
 
