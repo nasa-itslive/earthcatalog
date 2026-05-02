@@ -137,6 +137,6 @@ The result is exactly **1 Iceberg snapshot** regardless of how many incremental
 runs produced the input files.
 
 !!! warning "Brief table-not-found window"
-    Between `drop_table` and `get_or_create_table`, the catalog has no table.
+    Between dropping and recreating the Iceberg table, the catalog has no table.
     Any concurrent reader will see a `NoSuchTableError`.  Use `--use-lock` in
     production to prevent concurrent access during this window.
