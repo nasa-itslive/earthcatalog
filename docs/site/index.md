@@ -53,33 +53,26 @@ pip install -e .
 
 ### 2. Query the catalog
 
-The fastest way to explore the catalog is with DuckDB. No credentials needed:
+The fastest way to explore the catalog is with the EarthCatalog facade and DuckDB. No credentials needed:
 
 ```python
-import duckdb
-from shapely.geometry import Point
-from earthcatalog.core import catalog, store_config
+from earthcatalog.core import catalog
 from obstore.store import S3Store
+from shapely.geometry import Point
+import duckdb
 
-# Connect (no credentials for public bucket)
+# Open — returns EarthCatalog with Iceberg table + grid metadata
 store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
-store_config.set_store(store)
-store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
-catalog.download_catalog('/tmp/earthcatalog.db')
+ec = catalog.open(store=store,
+                  base='s3://its-live-data/test-space/stac/catalog')
 
-c = catalog.open('/tmp/earthcatalog.db', 
-               's3://its-live-data/test-space/stac/catalog/warehouse')
-table = catalog.get_or_create(c)
-info = catalog.info(table)
-
-# Prune to relevant files by H3 cell + year
+# Iceberg partition pruning — zero I/O on irrelevant files
 point = Point(-133.99, 58.74)
-paths = info.file_paths(table, point, start_datetime='2020-01-01', 
-                      end_datetime='2022-12-31')
+paths = ec.search_files(point, start_datetime='2020-01-01')
 
+# Query with DuckDB
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
-
 df = con.execute(f"""
     SELECT id, platform, datetime
     FROM read_parquet({paths})
@@ -88,31 +81,27 @@ df = con.execute(f"""
 """).df()
 ```
 
-See [Query Catalog](operations/query_catalog.md) for rustac + CQL2 examples.
+See [Query Catalog](operations/query_catalog.md) for DuckDB + rustac + CQL2 examples and [`search_files()` API docs](api/core.md).
 
-### 3. Ingest an increment
+### 3. Ingest a delta
 
-Daily increments come from the S3 Inventory delta. The GitHub Actions workflow handles this:
+Daily delta ingest from an S3 Inventory file, single-node:
 
-```bash
-# Daily at 04:00 UTC
-python scripts/run_backfill.py \
-  --inventory s3://its-live-data/test-space/stac/catalog/delta/pending/delta_2026-04-28.parquet \
-  --catalog /tmp/earthcatalog.db \
-  --warehouse s3://its-live-data/test-space/stac/catalog/warehouse \
-  --staging s3://its-live-data/test-space/stac/catalog/ingest/delta_2026-04-28 \
-  --delta \
-  --update-hash-index \
-  --scheduler local \
-  --workers 4
+```python
+ec.ingest("s3://bucket/delta/2026-04-28.parquet",
+          mode="delta",
+          update_hash_index=True)
 ```
 
-Key flags:
-- `--delta`: Append mode (add files without overwriting)
-- `--update-hash-index`: Merge new item IDs into the hash index in Phase 4
-- `--staging`: Date-specific path for isolated runs
+For large backfills on Dask/Coiled:
 
-See [Ingest Workflow](operations/ingest_workflow.md) for the full workflow and GitHub Actions configuration.
+```python
+ec.bulk_ingest("s3://bucket/full_inventory.parquet",
+               mode="full",
+               create_client=lambda: coiled.Client(n_workers=100))
+```
+
+See the [`ingest()`](api/core.md) and [`bulk_ingest()`](api/core.md) docstrings for all parameters, or the [Ingest Workflow](operations/ingest_workflow.md) for the GitHub Actions configuration.
 
 ---
 
@@ -161,4 +150,4 @@ What's not yet:
 
 ---
 
-<i>Built from commit <a href="https://github.com/nasa-itslive/earthcatalog/commit/6cf6d54">6cf6d54</a> (2026-04-29)</i>
+<i>Built from commit <a href="https://github.com/nasa-itslive/earthcatalog/commit/9083f82">9083f82</a> (2026-05-01)</i>
