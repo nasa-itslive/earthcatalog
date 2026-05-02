@@ -1,30 +1,64 @@
 # Quick Start
 
+EarthCatalog ingests STAC items from S3 into a spatially-partitioned GeoParquet
+catalog backed by Apache Iceberg. Instead of a database, Parquet files sit on S3
+and a small SQLite file tracks the Iceberg schema. DuckDB reads them directly —
+no serialization overhead, no infrastructure.
+
+## Bulk ingest
+
+First-time full backfill from an S3 Inventory file. Drops any existing table and
+recreates it from scratch.
+
 ```python
 import earthcatalog as ea
 from obstore.store import S3Store
-from shapely.geometry import box
+
+store = S3Store(bucket="its-live-data", region="us-west-2")
+ec = ea.open(store=store, base="s3://my-bucket/catalog")
+
+ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+               create_client=lambda: coiled.Client(n_workers=100))
+```
+
+For smaller inventories the single-node path works without Dask:
+
+```python
+ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
+```
+
+## Delta ingest
+
+Daily incremental updates. Appends new files to the existing table without
+overwriting, and updates the hash index for duplicate detection.
+
+```python
+ec.ingest("s3://bucket/delta/2026-04-28.parquet",
+          mode="delta",
+          update_hash_index=True)
+```
+
+Optionally filter by modification date:
+
+```python
 from datetime import UTC, datetime, timedelta
 
-# Open — any obstore store works (S3Store, LocalStore, MemoryStore)
-store = S3Store(bucket="its-live-data", region="us-west-2")
-ec = ea.open(store=store, base="s3://bucket/catalog")
-print(ec)  # EarthCatalog(grid_type='h3', resolution=1)
+ec.ingest("delta.parquet", mode="delta",
+          since=datetime.now(UTC) - timedelta(days=2))
+```
 
-# Ingest
-# --- daily delta (single-node, ThreadPoolExecutor)
-ec.ingest("s3://bucket/delta.parquet", mode="delta", update_hash_index=True)
-ec.ingest("delta.parquet", mode="delta", since=datetime.now(UTC) - timedelta(days=2))
+## Query with DuckDB
 
-# --- large backfill (Dask/Coiled, 4-phase spot-resilient)
-ec.bulk_ingest("s3://bucket/full.parquet", mode="full",
-               create_client=lambda: coiled.Client(n_workers=100))
+Iceberg partition pruning finds the relevant Parquet files for a geometry.
+DuckDB reads them with spatial filtering — no full scan.
 
-# Search — Iceberg partition pruning, zero I/O on irrelevant files
+```python
+from shapely.geometry import box
+import duckdb
+
 greenland = box(-60, 60, -20, 85)
 paths = ec.search_files(greenland, start_datetime="2020-01-01")
 
-import duckdb
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
 df = con.execute(f"""
@@ -33,8 +67,12 @@ df = con.execute(f"""
     WHERE ST_Intersects(geometry, ST_GeomFromText('{greenland.wkt}'))
     LIMIT 10
 """).df()
+```
 
-# Stats — from Iceberg manifests, no Parquet data read
-ec.stats()
-ec.unique_item_count()
+## Catalog info
+
+```python
+ec.stats()              # per-partition row/file counts
+ec.unique_item_count()  # unique STAC items (from hash index)
+ec.info()               # grid metadata (type, resolution, boundaries)
 ```
