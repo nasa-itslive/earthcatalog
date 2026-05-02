@@ -1,159 +1,40 @@
 # Quick Start
 
-Get earthcatalog up and running in five minutes.
-
----
-
-## Prerequisites
-
-- Python 3.12+
-- AWS credentials (only needed to write to a private S3 bucket; reading ITS_LIVE data is public)
-
----
-
-## 1. Install
-
-```bash
-pip install earthcatalog
-```
-
-Or for development with [uv](https://docs.astral.sh/uv/):
-
-```bash
-git clone https://github.com/nasa-itslive/earthcatalog.git
-cd earthcatalog
-uv sync --extra dev
-```
-
----
-
-## 2. Open a catalog
-
-The `catalog` module is the main entry point.  You provide an obstore-compatible
-store and a base path; EarthCatalog wires everything together.
-
 ```python
-from earthcatalog.core import catalog
+import earthcatalog as ea
 from obstore.store import S3Store
-
-store = S3Store(bucket="its-live-data", region="us-west-2")
-ec = catalog.open(
-    store=store,
-    base="s3://its-live-data/test-space/stac/catalog",
-)
-print(ec)
-# EarthCatalog(grid_type='h3', resolution=1)
-```
-
-The store handles all I/O — `S3Store`, `LocalStore`, and `MemoryStore` are
-interchangeable.  No special handling for different URI schemes needed.
-
----
-
-## 3. Ingest
-
-Two ingest paths depending on scale:
-
-### Daily deltas (`ec.ingest`)
-
-Single-node, `ThreadPoolExecutor`, no intermediate files — for small batches on GitHub Actions or laptops.
-
-```python
-# Full: drop+recreate table
-ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
-
-# Delta: append to existing table
-ec.ingest("s3://bucket/inventory/delta.parquet", mode="delta",
-          update_hash_index=True)
-
-# Delta with datetime filter
-from datetime import UTC, datetime, timedelta
-ec.ingest("delta.parquet", mode="delta",
-          since=datetime.now(UTC) - timedelta(days=2))
-```
-
-### Large backfills (`ec.bulk_ingest`)
-
-Distributed via Dask/Coiled.  4-phase staging pipeline with NDJSON intermediates
-and spot-instance resilience (completion markers, pending-chunk retry).
-
-```python
-ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
-               create_client=lambda: coiled.Client(n_workers=100))
-```
-
-See the full [`ingest()`][earthcatalog.core.earthcatalog.EarthCatalog.ingest]
-and [`bulk_ingest()`][earthcatalog.core.earthcatalog.EarthCatalog.bulk_ingest]
-docstrings for all parameters.
-
----
-
-## 5. Quick search
-
-Use Iceberg partition pruning to find files intersecting a geometry:
-
-```python
 from shapely.geometry import box
+from datetime import UTC, datetime, timedelta
 
+# Open — any obstore store works (S3Store, LocalStore, MemoryStore)
+store = S3Store(bucket="its-live-data", region="us-west-2")
+ec = ea.open(store=store, base="s3://bucket/catalog")
+print(ec)  # EarthCatalog(grid_type='h3', resolution=1)
+
+# Ingest
+# --- daily delta (single-node, ThreadPoolExecutor)
+ec.ingest("s3://bucket/delta.parquet", mode="delta", update_hash_index=True)
+ec.ingest("delta.parquet", mode="delta", since=datetime.now(UTC) - timedelta(days=2))
+
+# --- large backfill (Dask/Coiled, 4-phase spot-resilient)
+ec.bulk_ingest("s3://bucket/full.parquet", mode="full",
+               create_client=lambda: coiled.Client(n_workers=100))
+
+# Search — Iceberg partition pruning, zero I/O on irrelevant files
 greenland = box(-60, 60, -20, 85)
 paths = ec.search_files(greenland, start_datetime="2020-01-01")
-print(f"{len(paths)} files intersect Greenland")
-```
 
-The result is a list of file paths suitable for DuckDB:
-
-```python
 import duckdb
-
 con = duckdb.connect()
-con.execute("INSTALL iceberg; LOAD iceberg;")
-
+con.execute("INSTALL spatial; LOAD spatial;")
 df = con.execute(f"""
-    SELECT id, platform, datetime, percent_valid_pixels
-    FROM iceberg_scan('{ec.table.metadata_location}')
-    WHERE grid_partition IN (
-        SELECT DISTINCT grid_partition
-        FROM read_parquet({paths!r})
-    )
-    AND percent_valid_pixels > 50
-    LIMIT 20
+    SELECT id, platform, datetime
+    FROM read_parquet({paths})
+    WHERE ST_Intersects(geometry, ST_GeomFromText('{greenland.wkt}'))
+    LIMIT 10
 """).df()
-print(df)
+
+# Stats — from Iceberg manifests, no Parquet data read
+ec.stats()
+ec.unique_item_count()
 ```
-
-Or use the convenience method to generate the SQL cell filter:
-
-```python
-cell_filter = ec.cell_list_sql(greenland)
-# → "grid_partition IN ('8206d7fffffffff', '820677fffffffff', ...)"
-```
-
----
-
-## 6. Inspect the catalog
-
-```python
-# Per-partition stats (from Iceberg manifests, no Parquet I/O)
-for s in ec.stats()[:3]:
-    print(f"{s['grid_partition']}/{s['year']}: {s['row_count']} rows")
-
-# Unique item count (from hash index)
-print(f"Unique items: {ec.unique_item_count():,}")
-```
-
-Or from the command line:
-
-```bash
-python scripts/info.py \
-    --catalog   /tmp/catalog.db \
-    --warehouse /tmp/warehouse
-```
-
----
-
-## Next steps
-
-- [Architecture](../architecture.md) — how the pipeline works
-- [Configuration](../configuration.md) — full YAML reference
-- [Operations: Ingest Workflow](../operations/ingest_workflow.md) — production runbook
-- [Query Catalog](../operations/query_catalog.md) — DuckDB + rustac + CQL2 examples

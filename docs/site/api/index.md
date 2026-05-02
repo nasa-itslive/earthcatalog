@@ -22,7 +22,7 @@ Entry points for opening a catalog, ingesting data, and searching.
 
 | Module | Description |
 |---|---|
-| [`earthcatalog.core`](core.md) | Schema, transform, lock, store config, EarthCatalog |
+| [`earthcatalog.core`](core.md) | Schema, transform, lock, EarthCatalog |
 | [`earthcatalog.grids`](grids.md) | Spatial partitioners (H3, GeoJSON) |
 | [`earthcatalog.pipelines`](pipelines.md) | Incremental and backfill pipelines |
 | [`earthcatalog.maintenance`](maintenance.md) | Warehouse compaction |
