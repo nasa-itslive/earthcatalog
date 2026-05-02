@@ -4,34 +4,33 @@ How to query the EarthCatalog with DuckDB, rustac, and spatial/temporal filters.
 
 ---
 
+## EarthCatalog Search API
+
+The simplest way to find files is through the EarthCatalog facade:
+
+```python
+from earthcatalog.core import catalog
+from obstore.store import S3Store
+from shapely.geometry import Point
+
+store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
+ec = catalog.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
+
+# Iceberg partition pruning — zero I/O on irrelevant files
+point = Point(-133.99, 58.74)
+paths = ec.search_files(point, start_datetime='2020-01-01', end_datetime='2022-12-31')
+# paths is a list of S3 URIs ready for DuckDB read_parquet()
+```
+
+See the [`search_files()`][earthcatalog.core.earthcatalog.EarthCatalog.search_files] docstring for details.
+
 ## Quick Query (DuckDB)
 
 ### Spatial + temporal query with H3 cell pruning
 
 ```python
 import duckdb
-from shapely.geometry import Point
-from earthcatalog.core import catalog, store_config
-from obstore.store import S3Store
 
-# Connect to the public catalog (no credentials needed)
-store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
-store_config.set_store(store)
-store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
-catalog.download_catalog('/tmp/earthcatalog.db')
-
-# Open the catalog
-c = catalog.open('/tmp/earthcatalog.db',
-                's3://its-live-data/test-space/stac/catalog/warehouse')
-table = catalog.get_or_create(c)
-info = catalog.info(table)
-
-# Prune to relevant files by cell + year (Iceberg partition pruning)
-point = Point(-133.99, 58.74)
-paths = info.file_paths(table, point, start_datetime='2020-01-01',
-                      end_datetime='2022-12-31')
-
-# Query with spatial filter
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
 

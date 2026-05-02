@@ -12,34 +12,34 @@ The ingest workflow runs daily to process new ITS_LIVE granules from the S3 Inve
 
 EarthCatalog provides two ingest paths:
 
-### 1. Unified API: `catalog.ingest()`
+### 1. `ec.ingest()` — single-node
 
-Simple, single-function entry point for both full backfill and delta:
+For daily deltas on GitHub Actions.  ThreadPoolExecutor, no intermediate files.
+
+Key features: mode auto-detection, hash index update, `since=` filtering.
 
 ```python
-from earthcatalog.core import catalog
-from obstore.store import S3Store
-
-store = S3Store(bucket="its-live-data", region="us-west-2")
-ec = catalog.open(store=store, base="s3://my-bucket/catalog")
-
-# Full backfill: drop + recreate table
-ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
-
-# Delta: append new files to existing table
 ec.ingest("s3://bucket/inventory/delta.parquet", mode="delta",
           update_hash_index=True)
 ```
 
-Key features:
-- Mode auto-detection (`mode="auto"` → delta if table has data)
-- Consistent store-based I/O (no local/S3 branching)
-- Optional hash index update (`update_hash_index=True`)
-- `since` parameter for datetime-based filtering
+See the [`ingest()`][earthcatalog.core.earthcatalog.EarthCatalog.ingest] docstring for all parameters.
 
-### 2. Fault-tolerant pipeline: `scripts/run_backfill.py`
+### 2. `ec.bulk_ingest()` — distributed
 
-4-phase pipeline designed for spot-instance resilience:
+For large backfills on Dask/Coiled.  4-phase staging pipeline with NDJSON
+intermediates and spot-instance resilience.
+
+```python
+ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+               create_client=lambda: coiled.Client(n_workers=100))
+```
+
+See the [`bulk_ingest()`][earthcatalog.core.earthcatalog.EarthCatalog.bulk_ingest] docstring for all parameters.
+
+### 3. `scripts/run_backfill.py` — independent CLI
+
+The same 4-phase pipeline accessible as a standalone CLI (for manual runs):
 
 | Step | Action | Output |
 |------|--------|--------|
@@ -116,21 +116,17 @@ python scripts/run_backfill.py \
 | `--skip-inventory` | Re-use existing chunks in staging (after crash) |
 | `--no-lock` | Skip S3 lock (safe for single-operator runs) |
 
-## Hash Index Update (Plan B)
+## Hash Index Update
 
-When `--update-hash-index` is passed, Phase 4 (`register_delta`) does:
+The hash index (`warehouse_id_hashes.parquet`) tracks unique STAC item IDs
+via xxh3_128 hashes.  After a delta ingest, new hashes are merged in:
 
-1. Reads existing hash index from `s3://…/warehouse_id_hashes.parquet` (~40M hashes)
-2. Reads `id` column from each newly written warehouse parquet file
-3. Hashes each item ID with xxh3_128 (seed=42)
-4. Merges into existing set (union, deduplicates)
-5. Writes updated index back to S3
+1. Read existing hash index (footer-only, ~40M hashes)
+2. Read `id` column from newly written warehouse parquets
+3. Hash each ID with xxh3_128 (seed=42), union into existing set
+4. Write sorted index back
 
-**Why this is the correct approach:**
-- Reads from actual warehouse files (what's actually in the catalog)
-- No scan of existing files (~5k parquets avoided)
-- Fast: ~160k items takes seconds
-- Exact: only includes successfully ingested items
+See the [`hash_index`][earthcatalog.core.hash_index] module docs for details.
 
 ## Verifying After Ingest
 

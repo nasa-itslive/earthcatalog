@@ -50,47 +50,41 @@ interchangeable.  No special handling for different URI schemes needed.
 
 ---
 
-## 3. Full ingestion
+## 3. Ingest
 
-Ingest STAC items from an S3 Inventory file into a fresh catalog:
+Two ingest paths depending on scale:
 
-```python
-ec.ingest(
-    "s3://my-bucket/inventory/full.parquet",
-    mode="full",
-    chunk_size=10000,
-    update_hash_index=True,
-)
-```
+### Daily deltas (`ec.ingest`)
 
-- **`mode="full"`**: drops any existing Iceberg table and recreates it
-- Files are written to the warehouse store in hive-style layout:
-  `grid_partition={cell}/year={year}/part_{uuid}.parquet`
-- rustac writes valid stac-geoparquet with proper geo metadata
-- The optional `limit` parameter caps the number of items (useful for testing)
-
----
-
-## 4. Delta ingestion
-
-Append new items to an existing catalog without overwriting:
+Single-node, `ThreadPoolExecutor`, no intermediate files — for small batches on GitHub Actions or laptops.
 
 ```python
-ec.ingest(
-    "s3://my-bucket/inventory/delta_2026-04-28.parquet",
-    mode="delta",
-    update_hash_index=True,
-)
+# Full: drop+recreate table
+ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
+
+# Delta: append to existing table
+ec.ingest("s3://bucket/inventory/delta.parquet", mode="delta",
+          update_hash_index=True)
+
+# Delta with datetime filter
+from datetime import UTC, datetime, timedelta
+ec.ingest("delta.parquet", mode="delta",
+          since=datetime.now(UTC) - timedelta(days=2))
 ```
 
-- **`mode="delta"`**: opens the existing Iceberg table and adds files
-- New part files are numbered sequentially after existing ones per partition
-- The hash index is updated with new item IDs (deduplicates across runs)
-- Inventory rows have a `last_modified_date` column for `since=` filtering:
-  ```python
-  from datetime import UTC, datetime, timedelta
-  ec.ingest(inventory, mode="delta", since=datetime.now(UTC) - timedelta(days=2))
-  ```
+### Large backfills (`ec.bulk_ingest`)
+
+Distributed via Dask/Coiled.  4-phase staging pipeline with NDJSON intermediates
+and spot-instance resilience (completion markers, pending-chunk retry).
+
+```python
+ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+               create_client=lambda: coiled.Client(n_workers=100))
+```
+
+See the full [`ingest()`][earthcatalog.core.earthcatalog.EarthCatalog.ingest]
+and [`bulk_ingest()`][earthcatalog.core.earthcatalog.EarthCatalog.bulk_ingest]
+docstrings for all parameters.
 
 ---
 

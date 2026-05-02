@@ -1,10 +1,14 @@
 # Core API
 
-::: earthcatalog.core.schema
+::: earthcatalog.core.earthcatalog.EarthCatalog
+
+::: earthcatalog.core.catalog
+
+::: earthcatalog.core.catalog_info
 
 ::: earthcatalog.core.transform
 
-::: earthcatalog.core.catalog
+::: earthcatalog.core.schema
 
 ::: earthcatalog.core.lock
 
