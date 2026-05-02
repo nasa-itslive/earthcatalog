@@ -51,57 +51,41 @@ mamba activate itslive-ingest
 pip install -e .
 ```
 
-### 2. Query the catalog
-
-The fastest way to explore the catalog is with the EarthCatalog facade and DuckDB. No credentials needed:
+### 2. Quick start
 
 ```python
-from earthcatalog.core import catalog
+import earthcatalog as ea
 from obstore.store import S3Store
-from shapely.geometry import Point
+from shapely.geometry import box
 import duckdb
 
-# Open — returns EarthCatalog with Iceberg table + grid metadata
-store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
-ec = catalog.open(store=store,
-                  base='s3://its-live-data/test-space/stac/catalog')
+# Open — returns EarthCatalog
+store = S3Store(bucket="its-live-data", region="us-west-2", skip_signature=True)
+ec = ea.open(store=store, base="s3://its-live-data/test-space/stac/catalog")
 
-# Iceberg partition pruning — zero I/O on irrelevant files
-point = Point(-133.99, 58.74)
-paths = ec.search_files(point, start_datetime='2020-01-01')
+# Search — Iceberg partition pruning
+greenland = box(-60, 60, -20, 85)
+paths = ec.search_files(greenland, start_datetime="2020-01-01")
 
-# Query with DuckDB
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
 df = con.execute(f"""
     SELECT id, platform, datetime
     FROM read_parquet({paths})
-    WHERE ST_Intersects(geometry, ST_GeomFromText('{point.wkt}'))
+    WHERE ST_Intersects(geometry, ST_GeomFromText('{greenland.wkt}'))
     LIMIT 10
 """).df()
 ```
 
-See [Query Catalog](operations/query_catalog.md) for DuckDB + rustac + CQL2 examples and [`search_files()` API docs](api/core.md).
-
-### 3. Ingest a delta
-
-Daily delta ingest from an S3 Inventory file, single-node:
+### 3. Ingest
 
 ```python
-ec.ingest("s3://bucket/delta/2026-04-28.parquet",
-          mode="delta",
-          update_hash_index=True)
+# Daily delta (single-node)
+ec.ingest("s3://bucket/delta.parquet", mode="delta", update_hash_index=True)
+
+# Large backfill (Dask/Coiled)
+ec.bulk_ingest("s3://bucket/full.parquet", create_client=coiled.Client)
 ```
-
-For large backfills on Dask/Coiled:
-
-```python
-ec.bulk_ingest("s3://bucket/full_inventory.parquet",
-               mode="full",
-               create_client=lambda: coiled.Client(n_workers=100))
-```
-
-See the [`ingest()`](api/core.md) and [`bulk_ingest()`](api/core.md) docstrings for all parameters, or the [Ingest Workflow](operations/ingest_workflow.md) for the GitHub Actions configuration.
 
 ---
 
@@ -120,34 +104,6 @@ See the [`ingest()`](api/core.md) and [`bulk_ingest()`](api/core.md) docstrings 
 
 ---
 
-## Project status
-
-> **Alpha** — The schema, partition spec, and CLI are stable for the ITS_LIVE velocity-pair catalog (~40M items). API may change.
-
-What's working:
-- Full backfill from S3 Inventory
-- Daily delta ingest with isolated staging
-- H3 cell + year partition pruning
-- DuckDB + rustac queries with spatial filters
-- Hash index auto-update in Phase 4
-
-What's not yet:
-- Pypi package publishing
-- Hosted documentation (GitHub Pages build pending)
-- Automated compaction schedule
-
 ---
 
-## Learn more
-
-- **[Quick Start](quickstart.md)** — Install and run in five minutes
-- **[Architecture](architecture.md)** — Deep dive into the pipeline design
-- **[Configuration](configuration.md)** — YAML config reference
-- **[Query Catalog](operations/query_catalog.md)** — DuckDB, rustac, and CQL2 examples
-- **[Ingest Workflow](operations/ingest_workflow.md)** — GitHub Actions daily delta + ingest
-- **[Maintenance](maintenance/compact.md)** — Warehouse compaction
-- **[API Reference](api/index.md)** — Python API docs
-
----
-
-<i>Built from commit <a href="https://github.com/nasa-itslive/earthcatalog/commit/9083f82">9083f82</a> (2026-05-01)</i>
+<i>Built from commit <a href="https://github.com/nasa-itslive/earthcatalog/commit/7a0a3f6">7a0a3f6</a> (2026-05-01)</i>
