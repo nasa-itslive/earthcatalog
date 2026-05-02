@@ -84,6 +84,7 @@ Architecture = "architecture.md"
 Configuration = "configuration.md"
 
 [nav.Pipelines]
+Architecture = "architecture.md"
 Incremental = "pipelines/incremental.md"
 Backfill = "pipelines/backfill.md"
 
