@@ -30,16 +30,10 @@ features = [
 url = "https://github.com/nasa-itslive/earthcatalog"
 name = "nasa-itslive/earthcatalog"
 
-[[plugins]]
-name = "search"
-
-[[plugins]]
-name = "mkdocstrings"
-
-[plugins.mkdocstrings.handlers.python]
+[project.plugins.mkdocstrings.handlers.python]
 paths = ["."]
 
-[plugins.mkdocstrings.handlers.python.options]
+[project.plugins.mkdocstrings.handlers.python.options]
 docstring_style = "google"
 show_source = true
 show_root_heading = true
