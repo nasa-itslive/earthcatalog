@@ -3,6 +3,9 @@
 ::: earthcatalog.core.earthcatalog.EarthCatalog
 
 ::: earthcatalog.core.catalog
+    options:
+      filters:
+        - "!^_"
 
 ::: earthcatalog.core.catalog_info
 

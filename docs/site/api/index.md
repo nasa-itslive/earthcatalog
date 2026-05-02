@@ -2,10 +2,26 @@
 
 ## Top-Level API
 
-The `catalog` module is the main entry point — it provides `open()`, `ingest()`,
-and related lifecycle functions.
+Entry points for opening a catalog, ingesting data, and searching.
+
+### Module functions
 
 ::: earthcatalog.core.catalog
+    options:
+      members:
+        - open
+        - ingest
+
+### EarthCatalog methods
+
+::: earthcatalog.core.earthcatalog.EarthCatalog
+    options:
+      members:
+        - ingest
+        - bulk_ingest
+        - search_files
+        - stats
+        - unique_item_count
 
 ## Modules
 
