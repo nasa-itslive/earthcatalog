@@ -78,7 +78,7 @@ from earthcatalog.core.catalog import (
     PROP_GRID_RESOLUTION,
     PROP_GRID_TYPE,
     PROP_HASH_INDEX_PATH,
-    open_catalog,
+    _open_sqlite,
     upload_catalog,
 )
 from earthcatalog.core.transform import (
@@ -786,7 +786,7 @@ def register_and_cleanup(
     if hash_index_path is None:
         hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
 
-    catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
 
     try:
         catalog.create_namespace(NAMESPACE)
@@ -915,7 +915,7 @@ def register_delta(
     if hash_index_path is None:
         hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
 
-    catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
 
     try:
         catalog.create_namespace(NAMESPACE)
@@ -1099,7 +1099,7 @@ def run_backfill(
 
             from earthcatalog.core.catalog import FULL_NAME
 
-            catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_root)
+            catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
             try:
                 table = catalog.load_table(FULL_NAME)
             except NoSuchTableError:

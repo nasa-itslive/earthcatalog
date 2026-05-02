@@ -133,7 +133,7 @@ class TestRegisterDeltaUpdatesHashIndex:
             ICEBERG_SCHEMA,
             NAMESPACE,
             PARTITION_SPEC,
-            open_catalog,
+            _open_sqlite,
         )
         from earthcatalog.pipelines.backfill import register_delta
 
@@ -144,7 +144,7 @@ class TestRegisterDeltaUpdatesHashIndex:
         wh_root.mkdir()
 
         db_path = str(tmp_path / "test.db")
-        cat = open_catalog(db_path=db_path, warehouse_path=str(wh_root))
+        cat = _open_sqlite(db_path=db_path, warehouse_path=str(wh_root))
         from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
         try:
@@ -193,7 +193,7 @@ class TestRegisterDeltaUpdatesHashIndex:
             ICEBERG_SCHEMA,
             NAMESPACE,
             PARTITION_SPEC,
-            open_catalog,
+            _open_sqlite,
         )
         from earthcatalog.pipelines.backfill import register_delta
 
@@ -215,7 +215,7 @@ class TestRegisterDeltaUpdatesHashIndex:
         Path(hash_index_path).write_bytes(buf.getvalue())
 
         db_path = str(tmp_path / "test.db")
-        cat = open_catalog(db_path=db_path, warehouse_path=str(wh_root))
+        cat = _open_sqlite(db_path=db_path, warehouse_path=str(wh_root))
         from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
         try:
@@ -261,7 +261,7 @@ class TestRegisterDeltaUpdatesHashIndex:
             ICEBERG_SCHEMA,
             NAMESPACE,
             PARTITION_SPEC,
-            open_catalog,
+            _open_sqlite,
         )
         from earthcatalog.pipelines.backfill import register_delta
 
@@ -273,7 +273,7 @@ class TestRegisterDeltaUpdatesHashIndex:
         hash_index_path = str(tmp_path / "hash_index.parquet")
 
         db_path = str(tmp_path / "test.db")
-        cat = open_catalog(db_path=db_path, warehouse_path=str(wh_root))
+        cat = _open_sqlite(db_path=db_path, warehouse_path=str(wh_root))
         from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
         try:

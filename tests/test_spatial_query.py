@@ -19,7 +19,7 @@ import pytest
 from shapely.geometry import box
 
 from earthcatalog.config import GridConfig
-from earthcatalog.core.catalog import get_or_create, open
+from earthcatalog.core.catalog import _open_sqlite, get_or_create
 from earthcatalog.core.catalog_info import catalog_info
 from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
@@ -60,7 +60,7 @@ def warehouse(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("spatial")
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    cat = open(db_path=db, warehouse_path=wh)
+    cat = _open_sqlite(db_path=db, warehouse_path=wh)
     tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
     p = H3Partitioner(resolution=2)

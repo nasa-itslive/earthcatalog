@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from earthcatalog.core.catalog import get_or_create_table, open_catalog
+from earthcatalog.core.catalog import _open_sqlite, get_or_create
 from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
@@ -48,8 +48,8 @@ ITEMS = [
 def iceberg_table(tmp_path):
     db = str(tmp_path / "catalog.db")
     warehouse = str(tmp_path / "warehouse")
-    catalog = open_catalog(db_path=db, warehouse_path=warehouse)
-    return get_or_create_table(catalog), tmp_path
+    catalog = _open_sqlite(db_path=db, warehouse_path=warehouse)
+    return get_or_create(catalog), tmp_path
 
 
 def _write_and_add(iceberg_table_fixture, items, resolution=2):

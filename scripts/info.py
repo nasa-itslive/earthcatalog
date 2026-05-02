@@ -67,7 +67,7 @@ else:
 # Open catalog
 # ---------------------------------------------------------------------------
 
-from earthcatalog.core.catalog import FULL_NAME, PROP_HASH_INDEX_PATH, open  # noqa: E402
+from earthcatalog.core.catalog import FULL_NAME, PROP_HASH_INDEX_PATH, _open_sqlite  # noqa: E402
 from earthcatalog.core.catalog_info import catalog_info  # noqa: E402
 
 # Force anonymous S3 access — public buckets don't need credentials,
@@ -76,7 +76,7 @@ os.environ.pop("AWS_ACCESS_KEY_ID", None)
 os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
 os.environ.pop("AWS_SESSION_TOKEN", None)
 
-cat = open(db_path=catalog_path, warehouse_path=args.warehouse)
+cat = _open_sqlite(db_path=catalog_path, warehouse_path=args.warehouse)
 
 try:
     table = cat.load_table(FULL_NAME)

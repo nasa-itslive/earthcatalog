@@ -13,7 +13,7 @@ from shapely.geometry import Point, box
 
 from earthcatalog.config import GridConfig
 from earthcatalog.core import EarthCatalog, catalog
-from earthcatalog.core.catalog import get_or_create, open
+from earthcatalog.core.catalog import _open_sqlite, get_or_create
 from earthcatalog.core.catalog_info import catalog_info
 from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
@@ -34,7 +34,7 @@ def populated_warehouse(tmp_path):
     """
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    cat = open(db_path=db, warehouse_path=wh)
+    cat = _open_sqlite(db_path=db, warehouse_path=wh)
     tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
     # Create items across multiple cells and years
@@ -95,7 +95,7 @@ def memory_store_with_catalog(tmp_path):
     # Create a catalog with data
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    cat = open(db_path=db, warehouse_path=wh)
+    cat = _open_sqlite(db_path=db, warehouse_path=wh)
     tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
     # Add minimal data
@@ -163,30 +163,26 @@ class TestNewCatalogOpenAPI:
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
 
-        cat = catalog.open(db_path=db, warehouse_path=wh)
+        cat = _open_sqlite(db_path=db, warehouse_path=wh)
 
         # Legacy API returns SqlCatalog, not EarthCatalog
         assert not isinstance(cat, EarthCatalog)
         assert hasattr(cat, "load_table")
 
-    def test_open_mixing_apis_raises_error(self, tmp_path):
-        """Mixing new and legacy API parameters should raise ValueError."""
-        from obstore.store import MemoryStore
-
-        store = MemoryStore()
-
-        with pytest.raises(ValueError, match="Cannot mix"):
-            catalog.open(
-                store=store,
-                base=str(tmp_path / "catalog"),
-                db_path=str(tmp_path / "catalog.db"),
-                warehouse_path=str(tmp_path / "warehouse"),
-            )
-
-    def test_open_missing_required_params_raises_error(self):
-        """Missing required parameters should raise ValueError."""
-        with pytest.raises(ValueError, match="Must provide"):
+    def test_open_requires_store_and_base(self):
+        """open() must be called with store and base."""
+        with pytest.raises(TypeError):
             catalog.open()
+
+    def test_open_returns_earthcatalog(self, tmp_path):
+        """open() with store+base returns an EarthCatalog."""
+        from obstore.store import LocalStore
+
+        store = LocalStore(str(tmp_path))
+        ec = catalog.open(store=store, base=str(tmp_path))
+        from earthcatalog.core import EarthCatalog
+
+        assert isinstance(ec, EarthCatalog)
 
 
 # ---------------------------------------------------------------------------

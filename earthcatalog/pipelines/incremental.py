@@ -90,9 +90,9 @@ import pyarrow.parquet as pq
 from obstore.store import S3Store
 
 from earthcatalog.core.catalog import (
+    _open_sqlite,
     download_catalog,
     get_or_create_table,
-    open_catalog,
     upload_catalog,
 )
 from earthcatalog.core.lock import S3Lock
@@ -560,7 +560,7 @@ def run(
     def _ingest() -> None:
         download_catalog(catalog_path)
 
-        catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
+        catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path)
         table = get_or_create_table(catalog, grid_config=grid_config)
         print(f"Catalog  : {catalog_path}")
         print(f"Table    : {table.name()}")

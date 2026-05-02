@@ -121,10 +121,10 @@ def _run_pipeline(inventory_csv, catalog_dirs, **kwargs):
             use_lock=False,
             **kwargs,
         )
-    from earthcatalog.core.catalog import get_or_create_table, open_catalog
+    from earthcatalog.core.catalog import _open_sqlite, get_or_create
 
-    catalog = open_catalog(db_path=db, warehouse_path=wh)
-    return get_or_create_table(catalog)
+    catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+    return get_or_create(catalog)
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +242,10 @@ class TestPipelineE2E:
                 partitioner=H3Partitioner(resolution=2),
                 use_lock=False,
             )
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
 
-        catalog = open_catalog(db_path=db, warehouse_path=wh)
-        table = get_or_create_table(catalog)
+        catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+        table = get_or_create(catalog)
         assert len(table.history()) == 0
 
     def test_batch_add_files_single_snapshot(self, inventory_csv, catalog_dirs):
@@ -256,7 +256,7 @@ class TestPipelineE2E:
     def test_batch_add_files_multi_chunk_single_snapshot(self, inventory_csv, tmp_path):
         """With multiple chunks, batch_add_files=True still produces exactly
         one snapshot (chunk_size=2, 6 items → 3 chunks → 1 snapshot)."""
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
 
         db = str(tmp_path / "catalog_mc.db")
         wh = str(tmp_path / "wh_mc")
@@ -271,8 +271,8 @@ class TestPipelineE2E:
                 use_lock=False,
                 batch_add_files=True,
             )
-        catalog = open_catalog(db_path=db, warehouse_path=wh)
-        table = get_or_create_table(catalog)
+        catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+        table = get_or_create(catalog)
         assert len(table.history()) == 1, f"expected 1 snapshot, got {len(table.history())}"
 
     def test_batch_add_files_same_rows_as_incremental(self, inventory_csv, catalog_dirs, tmp_path):

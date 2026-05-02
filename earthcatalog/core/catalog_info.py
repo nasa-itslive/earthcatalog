@@ -6,12 +6,13 @@ properties at ingest time (see :func:`~earthcatalog.core.catalog.get_or_create_t
 
 Example::
 
-    from earthcatalog.core import catalog_info, open_catalog, get_or_create_table
+    from earthcatalog.core import catalog_info, open
+    from obstore.store import S3Store
     from shapely.geometry import box
 
-    catalog = open_catalog(db_path="catalog.db", warehouse_path="warehouse/")
-    table   = get_or_create_table(catalog)
-    info    = catalog_info(table)
+    store = S3Store(bucket="my-bucket", region="us-west-2")
+    ec    = open(store=store, base="s3://bucket/catalog")
+    info  = catalog_info(ec.table)
 
     bbox  = box(-60, 60, -30, 80)          # Greenland
     paths = info.file_paths(table, bbox)    # Iceberg-pruned file list

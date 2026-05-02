@@ -11,8 +11,8 @@ from earthcatalog.config import GridConfig
 from earthcatalog.core.catalog import (
     PROP_GRID_RESOLUTION,
     PROP_GRID_TYPE,
+    _open_sqlite,
     get_or_create,
-    open,
 )
 from earthcatalog.core.catalog_info import CatalogInfo, catalog_info
 
@@ -26,7 +26,7 @@ def h3_table(tmp_path):
     """Iceberg table created with an H3 resolution-2 grid config."""
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    catalog = open(db_path=db, warehouse_path=wh)
+    catalog = _open_sqlite(db_path=db, warehouse_path=wh)
     grid_cfg = GridConfig(type="h3", resolution=2)
     table = get_or_create(catalog, grid_config=grid_cfg)
     return table
@@ -37,7 +37,7 @@ def legacy_table(tmp_path):
     """Iceberg table created WITHOUT a grid config (pre-feature catalog)."""
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    catalog = open(db_path=db, warehouse_path=wh)
+    catalog = _open_sqlite(db_path=db, warehouse_path=wh)
     table = get_or_create(catalog, grid_config=None)
     return table
 
@@ -66,10 +66,10 @@ class TestFromTable:
         assert props[PROP_GRID_RESOLUTION] == "2"
 
     def test_backfill_missing_properties_on_existing_table(self, tmp_path):
-        """get_or_create_table called twice: second call should backfill props."""
+        """get_or_create called twice: second call should backfill props."""
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
-        catalog = open(db_path=db, warehouse_path=wh)
+        catalog = _open_sqlite(db_path=db, warehouse_path=wh)
         # First call — no grid config
         get_or_create(catalog, grid_config=None)
         # Second call — with grid config on existing table
@@ -110,7 +110,7 @@ class TestCellsForGeometry:
         """Higher resolution → more and smaller cells."""
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
-        catalog = open(db_path=db, warehouse_path=wh)
+        catalog = _open_sqlite(db_path=db, warehouse_path=wh)
         bbox = box(-60, 60, -30, 80)
 
         table_r1 = get_or_create(catalog, grid_config=GridConfig(type="h3", resolution=1))
@@ -118,7 +118,7 @@ class TestCellsForGeometry:
 
         # Need a fresh catalog for r2 (different table would share schema)
         db2 = str(tmp_path / "catalog2.db")
-        catalog2 = open(db_path=db2, warehouse_path=wh)
+        catalog2 = _open_sqlite(db_path=db2, warehouse_path=wh)
         table_r2 = get_or_create(catalog2, grid_config=GridConfig(type="h3", resolution=2))
         cells_r2 = catalog_info(table_r2).cells_for_geometry(bbox)
 
@@ -137,13 +137,13 @@ class TestCellsForGeometry:
 
 class TestStats:
     def test_returns_rows(self, tmp_path):
-        from earthcatalog.core.catalog import get_or_create, open
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
         from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
         from earthcatalog.grids.h3_partitioner import H3Partitioner
 
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
-        cat = open(db_path=db, warehouse_path=wh)
+        cat = _open_sqlite(db_path=db, warehouse_path=wh)
         tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
         item = {
@@ -172,13 +172,13 @@ class TestStats:
         assert len(stats) > 0
 
     def test_row_counts_match_fan_out(self, tmp_path):
-        from earthcatalog.core.catalog import get_or_create, open
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
         from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
         from earthcatalog.grids.h3_partitioner import H3Partitioner
 
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
-        cat = open(db_path=db, warehouse_path=wh)
+        cat = _open_sqlite(db_path=db, warehouse_path=wh)
         tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
         items = [
@@ -228,13 +228,13 @@ class TestStats:
             assert "total_bytes" in s
 
     def test_year_is_calendar_year(self, tmp_path):
-        from earthcatalog.core.catalog import get_or_create, open
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
         from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
         from earthcatalog.grids.h3_partitioner import H3Partitioner
 
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
-        cat = open(db_path=db, warehouse_path=wh)
+        cat = _open_sqlite(db_path=db, warehouse_path=wh)
         tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
         item = {
@@ -296,13 +296,13 @@ class TestStats:
 
 
 def _build_multiyear_warehouse(tmp_path, years):
-    from earthcatalog.core.catalog import get_or_create, open
+    from earthcatalog.core.catalog import _open_sqlite, get_or_create
     from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
     from earthcatalog.grids.h3_partitioner import H3Partitioner
 
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    cat = open(db_path=db, warehouse_path=wh)
+    cat = _open_sqlite(db_path=db, warehouse_path=wh)
     tbl = get_or_create(cat, grid_config=GridConfig(resolution=2))
 
     items = []

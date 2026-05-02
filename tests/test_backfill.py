@@ -303,9 +303,9 @@ class TestRegisterAndCleanup:
             upload=False,
         )
 
-        from earthcatalog.core.catalog import open_catalog
+        from earthcatalog.core.catalog import _open_sqlite
 
-        table = open_catalog(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
+        table = _open_sqlite(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
             "earthcatalog.stac_items"
         )
         assert table.scan().to_arrow().num_rows > 0
@@ -325,10 +325,10 @@ class TestRegisterDelta:
             ICEBERG_SCHEMA,
             NAMESPACE,
             PARTITION_SPEC,
-            open_catalog,
+            _open_sqlite,
         )
 
-        catalog = open_catalog(db_path=str(tmp_path / "existing.db"), warehouse_path=str(wh_root))
+        catalog = _open_sqlite(db_path=str(tmp_path / "existing.db"), warehouse_path=str(wh_root))
         from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
         try:
@@ -409,11 +409,11 @@ class TestRegisterDelta:
             ICEBERG_SCHEMA,
             NAMESPACE,
             PARTITION_SPEC,
-            open_catalog,
+            _open_sqlite,
         )
 
         db_path = str(tmp_path / "test.db")
-        catalog = open_catalog(db_path=db_path, warehouse_path=str(wh_root))
+        catalog = _open_sqlite(db_path=db_path, warehouse_path=str(wh_root))
         from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
         try:
@@ -485,9 +485,9 @@ class TestRunBackfillV2:
                 use_lock=False,
             )
 
-        from earthcatalog.core.catalog import open_catalog
+        from earthcatalog.core.catalog import _open_sqlite
 
-        table = open_catalog(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
+        table = _open_sqlite(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
             "earthcatalog.stac_items"
         )
         result = table.scan().to_arrow()
@@ -551,9 +551,9 @@ class TestRunBackfillV2:
                 skip_inventory=True,
             )
 
-        from earthcatalog.core.catalog import open_catalog
+        from earthcatalog.core.catalog import _open_sqlite
 
-        table = open_catalog(db_path=catalog_path2, warehouse_path=str(wh_root2)).load_table(
+        table = _open_sqlite(db_path=catalog_path2, warehouse_path=str(wh_root2)).load_table(
             "earthcatalog.stac_items"
         )
         assert table.scan().to_arrow().num_rows >= len(_STAC_ITEMS)
@@ -600,9 +600,9 @@ class TestRunBackfillV2Delta:
                 use_lock=False,
             )
 
-        from earthcatalog.core.catalog import open_catalog
+        from earthcatalog.core.catalog import _open_sqlite
 
-        table = open_catalog(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
+        table = _open_sqlite(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
             "earthcatalog.stac_items"
         )
         first_ids = set(table.scan().to_arrow().column("id").to_pylist())
@@ -664,7 +664,7 @@ class TestRunBackfillV2Delta:
                 delta=True,
             )
 
-        table2 = open_catalog(db_path=catalog_path2, warehouse_path=str(wh_root)).load_table(
+        table2 = _open_sqlite(db_path=catalog_path2, warehouse_path=str(wh_root)).load_table(
             "earthcatalog.stac_items"
         )
         result2 = table2.scan().to_arrow()

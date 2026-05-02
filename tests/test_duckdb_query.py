@@ -11,7 +11,7 @@ No network calls are made — the catalog lives entirely in tmp_path.
 import duckdb
 import pytest
 
-from earthcatalog.core.catalog import get_or_create_table, open_catalog
+from earthcatalog.core.catalog import _open_sqlite, get_or_create
 from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
@@ -59,8 +59,8 @@ def populated_table(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("duckdb")
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
-    cat = open_catalog(db_path=db, warehouse_path=wh)
-    tbl = get_or_create_table(cat)
+    cat = _open_sqlite(db_path=db, warehouse_path=wh)
+    tbl = get_or_create(cat)
 
     p = H3Partitioner(resolution=2)
     rows = fan_out(ITEMS, p)

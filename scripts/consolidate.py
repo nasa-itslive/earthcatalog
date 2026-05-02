@@ -284,11 +284,11 @@ def rebuild_catalog(
         NAMESPACE,
         PARTITION_SPEC,
         PROP_GRID_TYPE,
-        open_catalog,
+        _open_sqlite,
         upload_catalog,
     )
 
-    catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_uri)
+    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_uri)
 
     try:
         catalog.create_namespace(NAMESPACE)

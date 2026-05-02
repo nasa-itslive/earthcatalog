@@ -72,9 +72,9 @@ import pyarrow.parquet as pq
 from obstore.store import LocalStore
 
 from earthcatalog.core.catalog import (
+    _open_sqlite,
     download_catalog,
     get_or_create_table,
-    open_catalog,
     upload_catalog,
 )
 from earthcatalog.core.transform import FileMetadata
@@ -326,7 +326,7 @@ def _compact_warehouse_impl(
     #     simple, correct, and takes < 1 s for typical warehouse sizes.
     # ------------------------------------------------------------------
     download_catalog(catalog_path)
-    catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
+    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path)
 
     # Drop and recreate the table to clear all stale manifest entries.
     from pyiceberg.exceptions import NoSuchTableError

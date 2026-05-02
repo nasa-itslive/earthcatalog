@@ -375,10 +375,10 @@ class TestCompactWarehouse:
             threshold=2,
         )
 
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
 
-        catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
-        table = get_or_create_table(catalog)
+        catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path)
+        table = get_or_create(catalog)
         assert len(table.history()) == 1, (
             f"Expected 1 snapshot after catalog rebuild, got {len(table.history())}"
         )
@@ -406,10 +406,10 @@ class TestCompactWarehouse:
 
         import pyarrow.compute as pc
 
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.core.catalog import _open_sqlite, get_or_create
 
-        catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
-        table = get_or_create_table(catalog)
+        catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path)
+        table = get_or_create(catalog)
         result = table.scan().to_arrow()
         found_ids = result.column("id").to_pylist()
 
