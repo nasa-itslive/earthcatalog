@@ -132,6 +132,22 @@ class EarthCatalog:
 
         return self._info.unique_item_count(self._table, self._store, default_hash_index_path)
 
+    def info(self) -> CatalogInfo:
+        """Return the grid metadata and catalog statistics object.
+
+        Returns the underlying :class:`~earthcatalog.core.catalog_info.CatalogInfo`
+        which provides methods for exploring the grid system, file paths, and
+        per-partition statistics.
+
+        Example::
+
+            info = ec.info()
+            info.cells_for_geometry(geom)          # H3 cells intersecting geom
+            info.file_paths(table, geom)            # Iceberg-pruned file list
+            info.total_files(table)                 # file count from manifests
+        """
+        return self._info
+
     def ingest(
         self,
         inventory_path: str,

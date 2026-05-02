@@ -15,6 +15,7 @@ Entry points for opening a catalog, ingesting data, and searching.
         - ingest
         - bulk_ingest
         - search_files
+        - info
         - stats
         - unique_item_count
 
