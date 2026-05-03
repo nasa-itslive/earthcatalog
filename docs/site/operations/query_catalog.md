@@ -1,26 +1,65 @@
 # Querying the Catalog
 
-How to search the catalog using the high-level API or directly with DuckDB.
+Three search methods, from fastest to most flexible.
 
 ---
 
-## EarthCatalog Search API
+## Fastest — `duck_search(format="native")`
 
-The primary way to search.  Iceberg partition pruning narrows the search
-to relevant files (zero I/O), then rustac applies spatial, temporal, and
-CQL2 filters per file.
+Uses DuckDB internally for parallel Parquet I/O.  **~2× faster** than
+the other methods across all query types.  Returns a ``pandas.DataFrame``
+with flat columns — no pystac conversion overhead.
 
 ```python
 import earthcatalog as ec
+import cql2
 from obstore.store import S3Store
 
 store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
 catalog = ec.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
 
-# Simple spatial query
+df = catalog.duck_search(
+    format="native",
+    intersects={"type": "Point", "coordinates": [0, 60]},
+    datetime="2020-01-01/2020-12-31",
+    filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
+    max_items=100,
+)
+# df is a pandas.DataFrame — iterate or convert as needed
+for _, row in df.iterrows():
+    print(row["id"], row["platform"])
+```
+
+### `max_items` note
+
+DuckDB's SQL ``LIMIT`` triggers a **7× slower query plan** for multi-file
+scans.  ``duck_search()`` avoids this by fetching all matching rows and
+truncating in Python.  For ``max_items ≤ 100,000`` the overhead is
+negligible; for larger result sets use ``search_files()`` + hand-written
+DuckDB SQL (see BYO section).
+
+### Return a list of pystac Items
+
+```python
+items = catalog.duck_search(format="pystac", ...)
+# list[pystac.Item] — slower due to conversion overhead
+```
+
+---
+
+## Lazy iteration — `search()`
+
+Returns a lazy ``EarthCatalogItemSearch`` that yields ``pystac.Item``
+objects.  Comparable to ``search_to_arrow()`` in speed.  Best for
+interactive use with ``max_items=100`` where early exit avoids wasted
+work (sequential per-file processing stops as soon as enough items
+are found).
+
+```python
 results = catalog.search(
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
+    filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
     max_items=100,
 )
 for item in results.items():
@@ -29,33 +68,23 @@ for item in results.items():
 
 ### CQL2 filters
 
-Filters use `cql2.parse_text()` for a natural SQL-like syntax:
+Filters use ``cql2.parse_text()`` for a natural SQL-like syntax:
 
 ```python
 import cql2
 
-results = catalog.search(
-    intersects={"type": "Point", "coordinates": [-45, 70]},
-    filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
-    max_items=100,
-)
-```
-
-CQL2 expressions support standard comparisons, `AND`/`OR`, `IN`, etc.:
-
-```python
 cql2.parse_text('platform = "sentinel-2"')
 cql2.parse_text('percent_valid_pixels > 50')
 cql2.parse_text('platform IN ("sentinel-2", "landsat-8", "landsat-9")')
 cql2.parse_text('platform = "landsat-8" AND percent_valid_pixels > 70')
 ```
 
-For temporal filtering use the top-level ``datetime`` kwarg (STAC-standard).
-Do **not** reference ``datetime`` inside CQL2 — rustac generates broken SQL
-when ``datetime`` appears in a CQL2 expression:
+Temporal filtering uses the top-level ``datetime`` kwarg (STAC-standard).
+Do **not** reference ``datetime`` inside CQL2 — rustac generates broken
+SQL when ``datetime`` appears in a CQL2 expression:
 
 ```python
-# ✅ Correct — use datetime kwarg
+# ✅ Correct
 results = catalog.search(
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
@@ -83,7 +112,12 @@ s = results.stats()
 print(f"{s['files']} files, ~{s['rows_upper_bound']:,} rows")
 ```
 
-### Items as PyArrow
+---
+
+## PyArrow — `search_to_arrow()`
+
+Returns a ``pyarrow.Table``.  Useful for zero-copy interchange with
+other Arrow-native tools.  Same speed as ``search()``.
 
 ```python
 table = catalog.search_to_arrow(
@@ -96,71 +130,42 @@ table = catalog.search_to_arrow(
 
 ## Performance
 
-Estimated latency for a region like northern Greenland, based on the
-production catalog (63.4M rows, 5,024 files, ~12,600 items/file):
+See [`search_performance.md`](search_performance.md) for detailed
+benchmarks across all methods against the production catalog.
 
-| Scenario | Files after pruning | Est. latency | Items returned |
+| Method | Narrow query (2 files) | Wide query (32 files) | Wide + 100k limit |
 |---|---|---|---|
-| Spatial only, no filter | ~80 | ~9s | ~1M |
-| + year=2020 | ~10 | ~1s | ~126K |
-| + year=2020 + CQL2 filter + max_items=100 | ~1 | ~0.1–0.2s | 100 |
-| + year=2020 + highly selective CQL2 + max_items=100 | ~2–3 | ~0.3–0.4s | ~50 |
+| `search()` | ~2s | ~36s | ~55s |
+| `duck_search(pystac)` | ~2s | ~4s | ~57s |
+| `duck_search(native)` | **~2s** | **~3s (11×)** | **~28s (2×)** |
+| `search_to_arrow()` | ~2s | ~34s | ~47s |
 
-**Why `max_items=100` is fast**: files are read sequentially and the
-search stops as soon as enough matching items are found.  Since each
-warehouse file averages ~12,600 items, a `max_items=100` query almost
-always finishes after the first file regardless of filter selectivity —
-provided the filter matches at least 100 rows in that file.
+### How it works
 
-**Why latency scales with files, not total catalog size**: Iceberg
-partition pruning narrows the search to only the H3 cells and years
-that intersect your query geometry.  A point in Greenland resolves to
-~1-2 cells; a large polygon to ~5-10.  Each cell has 5-10 years of
-data, so even a full-catalog spatial query reads only ~25-100 files
-(out of 5,024).  The remaining 98% of files are never opened.
+1. **Iceberg partition pruning** resolves the spatial/temporal query
+   to a list of file paths (zero I/O on non-matching files).
+2. **DuckDB or rustac** then reads those files and applies CQL2 filters.
 
-### DuckDB Parquet predicate pushdown
-
-When a CQL2 filter (e.g. ``percent_valid_pixels >= 1``) is present,
-DuckDB's Parquet reader uses column chunk statistics (min, max)
-from the Parquet footer to skip row groups *before* decompressing
-any data:
-
-- Reads the Parquet footer (~1-10 KB per file)
-- For each row group, checks if ``stats.max >= 1``
-- Skips row groups that can't possibly match
-- Reads only the columns needed for the query from qualifying groups
-
-For regional-scale queries the files are small enough (single row group)
-that the footer read + full scan cost is similar regardless of filter
-selectivity.  Predicate pushdown becomes significant for large files
-with many row groups.
-
-### Benchmarks (test data: 1,000 items, 4 files)
-
-| Query | Items/s | Notes |
-|---|---|---|
-| No filter, max_items=100 | ~600 | Baseline |
-| `percent_valid_pixels >= 1`, max_items=100 | ~750 | Nearly all rows qualify |
-| `percent_valid_pixels <= 50`, max_items=100 | ~860 | ~50% qualify |
-| No limit, no filter | ~2,200 | Full sequential scan |
-| `pages()` | 4 pages | One per Iceberg partition |
+For narrow queries (few files), all methods are bottlenecked by the
+S3 download + Parquet scan time (~1s per file).  For wide queries with
+sparse data spread across many files, ``duck_search(native)`` benefits
+from DuckDB's internal parallel I/O while rustac reads files sequentially.
 
 ### Performance Tips
 
-1. **Always use `max_items`** for exploratory queries — keeps latency under 0.2s
-2. **Prefer temporal filters** — the `year` partition is heavily pruned
-3. **Spatial + temporal = fastest** — both partitions are pruned before any file is opened
-4. **Highly selective CQL2 filters** (e.g. `percent_valid_pixels >= 95`) skip row groups via Parquet statistics but don't reduce the number of files opened — pair them with `max_items` for consistent latency
+1. **Use ``duck_search(format="native")``** for fastest results
+2. **Use ``search()`` for lazy iteration** with ``max_items=100`` — early exit avoids wasted work
+3. **Prefer temporal filters** — the ``year`` partition is heavily pruned
+4. **Spatial + temporal = fastest** — both partitions are pruned before any file is opened
+5. **Highly selective CQL2 filters** pair with ``max_items`` for consistent latency
 
 ---
 
 ## BYO Query Engine: DuckDB
 
 If you need raw SQL access (aggregations, joins, arbitrary expressions),
-use Iceberg pruning to get the file list, then query with DuckDB directly.
-
-### Greenland 2020, Sentinel-2
+use ``search_files()`` to get the file list, then query with DuckDB
+directly.  Remember to configure anonymous S3 access:
 
 ```python
 import duckdb
@@ -176,6 +181,10 @@ paths = catalog.search_files(greenland, start_datetime='2020-01-01', end_datetim
 
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
+# Anonymous S3 — DuckDB inherits AWS creds from env; explicitly clear them
+con.execute("SET s3_access_key_id='';")
+con.execute("SET s3_secret_access_key='';")
+con.execute("SET s3_session_token='';")
 
 df = con.execute(f"""
     SELECT id, platform, datetime, 
@@ -208,7 +217,7 @@ df = con.execute(f"""
 ### Spatial query options
 
 ```python
-# ST_Intersects (polygon or point)
+# ST_Intersects
 ST_Intersects(geometry, ST_GeomFromText('POINT(-133.99 58.74)'))
 
 # Bounding box filter (faster, no geometry parsing)
@@ -244,6 +253,3 @@ paths = catalog.search_files(
 )
 # Returns: ['s3://.../warehouse/grid_partition=.../year=2020/part_000001.parquet', ...]
 ```
-
-Returns a list of parquet file paths that can be passed directly to
-DuckDB's ``read_parquet()``.
