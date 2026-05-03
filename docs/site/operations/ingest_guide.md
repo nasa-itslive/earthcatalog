@@ -5,21 +5,21 @@ Operational reference for bulk backfill and daily delta ingest.
 ## Quick reference
 
 ```python
-import earthcatalog as ea
+import earthcatalog as ec
 from obstore.store import S3Store
 
 store = S3Store(bucket="my-bucket", region="us-west-2")
-ec = ea.open(store=store, base="s3://my-bucket/catalog")
+catalog = ec.open(store=store, base="s3://my-bucket/catalog")
 
 # Bulk backfill (Dask/Coiled, spot-resilient 4-phase pipeline)
-ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
-               create_client=lambda: coiled.Client(n_workers=100))
+catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+                     create_client=lambda: coiled.Client(n_workers=100))
 
 # Single-node backfill (no Dask)
-ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
+catalog.ingest("s3://bucket/inventory/full.parquet", mode="full")
 
 # Daily delta
-ec.ingest("s3://bucket/delta/daily.parquet", mode="delta",
+catalog.ingest("s3://bucket/delta/daily.parquet", mode="delta",
           update_hash_index=True)
 ```
 
@@ -34,7 +34,7 @@ Runs the 4-phase staging pipeline: chunk files → async S3 fetch → NDJSON int
 are retried on restart, NDJSON survives, completion markers track progress.
 
 ```python
-ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
                create_client=lambda: coiled.Client(
                    n_workers=20,
                    vm_type="m6i.xlarge",
@@ -50,7 +50,7 @@ Simpler path using `ThreadPoolExecutor`. No intermediate files — fetch →
 fan-out → write → register. Suitable for inventories under ~1M items.
 
 ```python
-ec.ingest("s3://bucket/inventory/full.parquet", mode="full",
+catalog.ingest("s3://bucket/inventory/full.parquet", mode="full",
           chunk_size=10000, update_hash_index=True)
 ```
 
@@ -60,7 +60,7 @@ Process new items since the last ingest. Appends files without overwriting,
 updates the hash index for duplicate detection.
 
 ```python
-ec.ingest("s3://bucket/delta/2026-04-28.parquet",
+catalog.ingest("s3://bucket/delta/2026-04-28.parquet",
           mode="delta",
           update_hash_index=True)
 ```
@@ -70,7 +70,7 @@ Filter by modification date to skip old items:
 ```python
 from datetime import UTC, datetime, timedelta
 
-ec.ingest("s3://bucket/delta.parquet", mode="delta",
+catalog.ingest("s3://bucket/delta.parquet", mode="delta",
           since=datetime.now(UTC) - timedelta(days=2),
           update_hash_index=True)
 ```
@@ -78,9 +78,9 @@ ec.ingest("s3://bucket/delta.parquet", mode="delta",
 ## 3. Verification
 
 ```python
-ec.stats()              # per-partition row/file counts from Iceberg manifests
-ec.unique_item_count()  # unique STAC items (hash index footer, no full scan)
-ec.info()               # grid metadata and catalog info object
+catalog.stats()              # per-partition row/file counts from Iceberg manifests
+catalog.unique_item_count()  # unique STAC items (hash index footer, no full scan)
+catalog.info()               # grid metadata and catalog info object
 ```
 
 DuckDB query with spatial pruning:
@@ -90,7 +90,7 @@ from shapely.geometry import box
 import duckdb
 
 greenland = box(-60, 60, -20, 85)
-paths = ec.search_files(greenland, start_datetime="2020-01-01")
+paths = catalog.search_files(greenland, start_datetime="2020-01-01")
 
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")

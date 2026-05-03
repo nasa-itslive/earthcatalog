@@ -11,20 +11,20 @@ First-time full backfill from an S3 Inventory file. Drops any existing table and
 recreates it from scratch.
 
 ```python
-import earthcatalog as ea
+import earthcatalog as ec
 from obstore.store import S3Store
 
 store = S3Store(bucket="its-live-data", region="us-west-2")
-ec = ea.open(store=store, base="s3://my-bucket/catalog")
+catalog = ec.open(store=store, base="s3://my-bucket/catalog")
 
-ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
-               create_client=lambda: coiled.Client(n_workers=100))
+catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+                     create_client=lambda: coiled.Client(n_workers=100))
 ```
 
 For smaller inventories the single-node path works without Dask:
 
 ```python
-ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
+catalog.ingest("s3://bucket/inventory/full.parquet", mode="full")
 ```
 
 ## Delta ingest
@@ -33,7 +33,7 @@ Daily incremental updates. Appends new files to the existing table without
 overwriting, and updates the hash index for duplicate detection.
 
 ```python
-ec.ingest("s3://bucket/delta/2026-04-28.parquet",
+catalog.ingest("s3://bucket/delta/2026-04-28.parquet",
           mode="delta",
           update_hash_index=True)
 ```
@@ -43,7 +43,7 @@ Optionally filter by modification date:
 ```python
 from datetime import UTC, datetime, timedelta
 
-ec.ingest("delta.parquet", mode="delta",
+catalog.ingest("delta.parquet", mode="delta",
           since=datetime.now(UTC) - timedelta(days=2))
 ```
 
@@ -55,7 +55,7 @@ Accepts CQL2 filters, spatial predicates, and temporal ranges — same kwargs as
 
 ```python
 # Spatial + temporal + CQL2 filter — Iceberg prunes files, rustac filters rows
-results = ec.search(
+results = catalog.search(
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter={"op": "=", "args": [{"property": "platform"}, "sentinel-1"]},
@@ -63,7 +63,7 @@ results = ec.search(
 )
 
 # Results as a PyArrow table (zero-copy via Arrow PyCapsule protocol)
-table = ec.search_to_arrow(
+table = catalog.search_to_arrow(
     bbox=[-60, 60, -20, 85],
     datetime="2020-01/..",
 )
@@ -79,7 +79,7 @@ from shapely.geometry import box
 import duckdb
 
 greenland = box(-60, 60, -20, 85)
-paths = ec.search_files(greenland, start_datetime="2020-01-01")
+paths = catalog.search_files(greenland, start_datetime="2020-01-01")
 
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
@@ -94,7 +94,7 @@ df = con.execute(f"""
 ## Catalog info
 
 ```python
-ec.stats()              # per-partition row/file counts
-ec.unique_item_count()  # unique STAC items (from hash index)
-ec.info()               # grid metadata (type, resolution, boundaries)
+catalog.stats()              # per-partition row/file counts
+catalog.unique_item_count()  # unique STAC items (from hash index)
+catalog.info()               # grid metadata (type, resolution, boundaries)
 ```

@@ -35,6 +35,10 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Package dependencies split: `pandas`, `duckdb`, `coiled` moved to dev extras.
 - `catalog.py`, `catalog_info.py`, `fix_schema.py` consolidated into `earthcatalog.py` — one file for all catalog concerns.
 - Versioning switched from manual `pyproject.toml` version to `setuptools-scm` (git tag based).
+- S3 auth simplified: PyIceberg always uses anonymous reads (env credentials no longer needed for `open()`); `_anonymous_s3()` → `_cleared_env_s3()` detects anonymous mode from env directly instead of store config.
+- `pages()` now wraps rustac calls with anonymous S3 context (was missing, now consistent with `items_as_dicts()`).
+- `ingest()` and `bulk_ingest()` raise clear `RuntimeError` if `AWS_ACCESS_KEY_ID` is missing.
+- Public API docs and examples updated to `import earthcatalog as ec` / `catalog = ec.open(...)` pattern.
 
 ### Removed
 - `key_to_wkt()`, `_dedup_items()`, `open_catalog` alias.
