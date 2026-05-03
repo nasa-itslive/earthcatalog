@@ -54,11 +54,13 @@ Accepts CQL2 filters, spatial predicates, and temporal ranges — same kwargs as
 `rustac.search()`.
 
 ```python
+import cql2
+
 # Spatial + temporal + CQL2 filter — Iceberg prunes files, rustac filters rows
 results = catalog.search(
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
-    filter={"op": "=", "args": [{"property": "platform"}, "sentinel-1"]},
+    filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
     max_items=100,
 )
 

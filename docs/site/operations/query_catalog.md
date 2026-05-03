@@ -29,23 +29,33 @@ for item in results.items():
 
 ### CQL2 filters
 
-Any CQL2 filter expression is supported:
+Filters use `cql2.parse_text()` for a natural SQL-like syntax:
 
 ```python
-# Property filter
-results = catalog.search(
-    intersects={"type": "Point", "coordinates": [-45, 70]},
-    filter={"op": ">=", "args": [{"property": "percent_valid_pixels"}, 80]},
-    max_items=100,
-)
-
-# Same filter as CQL2 text (requires ``cql2`` package)
 import cql2
+
 results = catalog.search(
     intersects={"type": "Point", "coordinates": [-45, 70]},
     filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
     max_items=100,
 )
+```
+
+CQL2 expressions support standard comparisons, `AND`/`OR`, `IN`, etc.:
+
+```python
+cql2.parse_text('platform = "sentinel-2"')
+cql2.parse_text('percent_valid_pixels > 50')
+cql2.parse_text('datetime >= "2020-01-01" AND datetime <= "2022-12-31"')
+cql2.parse_text('platform IN ("sentinel-2", "landsat-8", "landsat-9")')
+cql2.parse_text('platform = "landsat-8" AND percent_valid_pixels > 70')
+```
+
+For callers that already have CQL2 JSON (e.g. from a UI builder), the
+raw JSON format is also accepted:
+
+```python
+filter={"op": ">=", "args": [{"property": "percent_valid_pixels"}, 80]}
 ```
 
 ### Pagination and metadata

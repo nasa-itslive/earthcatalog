@@ -646,9 +646,19 @@ class EarthCatalog:
         """Search across the catalog, returning a deferred ``EarthCatalogItemSearch``.
 
         Accepts the same kwargs as :func:`rustac.search`:
-        ``intersects``, ``bbox``, ``datetime``, ``filter`` (CQL2),
+        ``intersects``, ``bbox``, ``datetime``, ``filter`` (CQL2 JSON),
         ``ids``, ``collections``, ``max_items``, ``limit``, ``sortby``,
         ``include``, ``exclude``, ``query``, etc.
+
+        For the ``filter`` parameter, prefer ``cql2.parse_text()`` for a
+        natural SQL-like syntax::
+
+            import cql2
+            catalog.search(
+                filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
+            )
+
+        Raw CQL2 JSON dicts are also accepted.
 
         Returns
         -------
