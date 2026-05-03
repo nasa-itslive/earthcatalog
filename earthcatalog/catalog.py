@@ -239,7 +239,19 @@ class CatalogInfo:
         if end_datetime is not None:
             expr = And(expr, LessThanOrEqual("datetime", _parse_dt(end_datetime)))
 
-        return [task.file.file_path for task in table.scan(row_filter=expr).plan_files()]
+        start_year = _parse_dt(start_datetime).year if start_datetime is not None else None
+        end_year = _parse_dt(end_datetime).year if end_datetime is not None else None
+
+        paths = []
+        for task in table.scan(row_filter=expr).plan_files():
+            year = task.file.partition[1] + 1970
+            if start_year is not None and year < start_year:
+                continue
+            if end_year is not None and year > end_year:
+                continue
+            paths.append(task.file.file_path)
+
+        return paths
 
     def _ensure_stats(self, table) -> list[dict]:
         if self._cached_stats is None:
