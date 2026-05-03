@@ -152,7 +152,7 @@ store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
 catalog = ec.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
 
 greenland = Polygon([(-60, 60), (-20, 60), (-20, 85), (-60, 85), (-60, 60)])
-paths = catalog.info().file_paths(catalog.table, greenland, start_datetime='2020-01-01', end_datetime='2020-12-31')
+paths = catalog.search_files(greenland, start_datetime='2020-01-01', end_datetime='2020-12-31')
 
 con = duckdb.connect()
 con.execute("INSTALL spatial; LOAD spatial;")
@@ -174,7 +174,7 @@ df = con.execute(f"""
 from shapely.geometry import Point
 
 point = Point(-149.5, 63.5)
-paths = catalog.info().file_paths(catalog.table, point, start_datetime='2018-01-01', end_datetime='2023-12-31')
+paths = catalog.search_files(point, start_datetime='2018-01-01', end_datetime='2023-12-31')
 
 df = con.execute(f"""
     SELECT DATE_TRUNC('month', datetime) AS month, COUNT(*) AS scenes
@@ -212,13 +212,12 @@ info.grid_type        # 'h3'
 info.grid_resolution  # 1
 ```
 
-### CatalogInfo.file_paths(table, geometry, start_datetime, end_datetime)
+### catalog.search_files(geometry, start_datetime, end_datetime)
 
 Prunes files by H3 cell + year partition:
 
 ```python
-paths = info.file_paths(
-    table,
+paths = catalog.search_files(
     geometry=Point(-133.99, 58.74),
     start_datetime='2020-01-01',
     end_datetime='2022-12-31'
