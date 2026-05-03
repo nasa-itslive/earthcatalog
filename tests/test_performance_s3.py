@@ -470,19 +470,19 @@ class TestProductionPerformance:
         r_items = list(catalog.search(**query).items())
         t_r = time.perf_counter() - t0
 
-        # duck_search
+        # duck_search (returns DataFrame)
         t0 = time.perf_counter()
-        d_items = catalog.duck_search(**query)
+        d_df = catalog.duck_search(**query)
         t_d = time.perf_counter() - t0
 
         r_ids = {item.id for item in r_items}
-        d_ids = {item.id for item in d_items}
+        d_ids = set(d_df["id"])
         overlap = r_ids & d_ids
         info = catalog.search(intersects=GREENLAND_POINT, datetime="1980-01-01/2015-12-31").stats()
 
         print(f"\n  search()       {len(r_items):>6} items in {t_r:.1f}s")
         print(
-            f"  duck_search()  {len(d_items):>6} items in {t_d:.1f}s  ({(t_r / t_d):.1f}x faster)"
+            f"  duck_search()  {len(d_df):>6} items in {t_d:.1f}s  ({(t_r / t_d):.1f}x faster)"
         )
         print(
             f"  overlap: {len(overlap)} ids  "
@@ -495,19 +495,19 @@ class TestProductionPerformance:
         import cql2
 
         raw_json = {"op": ">=", "args": [{"property": "percent_valid_pixels"}, 80]}
-        items_raw = catalog.duck_search(
+        df_raw = catalog.duck_search(
             intersects={"type": "Point", "coordinates": [-45, 70]},
             datetime="2020-01-01/2020-12-31",
             filter=raw_json,
             max_items=10,
         )
-        items_cql2 = catalog.duck_search(
+        df_cql2 = catalog.duck_search(
             intersects={"type": "Point", "coordinates": [-45, 70]},
             datetime="2020-01-01/2020-12-31",
             filter=cql2.parse_text("percent_valid_pixels >= 80").to_json(),
             max_items=10,
         )
-        ids_raw = {it.id for it in items_raw}
-        ids_cql2 = {it.id for it in items_cql2}
+        ids_raw = set(df_raw["id"])
+        ids_cql2 = set(df_cql2["id"])
         match = "✅" if ids_raw == ids_cql2 else "❌"
         print(f"\n  {match} cql2.parse_text() == raw JSON: {len(ids_raw)} ids match")

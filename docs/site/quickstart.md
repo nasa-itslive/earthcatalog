@@ -52,7 +52,7 @@ catalog.ingest("delta.parquet", mode="delta",
 Iceberg pruning narrows the search to relevant files, then DuckDB or
 rustac applies spatial, temporal, and CQL2 filters per file.
 
-### Fastest — `duck_search(format="native")`
+### Fastest — `duck_search()`
 
 Uses DuckDB's parallel I/O — **~2× faster** than the other methods
 across all query types.  Returns a ``pandas.DataFrame`` (no pystac

@@ -4,7 +4,7 @@ Three search methods, from fastest to most flexible.
 
 ---
 
-## Fastest — `duck_search(format="native")`
+## Fastest — `duck_search()`
 
 Uses DuckDB internally for parallel Parquet I/O.  **~2× faster** than
 the other methods across all query types.  Returns a ``pandas.DataFrame``
@@ -137,7 +137,7 @@ benchmarks across all methods against the production catalog.
 |---|---|---|---|
 | `search()` | ~2s | ~36s | ~55s |
 | `duck_search(pystac)` | ~2s | ~4s | ~57s |
-| `duck_search(native)` | **~2s** | **~3s (11×)** | **~28s (2×)** |
+| `duck_search()` | **~2s** | **~3s (11×)** | **~28s (2×)** |
 | `search_to_arrow()` | ~2s | ~34s | ~47s |
 
 ### How it works
@@ -148,12 +148,12 @@ benchmarks across all methods against the production catalog.
 
 For narrow queries (few files), all methods are bottlenecked by the
 S3 download + Parquet scan time (~1s per file).  For wide queries with
-sparse data spread across many files, ``duck_search(native)`` benefits
+sparse data spread across many files, ``duck_search()`` benefits
 from DuckDB's internal parallel I/O while rustac reads files sequentially.
 
 ### Performance Tips
 
-1. **Use ``duck_search(format="native")``** for fastest results
+1. **Use ``duck_search()``** for fastest results
 2. **Use ``search()`` for lazy iteration** with ``max_items=100`` — early exit avoids wasted work
 3. **Prefer temporal filters** — the ``year`` partition is heavily pruned
 4. **Spatial + temporal = fastest** — both partitions are pruned before any file is opened
@@ -274,7 +274,7 @@ print(f"{len(urls)} data URLs")
 # e.g. 'https://its-live-data.s3.amazonaws.com/velocity_image_pair/...nc'
 ```
 
-This is faster than ``duck_search(format="native")`` for URL extraction
+This is faster than ``duck_search()`` for URL extraction
 because it reads only 2 columns (``id``, ``assets``) instead of all 30+.
 For large result sets the savings are significant.
 
