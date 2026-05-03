@@ -515,17 +515,8 @@ def open(
             props["s3.anonymous"] = "true"
             props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
         else:
-            key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
-            secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-            token = os.environ.get("AWS_SESSION_TOKEN", "")
-            if key_id and secret:
-                props["s3.access-key-id"] = key_id
-                props["s3.secret-access-key"] = secret
-                if token:
-                    props["s3.session-token"] = token
-            else:
-                props["s3.anonymous"] = "true"
-                props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
+            props["s3.anonymous"] = "true"
+            props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
 
     sql_catalog = SqlCatalog(NAMESPACE, **props)
     table = get_or_create(sql_catalog)
@@ -672,7 +663,7 @@ class EarthCatalog:
             params=kwargs,
             engine=engine,
             table=self._table,
-            anonymous_ctx=self._anonymous_s3,
+            anonymous_ctx=self._cleared_env_s3,
         )
 
     def search_to_arrow(self, **kwargs):
@@ -688,17 +679,18 @@ class EarthCatalog:
             self._table, geom, start_datetime=start_datetime, end_datetime=end_datetime
         )
 
-    def _anonymous_s3(self):
-        """Context manager: clear AWS cred env vars for anonymous DuckDB S3."""
+    def _cleared_env_s3(self):
+        """Context manager: clear AWS cred env vars so rustac/DuckDB use unsigned requests.
+
+        rustac and DuckDB read ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` from the
+        environment rather than using the obstore store's auth.  When the environment has
+        credentials (e.g. for writes) but the caller wants anonymous S3 reads, this context
+        manager temporarily removes them and sets ``AWS_NO_SIGN_REQUEST=yes``.
+        """
         import os
         from contextlib import contextmanager
 
-        store = self._store
-        anonymous = (
-            store is not None
-            and hasattr(store, "config")
-            and store.config.get("skip_signature") in (True, "true")
-        )
+        anonymous = not os.environ.get("AWS_ACCESS_KEY_ID")
 
         @contextmanager
         def _ctx():
@@ -761,6 +753,8 @@ class EarthCatalog:
         import uuid
         from concurrent.futures import ThreadPoolExecutor
 
+        import os
+
         from .hash_index import (
             merge_hashes_from_parquets,
             read_hashes,
@@ -773,6 +767,13 @@ class EarthCatalog:
         )
         from earthcatalog.grids import build_partitioner
         from earthcatalog.pipelines.incremental import _fetch_item, _iter_inventory
+
+        if not os.environ.get("AWS_ACCESS_KEY_ID"):
+            raise RuntimeError(
+                "No AWS credentials found in environment. "
+                "ingest() requires write access to S3. "
+                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
+            )
 
         if mode == "auto":
             try:
@@ -919,6 +920,14 @@ class EarthCatalog:
         from earthcatalog.config import GridConfig
         from earthcatalog.grids import build_partitioner
         from earthcatalog.pipelines.backfill import run_backfill
+
+        import os
+        if not os.environ.get("AWS_ACCESS_KEY_ID"):
+            raise RuntimeError(
+                "No AWS credentials found in environment. "
+                "bulk_ingest() requires write access to S3. "
+                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
+            )
 
         warehouse_root = self._catalog.properties.get("warehouse", "")
         uri = self._catalog.properties.get("uri", "")

@@ -353,11 +353,12 @@ class EarthCatalogItemSearch:
             return
         seen = 0
         max_items = self._params.get("max_items")
-        for batch in self._engine.iter_items(files, **self._params):
-            yield batch
-            seen += len(batch)
-            if max_items is not None and seen >= max_items:
-                return
+        with self._anonymous_ctx():
+            for batch in self._engine.iter_items(files, **self._params):
+                yield batch
+                seen += len(batch)
+                if max_items is not None and seen >= max_items:
+                    return
 
     def item_collection(self):
         """Materialize all results into a ``pystac.ItemCollection``."""

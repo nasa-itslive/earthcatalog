@@ -34,9 +34,7 @@ earthcatalog takes a different approach — spatially partitioned GeoParquet:
 
 - **No moving parts**: Parquet files sit on S3, no database to maintain or sync
 - **Spatial partitioning**: Queries with spatial filters open only relevant files — typically 2-10 files out of 5,000
-- **H3 resolution 1**: 842 global cells at roughly equal area (~5M km² each); works with any grid, not tied to H3 specifically
 - **Zero serialization overhead**: DuckDB reads directly from S3; bulk exports are limited only by network bandwidth
-- **No credentials needed**: Public ITS_LIVE bucket accessible without AWS keys
 - **SQLite on S3**: No infrastructure (no RDS, no Glue, no REST API) — the catalog is a single SQLite file on S3
 
 ---
@@ -54,35 +52,39 @@ pip install -e .
 ### 2. Quick start
 
 ```python
-import earthcatalog as ea
+import earthcatalog
 from obstore.store import S3Store
 from shapely.geometry import box
 import duckdb
 
 # Open — returns EarthCatalog
 store = S3Store(bucket="its-live-data", region="us-west-2", skip_signature=True)
-ec = ea.open(store=store, base="s3://its-live-data/test-space/stac/catalog")
+catalog = earthcatalog.open(store=store, base="s3://its-live-data/test-space/stac/catalog")
 
 # Search — rustac-powered with Iceberg file pruning
-results = ec.search(
+search = catalog.search(
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter={"op": "=", "args": [{"property": "platform"}, "sentinel-1"]},
     max_items=10,
 )
 
+# we get pystac items back!
+for items in search.items():
+    print(items)
+
 # Or get results as a PyArrow table
-table = ec.search_to_arrow(bbox=[-60, 60, -20, 85])
+table = catalog.search_to_arrow(bbox=[-60, 60, -20, 85])
 ```
 
 ### 3. Ingest
 
 ```python
 # Daily delta (single-node)
-ec.ingest("s3://bucket/delta.parquet", mode="delta", update_hash_index=True)
+catalog.ingest("s3://bucket/delta.parquet", mode="delta", update_hash_index=True)
 
 # Large backfill (Dask/Coiled)
-ec.bulk_ingest("s3://bucket/full.parquet", create_client=coiled.Client)
+catalog.bulk_ingest("s3://bucket/full.parquet", create_client=coiled.Client)
 ```
 
 ---
