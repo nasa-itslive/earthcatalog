@@ -698,6 +698,95 @@ class EarthCatalog:
         with self._cleared_env_s3():
             return engine.search_to_arrow(**kwargs)
 
+    def search_uris(self, **kwargs):
+        """Return asset URIs as a DataFrame with ``(id, uri)`` columns.
+
+        Accepts the same kwargs as :meth:`search` (``intersects``, ``bbox``,
+        ``datetime``, ``filter``, ``max_items``, etc.).
+
+        Uses ``search_files()`` + DuckDB internally, reading **only** the
+        ``id`` and ``assets`` columns from S3 — fastest way to get download
+        URLs for thousands of items.  Returns a ``pandas.DataFrame``.
+
+        Examples::
+
+            import cql2
+            df = catalog.search_uris(
+                intersects={"type": "Point", "coordinates": [-45, 70]},
+                datetime="2020-01-01/2020-12-31",
+                filter=cql2.parse_text("percent_valid_pixels >= 80").to_json(),
+                max_items=100,
+            )
+            # df has columns: id, uri
+            for _, row in df.iterrows():
+                print(row.id, row.uri)
+        """
+        import json
+        import duckdb
+        from shapely.geometry import shape
+
+        from .search import _extract_datetime_range
+
+        # --- geometry ---
+        geom = None
+        if "intersects" in kwargs:
+            geom = shape(kwargs["intersects"])
+        elif "bbox" in kwargs:
+            from shapely.geometry import box
+            b = kwargs["bbox"]
+            geom = box(b[0], b[1], b[2], b[3])
+
+        # --- Iceberg pruning ---
+        start_dt, end_dt = _extract_datetime_range(**kwargs)
+        paths = self._info.file_paths(
+            self._table, geom,
+            start_datetime=start_dt, end_datetime=end_dt,
+        )
+        if not paths:
+            import pandas as pd
+            return pd.DataFrame({"id": [], "uri": []})
+
+        # --- build SQL (read only id + assets) ---
+        path_list = ", ".join(repr(p) for p in paths)
+        conditions: list[str] = []
+        if geom is not None:
+            conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
+        if start_dt is not None:
+            conditions.append(f"datetime >= '{start_dt}'")
+        if end_dt is not None:
+            conditions.append(f"datetime <= '{end_dt}'")
+        raw_filter = kwargs.get("filter")
+        if raw_filter is not None:
+            from .search import _cql2_to_sql
+            conditions.append(_cql2_to_sql(raw_filter))
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        max_items = kwargs.get("max_items")
+
+        sql = f"""SELECT id, assets FROM read_parquet([{path_list}]) WHERE {where}"""
+
+        # --- execute ---
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        con.execute("SET s3_access_key_id='';")
+        con.execute("SET s3_secret_access_key='';")
+        con.execute("SET s3_session_token='';")
+        df = con.execute(sql).fetchdf()
+        if max_items is not None and len(df) > max_items:
+            df = df.head(max_items)
+
+        # --- extract data URIs from JSON assets ---
+        uris = []
+        for _, row in df.iterrows():
+            href = None
+            if row["assets"]:
+                try:
+                    href = json.loads(row["assets"]).get("data", {}).get("href")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+            uris.append(href)
+        df = df.assign(uri=uris).drop(columns=["assets"])
+        return df
+
     def duck_search(self, format: str = "pystac", **kwargs):
         """Search using DuckDB, returning results in the requested *format*.
 
