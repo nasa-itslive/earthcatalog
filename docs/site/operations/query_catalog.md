@@ -229,6 +229,62 @@ WHERE ST_XMin(geometry) >= -140
 
 ---
 
+## Bulk URL extraction
+
+Fastest way to get data download URLs for thousands of items matching
+a spatial/temporal/property filter.  Uses ``search_files()`` + a targeted
+DuckDB query that reads **only** the columns needed.
+
+```python
+import duckdb, json
+import earthcatalog as ec
+from obstore.store import S3Store
+from shapely.geometry import box
+
+store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
+catalog = ec.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
+
+# 1. Iceberg pruning — fast, zero I/O
+greenland = box(-60, 60, -20, 85)
+paths = catalog.search_files(greenland, start_datetime='2020-01-01', end_datetime='2020-12-31')
+
+# 2. DuckDB — only reads assets + geometry + filter columns
+con = duckdb.connect()
+con.execute("INSTALL spatial; LOAD spatial;")
+con.execute("SET s3_access_key_id='';")
+con.execute("SET s3_secret_access_key='';")
+con.execute("SET s3_session_token='';")
+
+df = con.execute(f"""
+    SELECT id, assets
+    FROM read_parquet({paths})
+    WHERE percent_valid_pixels > 50
+      AND ST_Intersects(geometry, ST_GeomFromText('{greenland.wkt}'))
+""").df()
+
+# 3. Extract data URLs from the JSON assets column
+urls = []
+for _, row in df.iterrows():
+    assets = json.loads(row["assets"])
+    href = assets.get("data", {}).get("href")
+    if href:
+        urls.append(href)
+
+print(f"{len(urls)} data URLs")
+# e.g. 'https://its-live-data.s3.amazonaws.com/velocity_image_pair/...nc'
+```
+
+This is faster than ``duck_search(format="native")`` for URL extraction
+because it reads only 2 columns (``id``, ``assets``) instead of all 30+.
+For large result sets the savings are significant.
+
+If you prefer the simpler API at the cost of reading all columns:
+
+```python
+df = catalog.duck_search(format="native", ...)
+urls = [json.loads(a).get("data", {}).get("href") for a in df["assets"] if a]
+```
+
 ## API Reference
 
 ### EarthCatalog.info()
