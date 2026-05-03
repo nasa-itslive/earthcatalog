@@ -5,18 +5,24 @@
 Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg. Transforms STAC items from S3 into a queryable GeoParquet catalog with spatial + temporal partition pruning.
 
 ```python
-import earthcatalog as ea
+import earthcatalog as ec
 from obstore.store import S3Store
 
 store = S3Store(bucket="its-live-data", region="us-west-2")
-ec = ea.open(store=store, base="s3://bucket/catalog")
+catalog = ec.open(store=store, base="s3://bucket/catalog")
 
 # Ingest
-ec.ingest("delta.parquet", mode="delta", update_hash_index=True)
-ec.bulk_ingest("full_inventory.parquet", create_client=coiled.Client)
+catalog.ingest("delta.parquet", mode="delta", update_hash_index=True)
+catalog.bulk_ingest("full_inventory.parquet", create_client=coiled.Client)
 
-# Search
-paths = ec.search_files(geometry, start_datetime="2020-01-01")
+# Search — returns pystac Items with Iceberg pruning + CQL2 filters
+results = catalog.search(
+    intersects={"type": "Point", "coordinates": [0, 60]},
+    datetime="2020-01-01/2020-12-31",
+    max_items=100,
+)
+for item in results.items():
+    print(item.id, item.properties["platform"])
 ```
 
 ## Install
