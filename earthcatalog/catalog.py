@@ -691,16 +691,22 @@ class EarthCatalog:
         with self._cleared_env_s3():
             return engine.search_to_arrow(**kwargs)
 
-    def duck_search(self, **kwargs) -> list:
-        """Search using DuckDB directly, returning a list of ``pystac.Item``.
+    def duck_search(self, format: str = "pystac", **kwargs):
+        """Search using DuckDB, returning results in the requested *format*.
 
         Accepts the same kwargs as :meth:`search` (``intersects``, ``bbox``,
         ``datetime``, ``filter``, ``max_items``, etc.).
 
         DuckDB reads Parquet files in parallel internally, making this
         significantly faster than :meth:`search` for queries spanning many
-        files (e.g. wide temporal ranges with sparse data).  Results are
-        returned eagerly as a list.
+        files (e.g. wide temporal ranges with sparse data).
+
+        Parameters
+        ----------
+        format:
+            ``"pystac"`` (default) — return ``list[pystac.Item]``.
+            ``"native"`` — return a ``pandas.DataFrame`` with flat columns
+            (no pystac conversion overhead).
 
         Use ``cql2.parse_text()`` for the ``filter`` kwarg, or pass raw
         CQL2 JSON dicts directly.
@@ -781,7 +787,10 @@ class EarthCatalog:
                 if v is not None:
                     os.environ[k] = v
 
-        # --- convert DataFrame rows → pystac Items ---
+        # --- convert results ---
+        if format == "native":
+            return df
+
         _TOP_LEVEL = {"id", "type", "stac_version", "stac_extensions", "geometry", "bbox", "assets", "links", "collection"}
         items = []
         import pandas as pd
