@@ -141,24 +141,64 @@ WHERE ST_XMin(geometry) >= -140
 
 ---
 
-## Benchmarks
+## Performance
 
-| Query Type | Files Opened | Rows Returned | Latency |
-|-----------|-------------|--------------|--------|
-| Full scan (no filter) | 5,024 | 63.4M | ~30s |
-| Cell filter (10 cells) | ~50 | 5.2M | ~5s |
-| Cell + year (2020) | ~10 | 1.1M | ~1s |
-| Cell + year + platform | ~5 | 150K | ~0.5s |
-| Point intersection | ~2 | ~100 | ~0.3s |
+Estimated latency for a region like northern Greenland, based on the
+production catalog (63.4M rows, 5,024 files, ~12,600 items/file):
 
-> **Note**: Benchmarks are from the production catalog (~63M rows, 5k files). Actual times vary by network, instance type, and S3 throughput.
+| Scenario | Files after pruning | Est. latency | Items returned |
+|---|---|---|---|
+| Spatial only, no filter | ~80 | ~9s | ~1M |
+| + year=2020 | ~10 | ~1s | ~126K |
+| + year=2020 + CQL2 filter + max_items=100 | ~1 | ~0.1–0.2s | 100 |
+| + year=2020 + highly selective CQL2 + max_items=100 | ~2–3 | ~0.3–0.4s | ~50 |
+
+**Why `max_items=100` is fast**: the search reads files sequentially and
+stops as soon as enough matching items are found.  Since each warehouse
+file averages ~12,600 items, a `max_items=100` query almost always
+finishes after the first file regardless of filter selectivity —
+provided the filter matches at least 100 rows in that file.
+
+**Why latency scales with files, not total catalog size**: Iceberg
+partition pruning narrows the search to only the H3 cells and years
+that intersect your query geometry.  A point in Greenland resolves to
+~1-2 cells; a large polygon to ~5-10.  Each cell has 5-10 years of
+data, so even a full-catalog spatial query reads only ~25-100 files
+(out of 5,024).  The remaining 98% of files are never opened.
+
+### DuckDB Parquet predicate pushdown
+
+When a CQL2 filter (e.g. ``percent_valid_pixels >= 1``) is present,
+DuckDB's Parquet reader uses column chunk statistics (min, max)
+from the Parquet footer to skip row groups *before* decompressing
+any data:
+
+- Reads the Parquet footer (~1-10 KB per file)
+- For each row group, checks if ``stats.max >= 1``
+- Skips row groups that can't possibly match
+- Reads only the columns needed for the query from qualifying groups
+
+For regional-scale queries the files are small enough (single row group)
+that the footer read + full scan cost is similar regardless of filter
+selectivity.  Predicate pushdown becomes significant for large files
+with many row groups.
+
+### Benchmarks (test data: 1,000 items, 4 files)
+
+| Query | Items/s | Notes |
+|---|---|---|
+| No filter, max_items=100 | ~600 | Baseline |
+| `percent_valid_pixels >= 1`, max_items=100 | ~750 | Nearly all rows qualify |
+| `percent_valid_pixels <= 50`, max_items=100 | ~860 | ~50% qualify |
+| No limit, no filter | ~2,200 | Full sequential scan |
+| `pages()` | 4 pages | One per Iceberg partition |
 
 ### Performance Tips
 
-1. **Use Iceberg partition pruning**: `info.file_paths()` filters by H3 cell and year first
-2. **Prefer temporal filters**: Year partition is heavily pruned
-3. **Avoid ST_Intersects on full scans**: Use bbox filters when possible
-4. **Limit result sets**: Always use `LIMIT` for exploratory queries
+1. **Always use `max_items`** for exploratory queries — keeps latency under 0.2s
+2. **Prefer temporal filters** — the `year` partition is heavily pruned
+3. **Spatial + temporal = fastest** — both partitions are pruned before any file is opened
+4. **Highly selective CQL2 filters** (e.g. `percent_valid_pixels >= 95`) skip row groups via Parquet statistics but don't reduce the number of files opened — pair them with `max_items` for consistent latency
 
 ---
 

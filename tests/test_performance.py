@@ -27,6 +27,39 @@ Note: ``percent_valid_pixels`` is stored as ``LongType`` (int64) with
 Parquet statistics enabled.  Single-row-group files (common at this
 scale) are either fully read or fully skipped — no partial row-group
 skipping within a file.
+
+Real-world extrapolation (ITS_LIVE catalog)
+--------------------------------------------
+Production catalog: 63.4M rows, 5,024 files, ~12,600 items/file.
+
+The benchmark above uses 4 files, 250 items/file (= 1,000 items total).
+With sequential per-file processing, total latency scales linearly with
+the number of files read — not with the total catalog size.
+
+Northern Greenland estimate (H3 resolution 1, cells ~842H+ etc.):
+
+  Scenario                              Files after   Est. latency   Est. items
+                                         pruning      (sequential)    returned
+  ────────────────────────────────────────────────────────────────────────────
+  Spatial only, no filter                    ~80        80×0.115s ≈ 9s      1M
+  + year=2020                                ~10        10×0.115s ≈ 1s    126K
+  + year=2020 + max_items=100                 ~1         0.12s             100
+  + year=2020 + pvp>=1 + max_items=100        ~1         0.13s             100
+  + year=2020 + pvp>=95 + max_items=100       ~2-3       0.3-0.4s         ~54
+
+  Per-file latency ~0.115s (from benchmark: 0.459s / 4 files).
+  Spatial pruning: H3 cell filters via Iceberg ``In(grid_partition, ...)``.
+  Temporal pruning: Iceberg ``year`` partition filter.
+
+Key insight: ``max_items=N`` reads at most *one file* when the first file
+already contains N matching items.  Since warehouse files average ~12,600
+items, a ``max_items=100`` query always stops after the first file regardless
+of filter selectivity — provided the filter matches at least 100 rows in
+that file.  This makes bounded searches consistently fast (~0.1-0.2s).
+
+Without ``max_items`` the latency is proportional to the number of pruned
+files, not the total catalog size.  A full-year scan of a single H3 cell
+(~10 files, ~126K items) takes ~1s.
 """
 
 from __future__ import annotations
