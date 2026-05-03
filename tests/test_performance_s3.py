@@ -331,3 +331,78 @@ class TestProductionPerformance:
         print(f"  point (Greenland): {n_p} items in {t_p:.3f}s"
               f"  (files={s_p['files']}, est.rows={s_p['rows_upper_bound']:,})")
 
+    def test_rustac_vs_duckdb_wide_range(self, catalog):
+        """Compare rustac search() vs search_files() + DuckDB for wide temporal range.
+
+        Both use the same spatial/temporal/property filter:
+        - point at [-45, 70]
+        - datetime 1980-01-01 to 2015-12-31
+        - percent_valid_pixels >= 1
+        """
+        import os
+        import duckdb
+        from shapely.geometry import shape
+
+        geom = shape(GREENLAND_POINT)
+
+        # ---- rustac path ----
+        t0 = time.perf_counter()
+        rustac_items = list(
+            catalog.search(
+                intersects=GREENLAND_POINT,
+                datetime="1980-01-01/2015-12-31",
+                filter={"op": ">=", "args": [{"property": "percent_valid_pixels"}, 1]},
+            ).items()
+        )
+        rustac_elapsed = time.perf_counter() - t0
+        rustac_ids = {item.id for item in rustac_items}
+        rustac_first = rustac_items[0] if rustac_items else None
+
+        # ---- DuckDB path ----
+        t0 = time.perf_counter()
+        paths = catalog.search_files(geom, start_datetime="1980-01-01", end_datetime="2015-12-31")
+        path_list = ", ".join(repr(p) for p in paths)
+
+        saved = {
+            "AWS_ACCESS_KEY_ID": os.environ.pop("AWS_ACCESS_KEY_ID", None),
+            "AWS_SECRET_ACCESS_KEY": os.environ.pop("AWS_SECRET_ACCESS_KEY", None),
+            "AWS_SESSION_TOKEN": os.environ.pop("AWS_SESSION_TOKEN", None),
+        }
+        os.environ["AWS_NO_SIGN_REQUEST"] = "yes"
+        try:
+            con = duckdb.connect()
+            con.execute("INSTALL spatial; LOAD spatial;")
+            rows = con.execute(f"""
+                SELECT id, platform, datetime
+                FROM read_parquet([{path_list}])
+                WHERE percent_valid_pixels >= 1 AND
+                      ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))
+                ORDER BY datetime
+            """).fetchdf()
+        finally:
+            os.environ.pop("AWS_NO_SIGN_REQUEST", None)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+        duckdb_elapsed = time.perf_counter() - t0
+        duckdb_ids = set(rows["id"])
+
+        # ---- comparison ----
+        n_rustac = len(rustac_ids)
+        n_duckdb = len(duckdb_ids)
+        only_rustac = rustac_ids - duckdb_ids
+        only_duck = duckdb_ids - rustac_ids
+        overlap = rustac_ids & duckdb_ids
+
+        print(f"\n  rustac items():  {n_rustac:>6} items in {rustac_elapsed:.1f}s")
+        print(f"  duckdb SQL:      {n_duckdb:>6} items in {duckdb_elapsed:.1f}s")
+        print(f"  overlap: {len(overlap)} shared IDs"
+              f"  (rustac only: {len(only_rustac)}, duckdb only: {len(only_duck)})"
+              f"  files: {len(paths)}")
+
+        if rustac_first:
+            print(f"  first rustac item: {rustac_first.id}"
+                  f"  platform={rustac_first.properties.get('platform')}"
+                  f"  datetime={rustac_first.properties.get('datetime')}")
+
