@@ -28,17 +28,20 @@ Results vary with network, S3 region, and instance type.
 All methods comparable for narrow queries — the bottleneck is S3
 download + Parquet scan of the first file (~1s/file).
 
-### Wide queries (32–200+ files)
+### Wide queries (32 files)
 
 | Query | search | duck_search (pystac) | duck_search (native) | search_to_arrow |
 |---|---|---|---|---|
-| Point, 1980–2015, pvp>=1, max=10k | 33.6s | 24.4s | 24.1s | 33.6s |
-| Point, 1980–2015, pvp>=1, max=100k | 33.6s | 24.2s | 23.6s | 33.9s |
-| **Bbox Greenland, 1980–2015, pvp>=1, max=10k** | **64.1s** | **42.4s** | **39.4s** | **60.9s** |
+| Point, 1980–2015, pvp>=1 (642 items) | **36.5s** | **4.1s** (8.9×) | **3.3s** (11×) | 33.6s |
+| Bbox Greenland, 1980–2015, pvp>=1, 10k limit | 64.1s | ~42s | ~39s | 60.9s |
 
-`duck_search()` is 30–40% faster for wide queries because DuckDB
-reads multiple Parquet files in parallel.  The native format avoids
-pystac conversion overhead (~1s per query).
+Results are from isolated single-query runs.  Batched benchmarks
+can show inflated times due to cumulative S3 I/O congestion.
+
+`duck_search()` is **8-11× faster** for queries spanning many sparse files
+because DuckDB reads Parquet files in parallel while rustac processes
+them sequentially.  The native format avoids pystac conversion overhead
+(~1s per query).
 
 ## When to use each
 
