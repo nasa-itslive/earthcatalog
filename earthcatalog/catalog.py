@@ -667,6 +667,14 @@ class EarthCatalog:
         rustac generates broken SQL when ``datetime`` appears in a CQL2
         expression.
 
+        Performance
+        -----------
+        For fastest results use :meth:`duck_search` with ``format="native"``
+        (DuckDB parallel I/O, ~2× faster across all query types).
+        ``search()`` and ``search_to_arrow()`` use rustac (sequential per-file)
+        and have comparable speed.  See :doc:`/operations/search_performance`
+        for detailed benchmarks.
+
         Returns
         -------
         EarthCatalogItemSearch

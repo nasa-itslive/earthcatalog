@@ -47,24 +47,53 @@ catalog.ingest("delta.parquet", mode="delta",
           since=datetime.now(UTC) - timedelta(days=2))
 ```
 
-## Search with rustac
+## Search
 
-Higher-level search using `rustac.search` semantics with automatic file pruning.
-Accepts CQL2 filters, spatial predicates, and temporal ranges — same kwargs as
-`rustac.search()`.
+Iceberg pruning narrows the search to relevant files, then DuckDB or
+rustac applies spatial, temporal, and CQL2 filters per file.
+
+### Fastest — `duck_search(format="native")`
+
+Uses DuckDB's parallel I/O — **~2× faster** than the other methods
+across all query types.  Returns a ``pandas.DataFrame`` (no pystac
+conversion overhead).
 
 ```python
 import cql2
 
-# Spatial + temporal + CQL2 filter — Iceberg prunes files, rustac filters rows
+df = catalog.duck_search(
+    format="native",
+    intersects={"type": "Point", "coordinates": [0, 60]},
+    datetime="2020-01-01/2020-12-31",
+    filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
+    max_items=100,
+)
+# df is a pandas.DataFrame with flat columns
+```
+
+### Lazy / pystac — `search()`
+
+Returns a lazy ``EarthCatalogItemSearch`` that yields ``pystac.Item``
+objects.  Same speed as ``search_to_arrow()``.  Best for interactive
+use with ``max_items=100`` where early exit avoids wasted work.
+
+```python
 results = catalog.search(
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
     max_items=100,
 )
+for item in results.items():
+    print(item.id, item.properties["platform"])
+```
 
-# Results as a PyArrow table (zero-copy via Arrow PyCapsule protocol)
+### PyArrow — `search_to_arrow()`
+
+Returns a ``pyarrow.Table``.  Useful for zero-copy interchange with
+other Arrow-native tools.
+
+```python
 table = catalog.search_to_arrow(
     bbox=[-60, 60, -20, 85],
     datetime="2020-01/..",
