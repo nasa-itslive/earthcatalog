@@ -27,7 +27,6 @@ store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
 catalog = ec.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
 
 df = catalog.duck_search(
-    format="native",
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
@@ -45,13 +44,6 @@ scans.  ``duck_search()`` avoids this by fetching all matching rows and
 truncating in Python.  For ``max_items ≤ 100,000`` the overhead is
 negligible; for larger result sets use ``search_files()`` + hand-written
 DuckDB SQL (see BYO section).
-
-### Return a list of pystac Items
-
-```python
-items = catalog.duck_search(format="pystac", ...)
-# list[pystac.Item] — slower due to conversion overhead
-```
 
 ---
 
@@ -288,7 +280,7 @@ For large result sets the savings are significant.
 If you prefer the simpler API at the cost of reading all columns:
 
 ```python
-df = catalog.duck_search(format="native", ...)
+df = catalog.duck_search(...)
 urls = [json.loads(a).get("data", {}).get("href") for a in df["assets"] if a]
 ```
 

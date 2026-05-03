@@ -62,7 +62,6 @@ conversion overhead).
 import cql2
 
 df = catalog.duck_search(
-    format="native",
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
