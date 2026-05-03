@@ -1,6 +1,14 @@
 # Querying the Catalog
 
-Three search methods, from fastest to most flexible.
+Five search methods, from fastest to most flexible:
+
+| Method | Returns | Speed | When to use |
+|---|---|---|---|
+| `duck_search()` | `pandas.DataFrame` (all columns) | **~2×** | Fastest results, any query |
+| `search_uris()` | `DataFrame(id, uri)` | fastest for URLs | Bulk download URL extraction |
+| `search()` | lazy `EarthCatalogItemSearch` → `pystac.Item` | 1× | Need pystac objects, lazy iteration |
+| `search_to_arrow()` | `pyarrow.Table` | 1× | Arrow-native workflows |
+| `search_files()` | `list[str]` (file paths) | — | Custom DuckDB SQL |
 
 ---
 
@@ -134,10 +142,9 @@ See [`search_performance.md`](search_performance.md) for detailed
 benchmarks across all methods against the production catalog.
 
 | Method | Narrow query (2 files) | Wide query (32 files) | Wide + 100k limit |
-|---|---|---|---|
-| `search()` | ~2s | ~36s | ~55s |
-| `duck_search(pystac)` | ~2s | ~4s | ~57s |
+|---|---|---|---|---|
 | `duck_search()` | **~2s** | **~3s (11×)** | **~28s (2×)** |
+| `search()` | ~2s | ~36s | ~55s |
 | `search_to_arrow()` | ~2s | ~34s | ~47s |
 
 ### How it works
