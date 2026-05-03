@@ -764,28 +764,33 @@ class EarthCatalog:
 
         sql = f"""SELECT id, assets FROM read_parquet([{path_list}]) WHERE {where}"""
 
-        # --- execute ---
+        # --- execute (Arrow → list is faster than pandas iterrows) ---
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
         con.execute("SET s3_access_key_id='';")
         con.execute("SET s3_secret_access_key='';")
         con.execute("SET s3_session_token='';")
-        df = con.execute(sql).fetchdf()
-        if max_items is not None and len(df) > max_items:
-            df = df.head(max_items)
+        table = con.execute(sql).to_arrow_table()
+        if max_items is not None and table.num_rows > max_items:
+            table = table.slice(0, max_items)
 
         # --- extract data URIs from JSON assets ---
+        import pyarrow as pa
+
+        ids = table.column("id").to_pylist()
+        assets_list = table.column("assets").to_pylist()
         uris = []
-        for _, row in df.iterrows():
+        for a in assets_list:
             href = None
-            if row["assets"]:
+            if a:
                 try:
-                    href = json.loads(row["assets"]).get("data", {}).get("href")
+                    href = json.loads(a).get("data", {}).get("href")
                 except (json.JSONDecodeError, AttributeError):
                     pass
             uris.append(href)
-        df = df.assign(uri=uris).drop(columns=["assets"])
-        return df
+
+        import pandas as pd
+        return pd.DataFrame({"id": ids, "uri": uris})
 
     def duck_search(self, format: str = "pystac", **kwargs):
         """Search using DuckDB, returning results in the requested *format*.
