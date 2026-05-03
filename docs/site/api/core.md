@@ -9,8 +9,6 @@
 
 ::: earthcatalog.transform
 
-::: earthcatalog.schema
-
 ::: earthcatalog.lock
 
 ::: earthcatalog.store_config
