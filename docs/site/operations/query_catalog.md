@@ -46,13 +46,28 @@ CQL2 expressions support standard comparisons, `AND`/`OR`, `IN`, etc.:
 ```python
 cql2.parse_text('platform = "sentinel-2"')
 cql2.parse_text('percent_valid_pixels > 50')
-cql2.parse_text('datetime >= "2020-01-01" AND datetime <= "2022-12-31"')
 cql2.parse_text('platform IN ("sentinel-2", "landsat-8", "landsat-9")')
 cql2.parse_text('platform = "landsat-8" AND percent_valid_pixels > 70')
 ```
 
-For callers that already have CQL2 JSON (e.g. from a UI builder), the
-raw JSON format is also accepted:
+For temporal filtering use the top-level ``datetime`` kwarg (STAC-standard)
+instead of referencing ``datetime`` inside CQL2 — rustac generates broken SQL
+when ``datetime`` appears in a CQL2 expression:
+
+```python
+# ✅ Correct — use datetime kwarg
+results = catalog.search(
+    datetime="2020-01-01/2020-12-31",
+    filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
+)
+
+# ❌ Broken — rustac crashes when datetime is inside CQL2
+results = catalog.search(
+    filter=cql2.parse_text('datetime >= "2020-01-01" AND percent_valid_pixels >= 80').to_json(),
+)
+```
+
+Raw CQL2 JSON dicts are also accepted:
 
 ```python
 filter={"op": ">=", "args": [{"property": "percent_valid_pixels"}, 80]}

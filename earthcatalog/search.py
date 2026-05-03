@@ -116,6 +116,12 @@ class _FileSearchEngine:
         """Yield lists of items from each file in *files*.
 
         Each yielded value is a ``list[dict]`` — one per file.
+
+        Note: ``datetime`` is intentionally passed through to ``rustac.search_sync``
+        as a top-level kwarg.  Rustac handles the STAC temporal filter correctly
+        this way.  Do **not** reference ``datetime`` inside a CQL2 ``filter`` —
+        rustac generates broken SQL when ``datetime`` appears in both places.
+        Use the top-level ``datetime`` kwarg instead.
         """
         if not files:
             return

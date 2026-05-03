@@ -119,6 +119,24 @@ class TestQueryReturnsResults:
         ids = {r["id"] for r in results}
         assert ids == {"good-2020", "bad-2020"}
 
+    def test_datetime_kwarg_works(self, warehouse):
+        """``datetime`` as a top-level kwarg (the STAC-standard way) works
+        correctly.  Do NOT put ``datetime`` in a CQL2 filter — rustac generates
+        broken SQL when it appears in both places."""
+        wh, p = warehouse
+        from earthcatalog.search import _FileSearchEngine
+
+        s = _FileSearchEngine(prune_fn=lambda geom, **kw: self._prune_fn(wh, p, geom, **kw))
+
+        # Use datetime kwarg only — no CQL2 filter on datetime
+        results = s.search(
+            intersects={"type": "Point", "coordinates": [0, 60]},
+            datetime="2020-01-01/2020-12-31",
+        )
+        assert len(results) == 2
+        ids = {r["id"] for r in results}
+        assert ids == {"good-2020", "bad-2020"}
+
 
 class TestColumnPredicatePushdown:
     """Verify Parquet column statistics exist for filter pushdown."""
