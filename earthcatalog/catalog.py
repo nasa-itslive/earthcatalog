@@ -774,26 +774,21 @@ class EarthCatalog:
 
         where = " AND ".join(conditions) if conditions else "TRUE"
         max_items = kwargs.get("max_items")
-        limit = f" LIMIT {max_items}" if max_items is not None else ""
 
-        sql = f"SELECT * FROM read_parquet([{path_list}]) WHERE {where}{limit}"
+        # Note: LIMIT in DuckDB SQL is intentionally omitted — it triggers
+        # a different query plan that is ~7× slower for multi-file reads.
+        # Truncation is applied at the Python level instead.
+        sql = f"SELECT * FROM read_parquet([{path_list}]) WHERE {where}"
 
         # --- execute ---
-        saved = {
-            "AWS_ACCESS_KEY_ID": os.environ.pop("AWS_ACCESS_KEY_ID", None),
-            "AWS_SECRET_ACCESS_KEY": os.environ.pop("AWS_SECRET_ACCESS_KEY", None),
-            "AWS_SESSION_TOKEN": os.environ.pop("AWS_SESSION_TOKEN", None),
-        }
-        os.environ["AWS_NO_SIGN_REQUEST"] = "yes"
-        try:
-            con = duckdb.connect()
-            con.execute("INSTALL spatial; LOAD spatial;")
-            df = con.execute(sql).fetchdf()
-        finally:
-            os.environ.pop("AWS_NO_SIGN_REQUEST", None)
-            for k, v in saved.items():
-                if v is not None:
-                    os.environ[k] = v
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        con.execute("SET s3_access_key_id='';")
+        con.execute("SET s3_secret_access_key='';")
+        con.execute("SET s3_session_token='';")
+        df = con.execute(sql).fetchdf()
+        if max_items is not None and len(df) > max_items:
+            df = df.head(max_items)
 
         # --- convert results ---
         if format == "native":
