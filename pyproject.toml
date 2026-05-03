@@ -37,6 +37,8 @@ dev = [
   "pre-commit",
   "zensical",
   "mkdocstrings[python]",
+  "scalene",
+  "memray",
 ]
 
 [project.urls]

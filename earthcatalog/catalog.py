@@ -671,7 +671,8 @@ class EarthCatalog:
         from .search import _FileSearchEngine
 
         engine = _FileSearchEngine(prune_fn=self._search_prune)
-        return engine.search_to_arrow(**kwargs)
+        with self._cleared_env_s3():
+            return engine.search_to_arrow(**kwargs)
 
     def _search_prune(self, geom, start_datetime=None, end_datetime=None):
         """Prune warehouse files via Iceberg partition metadata (zero I/O)."""
@@ -683,14 +684,16 @@ class EarthCatalog:
         """Context manager: clear AWS cred env vars so rustac/DuckDB use unsigned requests.
 
         rustac and DuckDB read ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` from the
-        environment rather than using the obstore store's auth.  When the environment has
-        credentials (e.g. for writes) but the caller wants anonymous S3 reads, this context
-        manager temporarily removes them and sets ``AWS_NO_SIGN_REQUEST=yes``.
+        environment rather than using the obstore store's auth.  When the store was created
+        as anonymous (``skip_signature``) or the environment has no credentials, this
+        context manager temporarily removes them and sets ``AWS_NO_SIGN_REQUEST=yes``.
         """
         import os
         from contextlib import contextmanager
 
         anonymous = not os.environ.get("AWS_ACCESS_KEY_ID")
+        if not anonymous and self._store is not None and hasattr(self._store, "config"):
+            anonymous = self._store.config.get("skip_signature") in (True, "true")
 
         @contextmanager
         def _ctx():

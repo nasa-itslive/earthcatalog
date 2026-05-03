@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext as _nullcontext
 
 _JSON_FIELDS = frozenset({"assets", "links", "bbox", "stac_extensions"})
@@ -101,9 +100,8 @@ def _rustac_search_sync(href, **kwargs):
 class _FileSearchEngine:
     """Fan-out ``rustac.search_sync`` across Iceberg-pruned files."""
 
-    def __init__(self, prune_fn=None, max_workers: int = 8):
+    def __init__(self, prune_fn=None):
         self._prune_fn = prune_fn
-        self._max_workers = max_workers
 
     def prune(self, **kwargs) -> list[str]:
         if self._prune_fn is None:
@@ -123,17 +121,20 @@ class _FileSearchEngine:
             return
 
         max_items = kwargs.get("max_items")
+        seen = 0
 
         with _suppress_stderr():
-            with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-                futures = {pool.submit(_rustac_search_sync, f, **kwargs): f for f in files}
-                for future in as_completed(futures):
-                    items = future.result()
+            for f in files:
+                remaining = None
+                if max_items is not None:
+                    remaining = max_items - seen
+                    if remaining <= 0:
+                        break
+                file_kwargs = {**kwargs, "max_items": remaining} if remaining is not None else kwargs
+                items = _rustac_search_sync(f, **file_kwargs)
+                if items:
                     yield items
-                    if max_items is not None and len(items) >= max_items:
-                        for f in futures:
-                            f.cancel()
-                        return
+                    seen += len(items)
 
     def search(self, **kwargs) -> list[dict]:
         """Collect all results into a single list (legacy path)."""
