@@ -31,6 +31,27 @@ for `duck_search(pystac)`, making it comparable to `search()`.
 
 The `pvp>=1` filter has negligible effect — almost all items satisfy it.
 
+## Sparse region — small polygon, Alaska
+
+126 files after pruning, ~1.4M est. rows.  `pvp<50` is selective
+(~5–10% of items satisfy it), forcing all methods to scan more rows
+before hitting the 100k limit.
+
+| Query | search | duck_search (pystac) | duck_search (native) | search_to_arrow |
+|---|---|---|---|---|
+| 1980–2026, no filter, max=100k | 62.0s | 60.0s | **30.3s** (2.0×) | 54.6s |
+| 1980–2026, pvp<50, max=100k | 108.2s | 93.6s | **62.5s** (1.7×) | 99.1s |
+| 1980–2026, date_dt>=50, max=100k | T/O | T/O | T/O | T/O |
+
+`duck_search(native)` is consistently **~2× faster**.  The selective
+`pvp<50` filter reduces the gap slightly because DuckDB must scan
+all rows regardless of parallelism (the filter is applied after read).
+
+The `date_dt>=50` query timed out (>10 min) with all methods — highly
+selective filters over a wide temporal range can be expensive regardless
+of approach.  Add a narrower temporal range or use `max_items` sparingly
+for such cases.
+
 ## Sparse query — single point, 1980–2015
 
 Few files per cell (32 files), each with sparse matching items.
@@ -68,9 +89,18 @@ are bounded by the S3 download + scan time for one or two files
 
 ## Key insight
 
-DuckDB's parallel I/O gives the biggest win when items are **spread
+`duck_search(format="native")` is consistently **~2× faster** across
+all query types due to DuckDB's parallel I/O.  The `pystac` conversion
+overhead (~25–30s for 100k items) erases this advantage, making
+`duck_search(pystac)` comparable to `search()`.
+
+DuckDB's parallelism gives the biggest win when items are **spread
 across many files** (sparse queries across wide temporal ranges).
-For dense queries (abundant items in every file) or narrow queries
-(few files), `search()` matches `duck_search()` because rustac's
-sequential scan is bottlenecked by the same S3 download time anyway.
-`search_to_arrow()` is similar to `search()` since both use rustac.
+For a point query over 34 years with sparse matching items, the gain
+reaches **8–11×** because DuckDB reads all files concurrently while
+rustac reads them one at a time.
+
+Selective filters (`pvp<50`, `date_dt>=50`) reduce the gain because
+DuckDB must scan all rows regardless of parallelism — the filter is
+applied after the read.  For extreme cases (highly selective + wide
+temporal range), the query may time out with all methods.
