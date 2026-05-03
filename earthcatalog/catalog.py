@@ -691,6 +691,132 @@ class EarthCatalog:
         with self._cleared_env_s3():
             return engine.search_to_arrow(**kwargs)
 
+    def duck_search(self, **kwargs) -> list:
+        """Search using DuckDB directly, returning a list of ``pystac.Item``.
+
+        Accepts the same kwargs as :meth:`search` (``intersects``, ``bbox``,
+        ``datetime``, ``filter``, ``max_items``, etc.).
+
+        DuckDB reads Parquet files in parallel internally, making this
+        significantly faster than :meth:`search` for queries spanning many
+        files (e.g. wide temporal ranges with sparse data).  Results are
+        returned eagerly as a list.
+
+        Use ``cql2.parse_text()`` for the ``filter`` kwarg, or pass raw
+        CQL2 JSON dicts directly.
+
+        Examples::
+
+            import cql2
+            items = catalog.duck_search(
+                intersects={"type": "Point", "coordinates": [-45, 70]},
+                datetime="1980-01-01/2015-12-31",
+                filter=cql2.parse_text("percent_valid_pixels >= 80").to_json(),
+                max_items=100,
+            )
+        """
+        import os
+        import duckdb
+        from shapely.geometry import shape
+
+        from .search import _extract_datetime_range, _cql2_to_sql, _rehydrate
+
+        # --- geometry ---
+        geom = None
+        if "intersects" in kwargs:
+            geom = shape(kwargs["intersects"])
+        elif "bbox" in kwargs:
+            from shapely.geometry import box
+            b = kwargs["bbox"]
+            geom = box(b[0], b[1], b[2], b[3])
+
+        # --- Iceberg pruning ---
+        start_dt, end_dt = _extract_datetime_range(**kwargs)
+        paths = self._info.file_paths(
+            self._table, geom,
+            start_datetime=start_dt, end_datetime=end_dt,
+        )
+        if not paths:
+            return []
+
+        # --- build SQL ---
+        path_list = ", ".join(repr(p) for p in paths)
+        conditions: list[str] = []
+
+        # spatial
+        if geom is not None:
+            conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
+
+        # temporal
+        if start_dt is not None:
+            conditions.append(f"datetime >= '{start_dt}'")
+        if end_dt is not None:
+            conditions.append(f"datetime <= '{end_dt}'")
+
+        # CQL2 filter
+        raw_filter = kwargs.get("filter")
+        if raw_filter is not None:
+            conditions.append(_cql2_to_sql(raw_filter))
+
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        max_items = kwargs.get("max_items")
+        limit = f" LIMIT {max_items}" if max_items is not None else ""
+
+        sql = f"SELECT * FROM read_parquet([{path_list}]) WHERE {where}{limit}"
+
+        # --- execute ---
+        saved = {
+            "AWS_ACCESS_KEY_ID": os.environ.pop("AWS_ACCESS_KEY_ID", None),
+            "AWS_SECRET_ACCESS_KEY": os.environ.pop("AWS_SECRET_ACCESS_KEY", None),
+            "AWS_SESSION_TOKEN": os.environ.pop("AWS_SESSION_TOKEN", None),
+        }
+        os.environ["AWS_NO_SIGN_REQUEST"] = "yes"
+        try:
+            con = duckdb.connect()
+            con.execute("INSTALL spatial; LOAD spatial;")
+            df = con.execute(sql).fetchdf()
+        finally:
+            os.environ.pop("AWS_NO_SIGN_REQUEST", None)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+        # --- convert DataFrame rows → pystac Items ---
+        _TOP_LEVEL = {"id", "type", "stac_version", "stac_extensions", "geometry", "bbox", "assets", "links", "collection"}
+        items = []
+        import pandas as pd
+        import pystac
+        from shapely import wkb
+
+        for _, row in df.iterrows():
+            d = row.to_dict()
+            # DuckDB returns flat columns; nest non-top-level fields into "properties"
+            props = {}
+            top = {}
+            for k, v in d.items():
+                if k in _TOP_LEVEL:
+                    top[k] = v
+                else:
+                    props[k] = v
+            top["properties"] = props
+            d = top
+
+            # Convert pandas Timestamps → ISO strings
+            for k, v in list(d.get("properties", {}).items()):
+                if isinstance(v, pd.Timestamp):
+                    d["properties"][k] = v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # geometry: WKB bytes → GeoJSON dict
+            geo = d.get("geometry")
+            if isinstance(geo, (bytes, bytearray)):
+                d["geometry"] = wkb.loads(bytes(geo)).__geo_interface__
+
+            # JSON-string fields → native types
+            d = _rehydrate(d)
+            items.append(pystac.Item.from_dict(d))
+
+        return items
+
     def _search_prune(self, geom, start_datetime=None, end_datetime=None):
         """Prune warehouse files via Iceberg partition metadata (zero I/O)."""
         return self._info.file_paths(

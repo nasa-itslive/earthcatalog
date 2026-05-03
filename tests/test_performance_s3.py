@@ -406,3 +406,60 @@ class TestProductionPerformance:
                   f"  platform={rustac_first.properties.get('platform')}"
                   f"  datetime={rustac_first.properties.get('datetime')}")
 
+    def test_duck_search_vs_rustac(self, catalog):
+        """Compare duck_search() vs search() (rustac) for wide temporal range.
+
+        duck_search() uses DuckDB internally for parallel Parquet reads.
+        """
+        from shapely.geometry import shape
+
+        query = dict(
+            intersects={"type": "Point", "coordinates": [-45, 70]},
+            datetime="1980-01-01/2015-12-31",
+            filter={"op": ">=", "args": [{"property": "percent_valid_pixels"}, 1]},
+        )
+
+        # rustac
+        t0 = time.perf_counter()
+        r_items = list(catalog.search(**query).items())
+        t_r = time.perf_counter() - t0
+
+        # duck_search
+        t0 = time.perf_counter()
+        d_items = catalog.duck_search(**query)
+        t_d = time.perf_counter() - t0
+
+        r_ids = {item.id for item in r_items}
+        d_ids = {item.id for item in d_items}
+        overlap = r_ids & d_ids
+        info = catalog.search(intersects=GREENLAND_POINT, datetime="1980-01-01/2015-12-31").stats()
+
+        print(f"\n  search()       {len(r_items):>6} items in {t_r:.1f}s")
+        print(f"  duck_search()  {len(d_items):>6} items in {t_d:.1f}s"
+              f"  ({(t_r/t_d):.1f}x faster)")
+        print(f"  overlap: {len(overlap)} ids  "
+              f"(search only: {len(r_ids - d_ids)}, duck only: {len(d_ids - r_ids)})"
+              f"  files={info['files']}")
+
+    def test_duck_search_cql2_vs_raw_json(self, catalog):
+        """duck_search() with cql2.parse_text() vs raw JSON should match."""
+        import cql2
+
+        raw_json = {"op": ">=", "args": [{"property": "percent_valid_pixels"}, 80]}
+        items_raw = catalog.duck_search(
+            intersects={"type": "Point", "coordinates": [-45, 70]},
+            datetime="2020-01-01/2020-12-31",
+            filter=raw_json,
+            max_items=10,
+        )
+        items_cql2 = catalog.duck_search(
+            intersects={"type": "Point", "coordinates": [-45, 70]},
+            datetime="2020-01-01/2020-12-31",
+            filter=cql2.parse_text("percent_valid_pixels >= 80").to_json(),
+            max_items=10,
+        )
+        ids_raw = {it.id for it in items_raw}
+        ids_cql2 = {it.id for it in items_cql2}
+        match = "✅" if ids_raw == ids_cql2 else "❌"
+        print(f"\n  {match} cql2.parse_text() == raw JSON: {len(ids_raw)} ids match")
+

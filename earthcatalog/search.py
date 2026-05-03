@@ -451,3 +451,61 @@ def _item_in_datetime_range(item: dict, start: str | None, end: str | None) -> b
     if end is not None and dt > end:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# CQL2 → DuckDB SQL WHERE clause converter
+# ---------------------------------------------------------------------------
+
+
+def _cql2_to_sql(expr) -> str:
+    if isinstance(expr, str):
+        return _cql2_format_literal(expr)
+
+    if not isinstance(expr, dict):
+        return _cql2_format_literal(expr)
+
+    # Property reference
+    if "property" in expr and len(expr) == 1:
+        return expr["property"]
+
+    op = expr.get("op")
+    args = expr.get("args", [])
+
+    if op in ("=", "!=", ">", ">=", "<", "<="):
+        left = _cql2_to_sql(args[0])
+        right = _cql2_to_sql(args[1])
+        return f"{left} {op} {right}"
+
+    if op == "and":
+        return "(" + " AND ".join(_cql2_to_sql(a) for a in args) + ")"
+
+    if op == "or":
+        return "(" + " OR ".join(_cql2_to_sql(a) for a in args) + ")"
+
+    if op == "not":
+        return f"NOT ({_cql2_to_sql(args[0])})"
+
+    if op == "in":
+        left = _cql2_to_sql(args[0])
+        values = ", ".join(_cql2_format_literal(v) for v in args[1])
+        return f"{left} IN ({values})"
+
+    if op == "isNull":
+        return f"{_cql2_to_sql(args[0])} IS NULL"
+
+    raise ValueError(f"Unsupported CQL2 operator: {op}")
+
+
+def _cql2_format_literal(val) -> str:
+    """Format a Python literal for DuckDB SQL."""
+    if val is None:
+        return "NULL"
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, str):
+        escaped = val.replace("'", "''")
+        return f"'{escaped}'"
+    raise TypeError(f"Unsupported CQL2 literal type: {type(val).__name__}")
