@@ -1,0 +1,71 @@
+# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
+name: Daily Delta
+
+on:
+  # schedule:
+  #   - cron: "0 2 * * *" # 02:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Date for delta file name (YYYY-MM-DD). Defaults to today."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  WAREHOUSE_HASH: s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
+  DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
+
+jobs:
+  produce-delta:
+    name: Produce daily delta
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine manifest URL
+        id: manifest
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            DATE="${{ github.event.inputs.date }}"
+          else
+            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "manifest_url=s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory/${DATE}T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
+
+      - name: Run daily delta
+        run: |
+          uv run python scripts/daily_delta.py \
+            "${{ steps.manifest.outputs.manifest_url }}" \
+            --warehouse-hash ${{ env.WAREHOUSE_HASH }} \
+            --delta-prefix ${{ env.DELTA_PREFIX }} \
+            --date "${{ steps.manifest.outputs.date }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Delta Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Date: ${{ steps.manifest.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Manifest: \`${{ steps.manifest.outputs.manifest_url }}\`" >> "$GITHUB_STEP_SUMMARY"

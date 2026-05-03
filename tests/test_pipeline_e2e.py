@@ -16,7 +16,7 @@ from unittest.mock import patch
 import pytest
 from obstore.store import MemoryStore
 
-from earthcatalog.core import store_config
+from earthcatalog import store_config
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 from earthcatalog.pipelines.incremental import run
 
@@ -50,7 +50,7 @@ STAC_ITEMS = [
             "sat:orbit_state": "descending",
         },
         "links": [],
-        "assets": {},
+        "assets": {"data": {"href": f"s3://fake-bucket/item-{i:04d}.tif", "type": "image/tiff"}},
     }
     for i in range(6)
 ]
@@ -121,10 +121,10 @@ def _run_pipeline(inventory_csv, catalog_dirs, **kwargs):
             use_lock=False,
             **kwargs,
         )
-    from earthcatalog.core.catalog import get_or_create_table, open_catalog
+    from earthcatalog.catalog import _open_sqlite, get_or_create
 
-    catalog = open_catalog(db_path=db, warehouse_path=wh)
-    return get_or_create_table(catalog)
+    catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+    return get_or_create(catalog)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +132,7 @@ def _run_pipeline(inventory_csv, catalog_dirs, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.e2e
 class TestPipelineE2E:
     def test_rows_written(self, inventory_csv, catalog_dirs):
         """At least one row per STAC item must appear in the Iceberg table."""
@@ -174,18 +175,23 @@ class TestPipelineE2E:
         """STAC properties must appear as top-level columns, not nested dicts."""
         table = _run_pipeline(inventory_csv, catalog_dirs)
         result = table.scan().to_arrow()
-        for col in ("platform", "proj_code", "sat_orbit_state"):
+        for col in ("platform", "proj:code", "sat:orbit_state"):
             assert col in result.schema.names
             vals = [v for v in result.column(col).to_pylist() if v is not None]
             assert len(vals) > 0, f"column {col} is all-null"
 
-    def test_raw_stac_roundtrip(self, inventory_csv, catalog_dirs):
-        """raw_stac must deserialise back to the original item dict."""
+    def test_assets_json_roundtrip(self, inventory_csv, catalog_dirs):
+        """assets must be stored as JSON strings and deserialise back to a dict."""
         table = _run_pipeline(inventory_csv, catalog_dirs)
         result = table.scan().to_arrow()
-        stored_ids = {json.loads(r.as_py())["id"] for r in result.column("raw_stac")}
-        for item in STAC_ITEMS:
-            assert item["id"] in stored_ids
+        found = False
+        for v in result.column("assets").to_pylist():
+            if v is not None:
+                parsed = json.loads(v)
+                assert isinstance(parsed, dict)
+                found = True
+                break
+        assert found, "all assets values were null"
 
     def test_geoparquet_files_in_warehouse(self, inventory_csv, catalog_dirs):
         """GeoParquet files written to the warehouse must carry geo metadata."""
@@ -236,10 +242,10 @@ class TestPipelineE2E:
                 partitioner=H3Partitioner(resolution=2),
                 use_lock=False,
             )
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.catalog import _open_sqlite, get_or_create
 
-        catalog = open_catalog(db_path=db, warehouse_path=wh)
-        table = get_or_create_table(catalog)
+        catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+        table = get_or_create(catalog)
         assert len(table.history()) == 0
 
     def test_batch_add_files_single_snapshot(self, inventory_csv, catalog_dirs):
@@ -250,7 +256,7 @@ class TestPipelineE2E:
     def test_batch_add_files_multi_chunk_single_snapshot(self, inventory_csv, tmp_path):
         """With multiple chunks, batch_add_files=True still produces exactly
         one snapshot (chunk_size=2, 6 items → 3 chunks → 1 snapshot)."""
-        from earthcatalog.core.catalog import get_or_create_table, open_catalog
+        from earthcatalog.catalog import _open_sqlite, get_or_create
 
         db = str(tmp_path / "catalog_mc.db")
         wh = str(tmp_path / "wh_mc")
@@ -265,8 +271,8 @@ class TestPipelineE2E:
                 use_lock=False,
                 batch_add_files=True,
             )
-        catalog = open_catalog(db_path=db, warehouse_path=wh)
-        table = get_or_create_table(catalog)
+        catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+        table = get_or_create(catalog)
         assert len(table.history()) == 1, f"expected 1 snapshot, got {len(table.history())}"
 
     def test_batch_add_files_same_rows_as_incremental(self, inventory_csv, catalog_dirs, tmp_path):

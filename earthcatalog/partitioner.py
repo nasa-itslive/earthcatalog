@@ -12,9 +12,8 @@ Built-in implementations
 
 Custom partitioners
 -------------------
-Subclass :class:`AbstractPartitioner` and implement :meth:`get_intersecting_keys`
-and :meth:`key_to_wkt`, then pass an instance to
-:func:`~earthcatalog.core.transform.fan_out`.
+Subclass :class:`AbstractPartitioner` and implement :meth:`get_intersecting_keys`,
+then pass an instance to :func:`~earthcatalog.transform.fan_out`.
 """
 
 from abc import ABC, abstractmethod
@@ -30,9 +29,4 @@ class AbstractPartitioner(ABC):
     @abstractmethod
     def get_intersecting_keys(self, geom_wkb: bytes) -> list[str]:
         """Return grid cell IDs that intersect the given WKB geometry."""
-        ...
-
-    @abstractmethod
-    def key_to_wkt(self, key: str) -> str:
-        """Return the WKT boundary polygon of a grid cell (useful for debugging)."""
         ...

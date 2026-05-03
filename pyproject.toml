@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "earthcatalog"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,9 +17,26 @@ dependencies = [
   "numpy",
   "pyyaml",
   "typer",
-  "duckdb",
   "dask[distributed]",
-  "coiled",
+  "orjson",
+  "xxhash",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+  "duckdb",
+  "pandas",
+  "jupyterlab",
+  "dask-labextension",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-xdist",
+  "ruff",
+  "mypy",
+  "pre-commit",
+  "zensical",
+  "mkdocstrings[python]",
 ]
 
 [project.urls]
@@ -37,13 +54,11 @@ earthcatalog = "earthcatalog.cli:main"
 where = ["."]
 include = ["earthcatalog*"]
 
-[dependency-groups]
-dev = ["pytest", "ruff", "mypy", "zensical", "mkdocstrings[python]"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
   "integration: end-to-end tests that require real S3 read access (public ITS_LIVE bucket)",
+  "e2e: heavy pipeline tests skipped in pre-commit (run with pytest -m e2e)",
 ]
 
 [tool.ruff]
@@ -57,3 +72,7 @@ ignore = ["E501"]                   # line length enforced by formatter
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.setuptools_scm]
+version_scheme = "no-guess-dev"
+local_scheme = "node-and-date"

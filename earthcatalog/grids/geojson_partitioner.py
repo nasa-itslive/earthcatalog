@@ -17,7 +17,7 @@ from shapely import wkb
 from shapely.geometry import shape
 from shapely.strtree import STRtree
 
-from earthcatalog.core.partitioner import AbstractPartitioner
+from earthcatalog.partitioner import AbstractPartitioner
 
 
 def _load_bytes(path: str) -> bytes:
@@ -65,7 +65,3 @@ class GeoJSONPartitioner(AbstractPartitioner):
         geom = wkb.loads(geom_wkb)
         candidate_idxs = self._tree.query(geom, predicate="intersects")
         return [self._keys[i] for i in candidate_idxs]
-
-    def key_to_wkt(self, key: str) -> str:
-        idx = self._keys.index(key)
-        return self._geometries[idx].wkt

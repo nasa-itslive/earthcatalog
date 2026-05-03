@@ -29,9 +29,9 @@ This guarantees no data gap at cell boundaries regardless of item shape.
 import h3
 import numpy as np
 from shapely import wkb
-from shapely.geometry import Polygon, mapping
+from shapely.geometry import mapping
 
-from earthcatalog.core.partitioner import AbstractPartitioner
+from earthcatalog.partitioner import AbstractPartitioner
 
 
 def _boundary_cells(geom: object, resolution: int) -> set[str]:
@@ -77,11 +77,3 @@ class H3Partitioner(AbstractPartitioner):
         interior = set(h3.geo_to_cells(mapping(geom), self.resolution))
         boundary = _boundary_cells(geom, self.resolution)
         return list(interior | boundary)
-
-    def key_to_wkt(self, key: str) -> str:
-        """Return the WKT boundary polygon for an H3 cell."""
-        # h3.cell_to_boundary returns [(lat, lng), ...] pairs
-        boundary_latlng = h3.cell_to_boundary(key)
-        # Convert to (lng, lat) for Shapely / WKT
-        coords = [(lng, lat) for lat, lng in boundary_latlng]
-        return Polygon(coords).wkt

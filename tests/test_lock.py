@@ -1,5 +1,5 @@
 """
-Tests for earthcatalog.core.lock — S3Lock using MemoryStore.
+Tests for earthcatalog.lock — S3Lock using MemoryStore.
 
 All tests run fully offline with no S3 credentials needed.
 """
@@ -10,8 +10,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from obstore.store import MemoryStore
 
-from earthcatalog.core import store_config
-from earthcatalog.core.lock import CatalogLocked, S3Lock
+from earthcatalog import store_config
+from earthcatalog.lock import CatalogLocked, S3Lock
 
 
 @pytest.fixture(autouse=True)

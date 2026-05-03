@@ -4,14 +4,12 @@ Round-trip integration test: fan_out + write_geoparquet → add_files → scan.
 Uses a fully in-process SQLite catalog (tmp_path) — no S3, no network.
 """
 
-import json
-
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from earthcatalog.core.catalog import get_or_create_table, open_catalog
-from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
+from earthcatalog.catalog import _open_sqlite, get_or_create
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
 # ---------------------------------------------------------------------------
@@ -37,8 +35,8 @@ ITEMS = [
             "proj:code": "EPSG:32632",
             "sat:orbit_state": "ascending",
         },
-        "links": [],
-        "assets": {},
+        "links": [{"href": "http://example.com", "rel": "canonical"}],
+        "assets": {"data": {"href": f"s3://bucket/item-{i:04d}.tif", "title": f"Data {i}"}},
     }
     for i in range(5)
 ]
@@ -48,8 +46,8 @@ ITEMS = [
 def iceberg_table(tmp_path):
     db = str(tmp_path / "catalog.db")
     warehouse = str(tmp_path / "warehouse")
-    catalog = open_catalog(db_path=db, warehouse_path=warehouse)
-    return get_or_create_table(catalog), tmp_path
+    catalog = _open_sqlite(db_path=db, warehouse_path=warehouse)
+    return get_or_create(catalog), tmp_path
 
 
 def _write_and_add(iceberg_table_fixture, items, resolution=2):
@@ -72,6 +70,7 @@ def _write_and_add(iceberg_table_fixture, items, resolution=2):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.e2e
 class TestRoundTrip:
     def test_append_and_scan_row_count(self, iceberg_table, tmp_path):
         """Rows written must be readable back via PyIceberg scan."""
@@ -103,8 +102,8 @@ class TestRoundTrip:
         table = _write_and_add(iceberg_table, ITEMS)
         result = table.scan().to_arrow()
         assert result.schema.field("id").type == pa.string()
-        assert result.schema.field("percent_valid_pixels").type == pa.int32()
-        assert result.schema.field("date_dt").type == pa.int32()
+        assert result.schema.field("percent_valid_pixels").type == pa.int64()
+        assert result.schema.field("date_dt").type == pa.int64()
         # geometry is binary (WKB) — may come back as binary or large_binary
         assert result.schema.field("geometry").type in (pa.binary(), pa.large_binary())
 
@@ -144,13 +143,35 @@ class TestRoundTrip:
         result = table.scan().to_arrow()
         assert result.num_rows == n * 2
 
-    def test_raw_stac_recoverable(self, iceberg_table, tmp_path):
-        """raw_stac must deserialise back to the original item dict."""
-        table = _write_and_add(iceberg_table, [ITEMS[0]])
-        result = table.scan().to_arrow()
-        raw = json.loads(result.column("raw_stac")[0].as_py())
-        assert raw["id"] == ITEMS[0]["id"]
-        assert raw["properties"]["platform"] == "sentinel-1"
+    def test_pystac_roundtrip(self, iceberg_table, tmp_path):
+        """Search results must produce valid ``pystac.Item`` objects.
+
+        Our Iceberg schema stores ``assets``, ``links``, and ``bbox`` as
+        JSON strings.  The search layer must rehydrate them to native
+        types so ``pystac.Item.from_dict()`` works.
+        """
+        import pystac
+        import rustac
+
+        from earthcatalog.search import _rehydrate
+
+        p = H3Partitioner(resolution=2)
+        rows = fan_out([ITEMS[0]], p)
+        out = str(tmp_path / "rehydrate_test.parquet")
+        write_geoparquet(rows, out)
+
+        raw = rustac.search_sync(out)
+        assert len(raw) > 0
+        result = _rehydrate(raw[0])
+
+
+        item = pystac.Item.from_dict(result)
+        assert item.id == ITEMS[0]["id"]
+        assert isinstance(item.geometry, dict)
+        assert isinstance(item.properties, dict)
+        assert isinstance(item.assets, dict)
+        assert "data" in item.assets
+        assert len(item.links) >= 1
 
     def test_grid_partition_column_populated(self, iceberg_table, tmp_path):
         """Every row must have a non-null, non-empty grid_partition."""

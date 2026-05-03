@@ -1,128 +1,100 @@
 # Quick Start
 
-Get earthcatalog up and running in five minutes.
+EarthCatalog ingests STAC items from S3 into a spatially-partitioned GeoParquet
+catalog backed by Apache Iceberg. Instead of a database, Parquet files sit on S3
+and a small SQLite file tracks the Iceberg schema. DuckDB reads them directly —
+no serialization overhead, no infrastructure.
 
----
+## Bulk ingest
 
-## Prerequisites
-
-- [mamba](https://mamba.readthedocs.io/) (or conda) for environment management
-- Python 3.12+
-- AWS credentials (only needed to write to a private S3 bucket; reading ITS_LIVE data is public)
-
----
-
-## 1. Install
-
-```bash
-# Create the conda environment
-mamba env create -f environment.yml
-mamba activate itslive-ingest
-
-# Install earthcatalog in editable mode
-pip install -e .
-```
-
-Or with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv sync
-uv run earthcatalog --help
-```
-
----
-
-## 2. Generate a test inventory
-
-```bash
-python -m earthcatalog.tools.make_test_inventory \
-    --prefix test-space/velocity_image_pair/nisar/v02 \
-    --limit  500 \
-    --output /tmp/test_inventory.csv
-```
-
-This reads the ITS_LIVE public S3 bucket (no credentials needed) and writes
-a CSV with `bucket` + `key` columns pointing to `.stac.json` files.
-
----
-
-## 3. Run the incremental pipeline
-
-=== "With flags"
-
-    ```bash
-    earthcatalog incremental \
-        --inventory  /tmp/test_inventory.csv \
-        --catalog    /tmp/catalog.db \
-        --warehouse  /tmp/warehouse \
-        --limit      500
-    ```
-
-=== "With a config file"
-
-    ```yaml title="config/h3_r1.yaml"
-    catalog:
-      db_path:   /tmp/catalog.db
-      warehouse: /tmp/warehouse
-
-    grid:
-      type:       h3
-      resolution: 1
-
-    ingest:
-      chunk_size:  500
-      max_workers: 8
-    ```
-
-    ```bash
-    earthcatalog incremental \
-        --config    config/h3_r1.yaml \
-        --inventory /tmp/test_inventory.csv
-    ```
-
----
-
-## 4. Query with DuckDB
+First-time full backfill from an S3 Inventory file. Drops any existing table and
+recreates it from scratch.
 
 ```python
-import duckdb
-from earthcatalog.core.catalog import open_catalog, get_or_create_table
+import earthcatalog as ea
+from obstore.store import S3Store
 
-catalog = open_catalog(db_path="/tmp/catalog.db", warehouse_path="/tmp/warehouse")
-table   = get_or_create_table(catalog)
+store = S3Store(bucket="its-live-data", region="us-west-2")
+ec = ea.open(store=store, base="s3://my-bucket/catalog")
+
+ec.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
+               create_client=lambda: coiled.Client(n_workers=100))
+```
+
+For smaller inventories the single-node path works without Dask:
+
+```python
+ec.ingest("s3://bucket/inventory/full.parquet", mode="full")
+```
+
+## Delta ingest
+
+Daily incremental updates. Appends new files to the existing table without
+overwriting, and updates the hash index for duplicate detection.
+
+```python
+ec.ingest("s3://bucket/delta/2026-04-28.parquet",
+          mode="delta",
+          update_hash_index=True)
+```
+
+Optionally filter by modification date:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+ec.ingest("delta.parquet", mode="delta",
+          since=datetime.now(UTC) - timedelta(days=2))
+```
+
+## Search with rustac
+
+Higher-level search using `rustac.search` semantics with automatic file pruning.
+Accepts CQL2 filters, spatial predicates, and temporal ranges — same kwargs as
+`rustac.search()`.
+
+```python
+# Spatial + temporal + CQL2 filter — Iceberg prunes files, rustac filters rows
+results = ec.search(
+    intersects={"type": "Point", "coordinates": [0, 60]},
+    datetime="2020-01-01/2020-12-31",
+    filter={"op": "=", "args": [{"property": "platform"}, "sentinel-1"]},
+    max_items=100,
+)
+
+# Results as a PyArrow table (zero-copy via Arrow PyCapsule protocol)
+table = ec.search_to_arrow(
+    bbox=[-60, 60, -20, 85],
+    datetime="2020-01/..",
+)
+```
+
+## Query with DuckDB
+
+Lower-level: Iceberg partition pruning finds the relevant Parquet file paths,
+then DuckDB reads them directly.
+
+```python
+from shapely.geometry import box
+import duckdb
+
+greenland = box(-60, 60, -20, 85)
+paths = ec.search_files(greenland, start_datetime="2020-01-01")
 
 con = duckdb.connect()
-con.execute("INSTALL iceberg; LOAD iceberg;")
-
+con.execute("INSTALL spatial; LOAD spatial;")
 df = con.execute(f"""
-    SELECT id, platform, grid_partition, datetime
-    FROM iceberg_scan('{table.metadata_location}')
-    WHERE platform = 'sentinel-2'
-    LIMIT 20
+    SELECT id, platform, datetime
+    FROM read_parquet({paths})
+    WHERE ST_Intersects(geometry, ST_GeomFromText('{greenland.wkt}'))
+    LIMIT 10
 """).df()
-
-print(df)
 ```
 
----
+## Catalog info
 
-## 5. Inspect the warehouse layout
-
-```bash
-find /tmp/warehouse -name "*.parquet" | head -10
-# grid_partition=820957fffffffff/year=2021/part_000000_abc.parquet
-# grid_partition=820957fffffffff/year=2022/part_000000_def.parquet
-# ...
+```python
+ec.stats()              # per-partition row/file counts
+ec.unique_item_count()  # unique STAC items (from hash index)
+ec.info()               # grid metadata (type, resolution, boundaries)
 ```
-
-Each file covers exactly one `(H3 cell, year)` bucket — matching the
-Iceberg `IdentityTransform(grid_partition)` + `YearTransform(datetime)` partition spec.
-
----
-
-## Next steps
-
-- [Architecture](../architecture.md) — understand how the pipeline works
-- [Configuration](../configuration.md) — full YAML reference
-- [Backfill pipeline](../pipelines/backfill.md) — process the full historical catalog with Dask
-- [Operations: Ingest Guide](../operations/ingest_guide.md) — production runbook

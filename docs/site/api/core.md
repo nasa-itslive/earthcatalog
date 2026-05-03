@@ -1,13 +1,18 @@
 # Core API
 
-::: earthcatalog.core.schema
+::: earthcatalog.catalog.EarthCatalog
 
-::: earthcatalog.core.transform
+::: earthcatalog.catalog
+    options:
+      filters:
+        - "!^_"
 
-::: earthcatalog.core.catalog
+::: earthcatalog.transform
 
-::: earthcatalog.core.lock
+::: earthcatalog.schema
 
-::: earthcatalog.core.store_config
+::: earthcatalog.lock
 
-::: earthcatalog.core.partitioner
+::: earthcatalog.store_config
+
+::: earthcatalog.partitioner

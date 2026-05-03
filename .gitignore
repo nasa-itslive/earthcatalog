@@ -177,3 +177,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.python-version
+
+# AI token usage logs
+token-usage-output.txt

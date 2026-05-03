@@ -89,14 +89,14 @@ import obstore
 import pyarrow.parquet as pq
 from obstore.store import S3Store
 
-from earthcatalog.core.catalog import (
+from earthcatalog.catalog import (
+    _open_sqlite,
     download_catalog,
-    get_or_create_table,
-    open_catalog,
+    get_or_create,
     upload_catalog,
 )
-from earthcatalog.core.lock import S3Lock
-from earthcatalog.core.transform import fan_out, group_by_partition, write_geoparquet
+from earthcatalog.lock import S3Lock
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids import build_partitioner
 from earthcatalog.grids.h3_partitioner import H3Partitioner
 
@@ -348,33 +348,6 @@ def _parse_manifest(manifest_s3_uri: str) -> tuple[str, object, list[str]]:
     return source_bucket, dest_store, data_keys
 
 
-def _list_manifest_files(
-    manifest_s3_uri: str,
-) -> tuple[str, object, list[str]]:
-    """
-    Parse an S3 Inventory ``manifest.json`` and return the file list without
-    streaming any row data.
-
-    This is the split-friendly entry point for the spot-resilient backfill
-    pipeline.  Each data file can be processed as an independent mini-run,
-    enabling per-file checkpointing.
-
-    Parameters
-    ----------
-    manifest_s3_uri:
-        ``s3://`` URI to the ``manifest.json``, e.g.
-        ``s3://my-log-bucket/inventory/.../manifest.json``.
-
-    Returns
-    -------
-    (source_bucket, dest_store, data_keys)
-        ``source_bucket``  — the S3 bucket inventoried (e.g. ``its-live-data``).
-        ``dest_store``     — authenticated ``S3Store`` for the destination bucket.
-        ``data_keys``      — list of object keys for Parquet data files.
-    """
-    return _parse_manifest(manifest_s3_uri)
-
-
 def _iter_inventory_file_from_store(
     store: object,
     data_key: str,
@@ -560,8 +533,8 @@ def run(
     def _ingest() -> None:
         download_catalog(catalog_path)
 
-        catalog = open_catalog(db_path=catalog_path, warehouse_path=warehouse_path)
-        table = get_or_create_table(catalog, grid_config=grid_config)
+        catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path)
+        table = get_or_create(catalog, grid_config=grid_config)
         print(f"Catalog  : {catalog_path}")
         print(f"Table    : {table.name()}")
 

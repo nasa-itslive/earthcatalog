@@ -89,6 +89,46 @@ value of the `id_field` property.
 
 ---
 
+## Inventory file format
+
+The inventory (and delta) file tells earthcatalog which STAC items to ingest.
+It must contain at minimum two columns — `bucket` and `key` — pointing to
+`.stac.json` files on S3.
+
+### Parquet
+
+```parquet
+bucket: string    # S3 bucket (e.g. "its-live-data")
+key:    string    # S3 object key ending in ".stac.json"
+```
+
+Optional column for `since=` filtering:
+
+```
+last_modified_date: timestamp  # used when --since is passed
+```
+
+### CSV
+
+Same columns, header row required when using `--since`:
+
+```csv
+bucket,key,last_modified_date
+its-live-data,path/to/item.stac.json,2026-04-28T01:00:00.000Z
+```
+
+### Delta files
+
+Delta parquets use the **same schema** as the full inventory — only the rows
+differ (new/modified items only). Both `ec.ingest()` and `ec.bulk_ingest()`
+read any supported format.
+
+### Manifest (AWS S3 Inventory)
+
+A `manifest.json` referencing multiple Parquet data files in a private
+destination bucket. earthcatalog reads credentials from env vars or
+`~/.aws/credentials`.
+
 ## Environment variables (S3 store)
 
 earthcatalog reads AWS credentials from standard environment variables when

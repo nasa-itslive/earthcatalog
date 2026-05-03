@@ -1,12 +1,12 @@
 """
-Tests for earthcatalog.core.catalog — download/upload using MemoryStore.
+Tests for earthcatalog.catalog — download/upload using MemoryStore.
 """
 
 import pytest
 from obstore.store import MemoryStore
 
-from earthcatalog.core import store_config
-from earthcatalog.core.catalog import download_catalog, upload_catalog
+from earthcatalog import store_config
+from earthcatalog.catalog import download_catalog, upload_catalog
 
 
 @pytest.fixture(autouse=True)

@@ -12,7 +12,7 @@ Usage:
 from __future__ import annotations
 
 from earthcatalog.config import GridConfig
-from earthcatalog.core.partitioner import AbstractPartitioner
+from earthcatalog.partitioner import AbstractPartitioner
 
 
 def build_partitioner(cfg: GridConfig) -> AbstractPartitioner:
