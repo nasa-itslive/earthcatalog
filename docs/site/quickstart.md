@@ -100,6 +100,22 @@ table = catalog.search_to_arrow(
 )
 ```
 
+### Bulk URIs — `search_uris()`
+
+Returns a ``pandas.DataFrame`` with ``(id, uri)`` — the data download
+URLs extracted from the ``assets`` column.  Reads only 2 columns from
+S3, making it the fastest method for URL-only workflows.
+
+```python
+df = catalog.search_uris(
+    intersects={"type": "Point", "coordinates": [-45, 70]},
+    filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
+    max_items=1000,
+)
+for _, row in df.iterrows():
+    print(row.id, row.uri)
+```
+
 ## Query with DuckDB
 
 Lower-level: Iceberg partition pruning finds the relevant Parquet file paths,

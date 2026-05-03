@@ -285,6 +285,17 @@ df = catalog.duck_search(format="native", ...)
 urls = [json.loads(a).get("data", {}).get("href") for a in df["assets"] if a]
 ```
 
+Or use the dedicated method that does all of the above:
+
+```python
+df = catalog.search_uris(
+    intersects={"type": "Point", "coordinates": [-45, 70]},
+    datetime="2020-01-01/2020-12-31",
+    max_items=100,
+)
+# df has columns: id, uri (data download URL extracted from assets)
+```
+
 ## API Reference
 
 ### EarthCatalog.info()
