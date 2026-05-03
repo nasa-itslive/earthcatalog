@@ -67,8 +67,12 @@ else:
 # Open catalog
 # ---------------------------------------------------------------------------
 
-from earthcatalog.catalog import FULL_NAME, PROP_HASH_INDEX_PATH, _open_sqlite  # noqa: E402
-from earthcatalog.catalog import _catalog_info  # noqa: E402
+from earthcatalog.catalog import (  # noqa: E402
+    FULL_NAME,
+    PROP_HASH_INDEX_PATH,
+    _catalog_info,  # noqa: E402
+    _open_sqlite,
+)
 
 # Force anonymous S3 access — public buckets don't need credentials,
 # and existing creds may not have permission on every bucket.

@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 from obstore.store import MemoryStore
 
+from earthcatalog.grids.h3_partitioner import H3Partitioner
 from earthcatalog.transform import (
     FileMetadata,
     fan_out,
@@ -25,7 +26,6 @@ from earthcatalog.transform import (
     write_geoparquet,
     write_geoparquet_s3,
 )
-from earthcatalog.grids.h3_partitioner import H3Partitioner
 
 # ---------------------------------------------------------------------------
 # Shared fixtures

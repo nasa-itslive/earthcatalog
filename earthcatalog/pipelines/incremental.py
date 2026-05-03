@@ -95,10 +95,10 @@ from earthcatalog.catalog import (
     get_or_create,
     upload_catalog,
 )
-from earthcatalog.lock import S3Lock
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids import build_partitioner
 from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.lock import S3Lock
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
 # One store per bucket — reused across all fetches
 _STORES: dict[str, S3Store] = {}

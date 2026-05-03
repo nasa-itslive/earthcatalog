@@ -64,7 +64,9 @@ class TestFileSearchEngine:
 
         monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [])
 
-        eng.search(intersects={"type": "Point", "coordinates": [0, 60]}, datetime="2020-01-01/2020-12-31")
+        eng.search(
+            intersects={"type": "Point", "coordinates": [0, 60]}, datetime="2020-01-01/2020-12-31"
+        )
         assert len(calls) == 1
         assert calls[0][0] is not None
         assert calls[0][1] == "2020-01-01"
@@ -89,7 +91,9 @@ class TestFileSearchEngine:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet", "b.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}"} for _ in range(5)])
+        monkeypatch.setattr(
+            rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}"} for _ in range(5)]
+        )
         results = eng.search(intersects={"type": "Point", "coordinates": [0, 60]}, max_items=3)
         assert len(results) == 3
 
@@ -116,7 +120,9 @@ class TestEarthCatalogItemSearch:
         import rustac
 
         monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}"}])
-        sr = EarthCatalogItemSearch(params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng)
+        sr = EarthCatalogItemSearch(
+            params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
+        )
         results = list(sr.items_as_dicts())
         assert len(results) == 2
         assert results[0]["id"] == "item-a.parquet"
@@ -126,16 +132,24 @@ class TestEarthCatalogItemSearch:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{
-            "id": "test-id",
-            "type": "Feature",
-            "stac_version": "1.0.0",
-            "geometry": {"type": "Point", "coordinates": [0, 60]},
-            "properties": {"datetime": "2020-01-01T00:00:00Z"},
-            "links": [],
-            "assets": {},
-        }])
-        sr = EarthCatalogItemSearch(params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng)
+        monkeypatch.setattr(
+            rustac,
+            "search_sync",
+            lambda href, **kw: [
+                {
+                    "id": "test-id",
+                    "type": "Feature",
+                    "stac_version": "1.0.0",
+                    "geometry": {"type": "Point", "coordinates": [0, 60]},
+                    "properties": {"datetime": "2020-01-01T00:00:00Z"},
+                    "links": [],
+                    "assets": {},
+                }
+            ],
+        )
+        sr = EarthCatalogItemSearch(
+            params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
+        )
         items = list(sr.items())
         assert len(items) == 1
         assert items[0].id == "test-id"
@@ -146,7 +160,9 @@ class TestEarthCatalogItemSearch:
         import rustac
 
         monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": "item"}])
-        sr = EarthCatalogItemSearch(params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng)
+        sr = EarthCatalogItemSearch(
+            params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
+        )
         assert list(sr) == [{"id": "item"}]
 
     def test_pages(self, monkeypatch):
@@ -158,7 +174,9 @@ class TestEarthCatalogItemSearch:
             return [{"id": f"item-{href}-{i}"} for i in range(2)]
 
         monkeypatch.setattr(rustac, "search_sync", fake)
-        sr = EarthCatalogItemSearch(params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng)
+        sr = EarthCatalogItemSearch(
+            params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
+        )
         pages = list(sr.pages())
         assert len(pages) == 2
         assert len(pages[0]) == 2
@@ -169,8 +187,13 @@ class TestEarthCatalogItemSearch:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet", "b.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}-{i}"} for i in range(5)])
-        sr = EarthCatalogItemSearch(params={"intersects": {"type": "Point", "coordinates": [0, 60]}, "max_items": 3}, engine=eng)
+        monkeypatch.setattr(
+            rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}-{i}"} for i in range(5)]
+        )
+        sr = EarthCatalogItemSearch(
+            params={"intersects": {"type": "Point", "coordinates": [0, 60]}, "max_items": 3},
+            engine=eng,
+        )
         results = list(sr.items_as_dicts())
         assert len(results) == 3
 
@@ -191,7 +214,10 @@ class TestEarthCatalogItemSearch:
 
     def test_repr_shows_params(self):
         eng = _FileSearchEngine()
-        sr = EarthCatalogItemSearch(params={"max_items": 10, "collections": ["test"], "bbox": [-120, 35, -119, 36]}, engine=eng)
+        sr = EarthCatalogItemSearch(
+            params={"max_items": 10, "collections": ["test"], "bbox": [-120, 35, -119, 36]},
+            engine=eng,
+        )
         r = repr(sr)
         assert "EarthCatalogItemSearch" in r
         assert "max_items=10" in r
@@ -205,7 +231,9 @@ class TestEarthCatalogItemSearch:
 
     def test_html_repr_contains_params(self):
         eng = _FileSearchEngine()
-        sr = EarthCatalogItemSearch(params={"max_items": 10, "bbox": [-120, 35, -119, 36]}, engine=eng)
+        sr = EarthCatalogItemSearch(
+            params={"max_items": 10, "bbox": [-120, 35, -119, 36]}, engine=eng
+        )
         html = sr._repr_html_()
         assert "EarthCatalogItemSearch" in html
         assert "max_items" in html
@@ -217,14 +245,20 @@ class TestSearchToArrow:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{
-            "id": "test",
-            "type": "Feature",
-            "stac_version": "1.0.0",
-            "geometry": {"type": "Point", "coordinates": [0, 60]},
-            "properties": {"datetime": "2020-01-01T00:00:00Z"},
-            "links": [],
-            "assets": {},
-        }])
+        monkeypatch.setattr(
+            rustac,
+            "search_sync",
+            lambda href, **kw: [
+                {
+                    "id": "test",
+                    "type": "Feature",
+                    "stac_version": "1.0.0",
+                    "geometry": {"type": "Point", "coordinates": [0, 60]},
+                    "properties": {"datetime": "2020-01-01T00:00:00Z"},
+                    "links": [],
+                    "assets": {},
+                }
+            ],
+        )
         result = eng.search_to_arrow(intersects={"type": "Point", "coordinates": [0, 60]})
         assert result.num_rows == 1

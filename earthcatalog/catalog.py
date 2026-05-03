@@ -33,7 +33,7 @@ from pyiceberg.types import (
 )
 
 if TYPE_CHECKING:
-    from .lock import S3Lock
+    from pyiceberg.table import Table
 
 from . import store_config
 
@@ -193,8 +193,7 @@ def _build_stats_cache(table) -> list[dict]:
 
 @dataclass
 class CatalogInfo:
-    """Grid metadata read from Iceberg table properties.
-    """
+    """Grid metadata read from Iceberg table properties."""
 
     grid_type: str
     grid_resolution: int | None
@@ -729,11 +728,10 @@ class EarthCatalog:
                 max_items=100,
             )
         """
-        import os
         import duckdb
         from shapely.geometry import shape
 
-        from .search import _extract_datetime_range, _cql2_to_sql, _rehydrate
+        from .search import _cql2_to_sql, _extract_datetime_range, _rehydrate
 
         # --- geometry ---
         geom = None
@@ -741,14 +739,17 @@ class EarthCatalog:
             geom = shape(kwargs["intersects"])
         elif "bbox" in kwargs:
             from shapely.geometry import box
+
             b = kwargs["bbox"]
             geom = box(b[0], b[1], b[2], b[3])
 
         # --- Iceberg pruning ---
         start_dt, end_dt = _extract_datetime_range(**kwargs)
         paths = self._info.file_paths(
-            self._table, geom,
-            start_datetime=start_dt, end_datetime=end_dt,
+            self._table,
+            geom,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
         )
         if not paths:
             return []
@@ -794,7 +795,17 @@ class EarthCatalog:
         if format == "native":
             return df
 
-        _TOP_LEVEL = {"id", "type", "stac_version", "stac_extensions", "geometry", "bbox", "assets", "links", "collection"}
+        _TOP_LEVEL = {
+            "id",
+            "type",
+            "stac_version",
+            "stac_extensions",
+            "geometry",
+            "bbox",
+            "assets",
+            "links",
+            "collection",
+        }
         items = []
         import pandas as pd
         import pystac
@@ -820,7 +831,7 @@ class EarthCatalog:
 
             # geometry: WKB bytes → GeoJSON dict
             geo = d.get("geometry")
-            if isinstance(geo, (bytes, bytearray)):
+            if isinstance(geo, bytes | bytearray):
                 d["geometry"] = wkb.loads(bytes(geo)).__geo_interface__
 
             # JSON-string fields → native types
@@ -908,10 +919,12 @@ class EarthCatalog:
         The caller is responsible for holding an S3Lock around this call
         when running against a shared store (use ``self.lock()``).
         """
+        import os
         import uuid
         from concurrent.futures import ThreadPoolExecutor
 
-        import os
+        from earthcatalog.grids import build_partitioner
+        from earthcatalog.pipelines.incremental import _fetch_item, _iter_inventory
 
         from .hash_index import (
             merge_hashes_from_parquets,
@@ -923,8 +936,6 @@ class EarthCatalog:
             group_by_partition,
             write_geoparquet_s3,
         )
-        from earthcatalog.grids import build_partitioner
-        from earthcatalog.pipelines.incremental import _fetch_item, _iter_inventory
 
         if not os.environ.get("AWS_ACCESS_KEY_ID"):
             raise RuntimeError(
@@ -1072,6 +1083,7 @@ class EarthCatalog:
         retry_pending: bool = False,
     ) -> None:
         """Ingest large inventories using a distributed Dask cluster."""
+        import os
         from datetime import UTC
         from datetime import datetime as _dt
 
@@ -1079,7 +1091,6 @@ class EarthCatalog:
         from earthcatalog.grids import build_partitioner
         from earthcatalog.pipelines.backfill import run_backfill
 
-        import os
         if not os.environ.get("AWS_ACCESS_KEY_ID"):
             raise RuntimeError(
                 "No AWS credentials found in environment. "

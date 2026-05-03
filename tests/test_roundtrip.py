@@ -9,8 +9,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from earthcatalog.catalog import _open_sqlite, get_or_create
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -163,7 +163,6 @@ class TestRoundTrip:
         raw = rustac.search_sync(out)
         assert len(raw) > 0
         result = _rehydrate(raw[0])
-
 
         item = pystac.Item.from_dict(result)
         assert item.id == ITEMS[0]["id"]

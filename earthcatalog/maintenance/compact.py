@@ -70,7 +70,14 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from obstore.store import LocalStore
 
-from earthcatalog.catalog import FULL_NAME, _HIVE_RE, _open_sqlite, download_catalog, get_or_create, upload_catalog
+from earthcatalog.catalog import (
+    _HIVE_RE,
+    FULL_NAME,
+    _open_sqlite,
+    download_catalog,
+    get_or_create,
+    upload_catalog,
+)
 from earthcatalog.transform import FileMetadata
 
 # Matches the hive-style path layout written by both run() and run_backfill():
@@ -321,8 +328,6 @@ def _compact_warehouse_impl(
 
     # Drop and recreate the table to clear all stale manifest entries.
     from pyiceberg.exceptions import NoSuchTableError
-
-    from earthcatalog.catalog import FULL_NAME
 
     try:
         catalog.drop_table(FULL_NAME)

@@ -12,8 +12,8 @@ import duckdb
 import pytest
 
 from earthcatalog.catalog import _open_sqlite, get_or_create
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
 # ---------------------------------------------------------------------------
 # Shared fixtures

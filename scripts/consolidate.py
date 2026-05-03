@@ -278,12 +278,12 @@ def rebuild_catalog(
     from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
     from earthcatalog.catalog import (
+        _HIVE_RE,
         FULL_NAME,
         ICEBERG_SCHEMA,
         NAMESPACE,
         PARTITION_SPEC,
         PROP_GRID_TYPE,
-        _HIVE_RE,
         _open_sqlite,
         upload_catalog,
     )

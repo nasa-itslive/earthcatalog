@@ -138,7 +138,11 @@ class _FileSearchEngine:
                     remaining = max_items - seen
                     if remaining <= 0:
                         break
-                file_kwargs = {**_rustac_kwargs, "max_items": remaining} if remaining is not None else _rustac_kwargs
+                file_kwargs = (
+                    {**_rustac_kwargs, "max_items": remaining}
+                    if remaining is not None
+                    else _rustac_kwargs
+                )
                 items = _rustac_search_sync(f, **file_kwargs)
                 if not items:
                     continue
@@ -213,7 +217,16 @@ class EarthCatalogItemSearch:
 
     def __repr__(self) -> str:
         parts = []
-        for k in ("collections", "max_items", "bbox", "datetime", "intersects", "filter", "ids", "query"):
+        for k in (
+            "collections",
+            "max_items",
+            "bbox",
+            "datetime",
+            "intersects",
+            "filter",
+            "ids",
+            "query",
+        ):
             v = self._params.get(k)
             if v is not None:
                 parts.append(f"{k}={v!r}")
@@ -226,7 +239,17 @@ class EarthCatalogItemSearch:
 
     def _repr_html_(self) -> str:
         rows = ""
-        for k in ("collections", "ids", "bbox", "intersects", "datetime", "filter", "query", "max_items", "sortby"):
+        for k in (
+            "collections",
+            "ids",
+            "bbox",
+            "intersects",
+            "datetime",
+            "filter",
+            "query",
+            "max_items",
+            "sortby",
+        ):
             v = self._params.get(k)
             if v is not None:
                 val = str(v)
@@ -244,9 +267,9 @@ class EarthCatalogItemSearch:
         if s is not None:
             rows += f"""
                 <tr><td style='padding:4px 8px;border:none;width:180px;font-weight:600'>files</td>
-                <td style='padding:4px 8px;border:none'>{s['files']:,}</td></tr>
+                <td style='padding:4px 8px;border:none'>{s["files"]:,}</td></tr>
                 <tr><td style='padding:4px 8px;border:none;width:180px;font-weight:600'>data (est.)</td>
-                <td style='padding:4px 8px;border:none'>{_format_bytes(s['bytes_upper_bound'])}</td></tr>"""
+                <td style='padding:4px 8px;border:none'>{_format_bytes(s["bytes_upper_bound"])}</td></tr>"""
         return f"""<div style='border:1px solid #ddd;border-radius:4px;padding:12px;max-width:800px;font-family:sans-serif'>
             <div style='font-weight:700;font-size:15px;margin-bottom:8px'>EarthCatalogItemSearch</div>
             <table style='border-collapse:collapse;width:100%;font-size:13px'>{rows}</table></div>"""
@@ -388,10 +411,12 @@ def _extract_geometry(**kwargs):
     intersects = kwargs.get("intersects")
     if intersects is not None:
         from shapely.geometry import shape
+
         return shape(intersects)
     bbox = kwargs.get("bbox")
     if bbox is not None:
         from shapely.geometry import box
+
         return box(bbox[0], bbox[1], bbox[2], bbox[3])
     return None
 
@@ -503,7 +528,7 @@ def _cql2_format_literal(val) -> str:
         return "NULL"
     if isinstance(val, bool):
         return "TRUE" if val else "FALSE"
-    if isinstance(val, (int, float)):
+    if isinstance(val, int | float):
         return str(val)
     if isinstance(val, str):
         escaped = val.replace("'", "''")

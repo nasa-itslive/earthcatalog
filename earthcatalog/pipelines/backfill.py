@@ -81,6 +81,8 @@ from earthcatalog.catalog import (
     _open_sqlite,
     upload_catalog,
 )
+from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.pipelines.incremental import _iter_inventory
 from earthcatalog.transform import (
     fan_out,
     group_by_partition,
@@ -88,8 +90,6 @@ from earthcatalog.transform import (
 from earthcatalog.transform import (
     write_geoparquet as _write_geoparquet,
 )
-from earthcatalog.grids.h3_partitioner import H3Partitioner
-from earthcatalog.pipelines.incremental import _iter_inventory
 
 _FETCH_RETRIES = 3
 _FETCH_BACKOFF_BASE = 0.5

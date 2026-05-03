@@ -11,11 +11,12 @@ import pytest
 from obstore.store import MemoryStore
 from shapely.geometry import Point, box
 
-from earthcatalog.config import GridConfig
-from earthcatalog import EarthCatalog, open as ec_open
+from earthcatalog import EarthCatalog
+from earthcatalog import open as ec_open
 from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
+from earthcatalog.config import GridConfig
 from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -490,10 +491,9 @@ class TestBulkIngest:
 
     def test_bulk_ingest_derives_params(self, tmp_path, monkeypatch):
         """bulk_ingest correctly resolves mode and passes params to run_backfill."""
-        from earthcatalog.config import GridConfig
         from earthcatalog import EarthCatalog
-        from earthcatalog.catalog import _open_sqlite, get_or_create
-        from earthcatalog.catalog import _catalog_info
+        from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
+        from earthcatalog.config import GridConfig
 
         store = MemoryStore()
         db = str(tmp_path / "catalog.db")

@@ -67,10 +67,11 @@ from __future__ import annotations
 import time
 
 import pytest
+
 from earthcatalog.catalog import _open_sqlite, get_or_create
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
-from earthcatalog.grids.h3_partitioner import H3Partitioner
 from earthcatalog.config import GridConfig
+from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -137,7 +138,10 @@ def _make_prune_fn(table):
     info = _catalog_info(table)
 
     def _prune(geom, start_datetime=None, end_datetime=None):
-        return info.file_paths(table, geom, start_datetime=start_datetime, end_datetime=end_datetime)
+        return info.file_paths(
+            table, geom, start_datetime=start_datetime, end_datetime=end_datetime
+        )
+
     return _prune
 
 
@@ -163,8 +167,10 @@ class TestSearchPerformance:
             max_items=100,
         )
         assert len(items) == 100
-        print(f"\n  no filter, max_items=100: {len(items)} items in {elapsed:.3f}s "
-              f"({len(items)/elapsed:.0f} items/s)")
+        print(
+            f"\n  no filter, max_items=100: {len(items)} items in {elapsed:.3f}s "
+            f"({len(items) / elapsed:.0f} items/s)"
+        )
 
     def test_filter_high_selectivity(self, warehouse):
         """percent_valid_pixels >= 1 — nearly all rows qualify."""
@@ -176,8 +182,10 @@ class TestSearchPerformance:
             max_items=100,
         )
         assert len(items) == 100
-        print(f"\n  percent_valid_pixels >= 1, max_items=100: {len(items)} items in {elapsed:.3f}s "
-              f"({len(items)/elapsed:.0f} items/s)")
+        print(
+            f"\n  percent_valid_pixels >= 1, max_items=100: {len(items)} items in {elapsed:.3f}s "
+            f"({len(items) / elapsed:.0f} items/s)"
+        )
 
     def test_filter_low_selectivity(self, warehouse):
         """percent_valid_pixels <= 50 — ~50% of rows qualify."""
@@ -189,8 +197,10 @@ class TestSearchPerformance:
             max_items=100,
         )
         assert len(items) == 100
-        print(f"\n  percent_valid_pixels <= 50, max_items=100: {len(items)} items in {elapsed:.3f}s "
-              f"({len(items)/elapsed:.0f} items/s)")
+        print(
+            f"\n  percent_valid_pixels <= 50, max_items=100: {len(items)} items in {elapsed:.3f}s "
+            f"({len(items) / elapsed:.0f} items/s)"
+        )
 
     def test_filter_highly_selective(self, warehouse):
         """percent_valid_pixels >= 95 — ~5% of rows qualify, may not reach max_items."""
@@ -201,9 +211,12 @@ class TestSearchPerformance:
             filter={"op": ">=", "args": [{"property": "percent_valid_pixels"}, 95]},
             max_items=100,
         )
-        print(f"\n  percent_valid_pixels >= 95, max_items=100: {len(items)} items in {elapsed:.3f}s "
-              f"({len(items)/elapsed:.0f} items/s)" if items else
-              f"\n  percent_valid_pixels >= 95: 0 items (no matching rows)")
+        print(
+            f"\n  percent_valid_pixels >= 95, max_items=100: {len(items)} items in {elapsed:.3f}s "
+            f"({len(items) / elapsed:.0f} items/s)"
+            if items
+            else "\n  percent_valid_pixels >= 95: 0 items (no matching rows)"
+        )
 
     def test_no_limit(self, warehouse):
         """No max_items — read all matching items from pruned files."""
@@ -212,8 +225,10 @@ class TestSearchPerformance:
             intersects={"type": "Point", "coordinates": [-45, 70]},
             datetime="1980-01-01/2026-12-31",
         )
-        print(f"\n  no limit, no filter: {len(items)} items in {elapsed:.3f}s "
-              f"({len(items)/elapsed:.0f} items/s)")
+        print(
+            f"\n  no limit, no filter: {len(items)} items in {elapsed:.3f}s "
+            f"({len(items) / elapsed:.0f} items/s)"
+        )
 
     def test_paginated_search(self, warehouse):
         """Materialize via pages() — measure per-page latency."""

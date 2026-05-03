@@ -19,8 +19,8 @@ import pytest
 from obstore.store import LocalStore, MemoryStore
 
 from earthcatalog import store_config
-from earthcatalog.transform import write_geoparquet as _write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.transform import write_geoparquet as _write_geoparquet
 
 _PARTITIONER = H3Partitioner(resolution=2)
 
@@ -78,8 +78,8 @@ def _make_inventory_csv(pairs: list[tuple[str, str]]) -> str:
 
 class TestCompactCellYear:
     def test_reads_ndjson_and_writes_parquet(self, tmp_path):
-        from earthcatalog.transform import fan_out, group_by_partition
         from earthcatalog.pipelines.backfill import compact_cell_year
+        from earthcatalog.transform import fan_out, group_by_partition
 
         store = MemoryStore()
         fo = fan_out(_STAC_ITEMS, _PARTITIONER)
@@ -120,8 +120,8 @@ class TestCompactCellYear:
         assert report["output_rows"] == 0
 
     def test_writes_to_store(self):
-        from earthcatalog.transform import fan_out, group_by_partition
         from earthcatalog.pipelines.backfill import compact_cell_year
+        from earthcatalog.transform import fan_out, group_by_partition
 
         store = MemoryStore()
         wh_store = MemoryStore()

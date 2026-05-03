@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import re
 
 import obstore
 import pyarrow.parquet as pq

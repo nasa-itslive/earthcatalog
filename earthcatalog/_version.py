@@ -1,4 +1,5 @@
 """Package version from setuptools-scm (git tags) and git commit."""
+
 from __future__ import annotations
 
 import re

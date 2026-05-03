@@ -7,14 +7,15 @@ from datetime import UTC, datetime
 import pytest
 from shapely.geometry import Point, box
 
-from earthcatalog.config import GridConfig
 from earthcatalog.catalog import (
     PROP_GRID_RESOLUTION,
     PROP_GRID_TYPE,
+    CatalogInfo,
+    _catalog_info,
     _open_sqlite,
     get_or_create,
 )
-from earthcatalog.catalog import CatalogInfo, _catalog_info
+from earthcatalog.config import GridConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -138,8 +139,8 @@ class TestCellsForGeometry:
 class TestStats:
     def test_returns_rows(self, tmp_path):
         from earthcatalog.catalog import _open_sqlite, get_or_create
-        from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
         from earthcatalog.grids.h3_partitioner import H3Partitioner
+        from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
@@ -173,8 +174,8 @@ class TestStats:
 
     def test_row_counts_match_fan_out(self, tmp_path):
         from earthcatalog.catalog import _open_sqlite, get_or_create
-        from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
         from earthcatalog.grids.h3_partitioner import H3Partitioner
+        from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
@@ -229,8 +230,8 @@ class TestStats:
 
     def test_year_is_calendar_year(self, tmp_path):
         from earthcatalog.catalog import _open_sqlite, get_or_create
-        from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
         from earthcatalog.grids.h3_partitioner import H3Partitioner
+        from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
@@ -297,8 +298,8 @@ class TestStats:
 
 def _build_multiyear_warehouse(tmp_path, years):
     from earthcatalog.catalog import _open_sqlite, get_or_create
-    from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
     from earthcatalog.grids.h3_partitioner import H3Partitioner
+    from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")

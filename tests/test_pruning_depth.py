@@ -10,8 +10,8 @@ from __future__ import annotations
 import pyarrow.parquet as pq
 import pytest
 
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 from earthcatalog.grids.h3_partitioner import H3Partitioner
+from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
 
 @pytest.fixture
@@ -79,8 +79,10 @@ class TestQueryReturnsResults:
 
     def _prune_fn(self, wh, p, geom, start_datetime=None, end_datetime=None):
         from shapely import wkb
+
         cells = set(p.get_intersecting_keys(wkb.dumps(geom)))
         import os
+
         paths = []
         for root, dirs, files in os.walk(wh):
             for f in files:

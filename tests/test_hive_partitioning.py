@@ -7,22 +7,29 @@ import pytest
 
 @pytest.fixture
 def hive_warehouse(tmp_path):
-    from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
     from earthcatalog.grids.h3_partitioner import H3Partitioner
+    from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
     items = []
-    for i, (lon, lat, yr) in enumerate([
-        (0, 60, 2020), (10, 65, 2021), (-10, 55, 2020), (20, 70, 2022),
-    ]):
-        items.append({
-            "id": f"item-{i:04d}",
-            "type": "Feature",
-            "stac_version": "1.0.0",
-            "geometry": {"type": "Point", "coordinates": [lon, lat]},
-            "properties": {"datetime": f"{yr}-06-15T00:00:00Z", "platform": "sentinel-1"},
-            "links": [],
-            "assets": {},
-        })
+    for i, (lon, lat, yr) in enumerate(
+        [
+            (0, 60, 2020),
+            (10, 65, 2021),
+            (-10, 55, 2020),
+            (20, 70, 2022),
+        ]
+    ):
+        items.append(
+            {
+                "id": f"item-{i:04d}",
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {"datetime": f"{yr}-06-15T00:00:00Z", "platform": "sentinel-1"},
+                "links": [],
+                "assets": {},
+            }
+        )
 
     p = H3Partitioner(resolution=2)
     wh = tmp_path / "warehouse"
@@ -36,11 +43,13 @@ def hive_warehouse(tmp_path):
 class TestHivePruning:
     def test_unfiltered(self, hive_warehouse):
         from rustac import DuckdbClient
+
         client = DuckdbClient(use_hive_partitioning=True)
         assert len(client.search(f"{hive_warehouse}/*/*/*.parquet")) == 4
 
     def test_single_cell_filter(self, hive_warehouse):
         from rustac import DuckdbClient
+
         client = DuckdbClient(use_hive_partitioning=True)
         results = client.search(
             f"{hive_warehouse}/*/*/*.parquet",
@@ -51,6 +60,7 @@ class TestHivePruning:
 
     def test_multi_cell_filter(self, hive_warehouse):
         from rustac import DuckdbClient
+
         client = DuckdbClient(use_hive_partitioning=True)
         cells = ["820807fffffffff", "82094ffffffffff"]
         results = client.search(

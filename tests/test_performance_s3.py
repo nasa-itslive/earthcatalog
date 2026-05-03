@@ -46,6 +46,7 @@ def _duckdb_search(paths, geom, datetime_range=None):
     S3 access we clear them for the duration of the query.
     """
     import os
+
     import duckdb
 
     saved = {
@@ -99,6 +100,7 @@ class TestCorrectness:
     def test_rustac_vs_duckdb_point(self, catalog):
         """Point query: compare rustac vs DuckDB item counts for same spatial+temporal args."""
         import os
+
         import duckdb
         from shapely.geometry import shape
 
@@ -142,9 +144,11 @@ class TestCorrectness:
         if rustac_ids != duck_ids:
             only_rustac = set(rustac_ids) - set(duck_ids)
             only_duck = set(duck_ids) - set(rustac_ids)
-            print(f"\n  📊 rustac={len(rustac_ids)}, duckdb={len(duck_ids)}"
-                  f"  (rustac/duckdb={ratio:.1%})"
-                  f"  rustac extra: {len(only_rustac)}, duckdb extra: {len(only_duck)}")
+            print(
+                f"\n  📊 rustac={len(rustac_ids)}, duckdb={len(duck_ids)}"
+                f"  (rustac/duckdb={ratio:.1%})"
+                f"  rustac extra: {len(only_rustac)}, duckdb extra: {len(only_duck)}"
+            )
         else:
             print(f"\n  ✅ rustac & DuckDB match: {len(rustac_ids)} IDs identical")
 
@@ -166,9 +170,12 @@ class TestProductionPerformance:
         info = results.stats()
         return len(items), elapsed, info
 
-    def _bench_duckdb(self, catalog, label, geom, start_datetime=None, end_datetime=None, limit=100):
+    def _bench_duckdb(
+        self, catalog, label, geom, start_datetime=None, end_datetime=None, limit=100
+    ):
         """Time search_files() + DuckDB path. Returns (n_items, elapsed)."""
         import os
+
         import duckdb
 
         t0 = time.perf_counter()
@@ -208,17 +215,23 @@ class TestProductionPerformance:
 
         geom = shape(GREENLAND_POINT)
         n_r, t_r, info = self._bench_rustac(
-            catalog, "point",
+            catalog,
+            "point",
             intersects=GREENLAND_POINT,
             datetime="2020-01-01/2020-12-31",
             max_items=100,
         )
         n_d, t_d = self._bench_duckdb(
-            catalog, "point", geom,
-            start_datetime="2020-01-01", end_datetime="2020-12-31",
+            catalog,
+            "point",
+            geom,
+            start_datetime="2020-01-01",
+            end_datetime="2020-12-31",
             limit=100,
         )
-        print(f"\n  rustac: {n_r} items in {t_r:.3f}s  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  rustac: {n_r} items in {t_r:.3f}s  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
         print(f"  duckdb: {n_d} items in {t_d:.3f}s")
 
     def test_rustac_vs_duckdb_latency_bbox(self, catalog):
@@ -227,64 +240,82 @@ class TestProductionPerformance:
 
         geom = box(*GREENLAND_BBOX)
         n_r, t_r, info = self._bench_rustac(
-            catalog, "bbox",
+            catalog,
+            "bbox",
             bbox=GREENLAND_BBOX,
             datetime="2020-01-01/2020-12-31",
             max_items=100,
         )
         n_d, t_d = self._bench_duckdb(
-            catalog, "bbox", geom,
-            start_datetime="2020-01-01", end_datetime="2020-12-31",
+            catalog,
+            "bbox",
+            geom,
+            start_datetime="2020-01-01",
+            end_datetime="2020-12-31",
             limit=100,
         )
-        print(f"\n  rustac: {n_r} items in {t_r:.3f}s  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  rustac: {n_r} items in {t_r:.3f}s  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
         print(f"  duckdb: {n_d} items in {t_d:.3f}s")
 
     def test_spatial_only(self, catalog):
         """Point query, no temporal or CQL2 filter, max_items=100."""
         n, elapsed, info = self._bench_rustac(
-            catalog, "spatial only",
+            catalog,
+            "spatial only",
             intersects=GREENLAND_POINT,
             max_items=100,
         )
-        print(f"\n  spatial only, max_items=100: {n} items in {elapsed:.3f}s"
-              f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  spatial only, max_items=100: {n} items in {elapsed:.3f}s"
+            f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
 
     def test_spatial_and_year(self, catalog):
         """Point in Greenland + single year, max_items=100."""
         n, elapsed, info = self._bench_rustac(
-            catalog, "spatial + year",
+            catalog,
+            "spatial + year",
             intersects=GREENLAND_POINT,
             datetime="2020-01-01/2020-12-31",
             max_items=100,
         )
-        print(f"\n  spatial + year=2020, max_items=100: {n} items in {elapsed:.3f}s"
-              f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  spatial + year=2020, max_items=100: {n} items in {elapsed:.3f}s"
+            f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
 
     def test_spatial_year_cql2(self, catalog):
         """Point + year + CQL2 percent_valid_pixels >= 80, max_items=100."""
         import cql2
 
         n, elapsed, info = self._bench_rustac(
-            catalog, "spatial + year + CQL2",
+            catalog,
+            "spatial + year + CQL2",
             intersects=GREENLAND_POINT,
             datetime="2020-01-01/2020-12-31",
             filter=cql2.parse_text("percent_valid_pixels >= 80").to_json(),
             max_items=100,
         )
-        print(f"\n  spatial + year=2020 + pvp>=80, max_items=100: {n} items in {elapsed:.3f}s"
-              f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  spatial + year=2020 + pvp>=80, max_items=100: {n} items in {elapsed:.3f}s"
+            f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
 
     def test_wide_temporal_range(self, catalog):
         """Full temporal range (1980–2026) with no item limit."""
         n, elapsed, info = self._bench_rustac(
-            catalog, "full range",
+            catalog,
+            "full range",
             intersects=GREENLAND_POINT,
             datetime="1980-01-01/2026-12-31",
         )
-        print(f"\n  spatial + full range, no limit: {n} items in {elapsed:.3f}s"
-              f"  ({n/elapsed:.0f} items/s)"
-              f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  spatial + full range, no limit: {n} items in {elapsed:.3f}s"
+            f"  ({n / elapsed:.0f} items/s)"
+            f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
 
     def test_pages(self, catalog):
         """Materialize via pages(), measure per-page breakdown."""
@@ -298,38 +329,49 @@ class TestProductionPerformance:
         n_pages = len(pages)
         n_total = sum(len(p) for p in pages)
         page_sizes = [len(p) for p in pages[:5]]
-        print(f"\n  pages(): {n_pages} pages, {n_total} items in {elapsed:.3f}s"
-              f"  (first page sizes: {page_sizes}...)")
+        print(
+            f"\n  pages(): {n_pages} pages, {n_total} items in {elapsed:.3f}s"
+            f"  (first page sizes: {page_sizes}...)"
+        )
 
     def test_out_of_range_datetime(self, catalog):
         """Datetime range that matches no data — Iceberg prunes to 0 files."""
         n, elapsed, info = self._bench_rustac(
-            catalog, "out-of-range",
+            catalog,
+            "out-of-range",
             intersects=GREENLAND_POINT,
             datetime="1970-01-01/1979-12-31",
             max_items=100,
         )
-        print(f"\n  out-of-range datetime, max_items=100: {n} items in {elapsed:.4f}s"
-              f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})")
+        print(
+            f"\n  out-of-range datetime, max_items=100: {n} items in {elapsed:.4f}s"
+            f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
+        )
 
     def test_bbox_vs_point(self, catalog):
         """Compare bbox vs point query latency side by side."""
         n_b, t_b, s_b = self._bench_rustac(
-            catalog, "bbox",
+            catalog,
+            "bbox",
             bbox=GREENLAND_BBOX,
             datetime="2020-01-01/2020-12-31",
             max_items=100,
         )
         n_p, t_p, s_p = self._bench_rustac(
-            catalog, "point",
+            catalog,
+            "point",
             intersects=GREENLAND_POINT,
             datetime="2020-01-01/2020-12-31",
             max_items=100,
         )
-        print(f"\n  bbox  (Greenland): {n_b} items in {t_b:.3f}s"
-              f"  (files={s_b['files']}, est.rows={s_b['rows_upper_bound']:,})")
-        print(f"  point (Greenland): {n_p} items in {t_p:.3f}s"
-              f"  (files={s_p['files']}, est.rows={s_p['rows_upper_bound']:,})")
+        print(
+            f"\n  bbox  (Greenland): {n_b} items in {t_b:.3f}s"
+            f"  (files={s_b['files']}, est.rows={s_b['rows_upper_bound']:,})"
+        )
+        print(
+            f"  point (Greenland): {n_p} items in {t_p:.3f}s"
+            f"  (files={s_p['files']}, est.rows={s_p['rows_upper_bound']:,})"
+        )
 
     def test_rustac_vs_duckdb_wide_range(self, catalog):
         """Compare rustac search() vs search_files() + DuckDB for wide temporal range.
@@ -340,6 +382,7 @@ class TestProductionPerformance:
         - percent_valid_pixels >= 1
         """
         import os
+
         import duckdb
         from shapely.geometry import shape
 
@@ -397,21 +440,24 @@ class TestProductionPerformance:
 
         print(f"\n  rustac items():  {n_rustac:>6} items in {rustac_elapsed:.1f}s")
         print(f"  duckdb SQL:      {n_duckdb:>6} items in {duckdb_elapsed:.1f}s")
-        print(f"  overlap: {len(overlap)} shared IDs"
-              f"  (rustac only: {len(only_rustac)}, duckdb only: {len(only_duck)})"
-              f"  files: {len(paths)}")
+        print(
+            f"  overlap: {len(overlap)} shared IDs"
+            f"  (rustac only: {len(only_rustac)}, duckdb only: {len(only_duck)})"
+            f"  files: {len(paths)}"
+        )
 
         if rustac_first:
-            print(f"  first rustac item: {rustac_first.id}"
-                  f"  platform={rustac_first.properties.get('platform')}"
-                  f"  datetime={rustac_first.properties.get('datetime')}")
+            print(
+                f"  first rustac item: {rustac_first.id}"
+                f"  platform={rustac_first.properties.get('platform')}"
+                f"  datetime={rustac_first.properties.get('datetime')}"
+            )
 
     def test_duck_search_vs_rustac(self, catalog):
         """Compare duck_search() vs search() (rustac) for wide temporal range.
 
         duck_search() uses DuckDB internally for parallel Parquet reads.
         """
-        from shapely.geometry import shape
 
         query = dict(
             intersects={"type": "Point", "coordinates": [-45, 70]},
@@ -435,11 +481,14 @@ class TestProductionPerformance:
         info = catalog.search(intersects=GREENLAND_POINT, datetime="1980-01-01/2015-12-31").stats()
 
         print(f"\n  search()       {len(r_items):>6} items in {t_r:.1f}s")
-        print(f"  duck_search()  {len(d_items):>6} items in {t_d:.1f}s"
-              f"  ({(t_r/t_d):.1f}x faster)")
-        print(f"  overlap: {len(overlap)} ids  "
-              f"(search only: {len(r_ids - d_ids)}, duck only: {len(d_ids - r_ids)})"
-              f"  files={info['files']}")
+        print(
+            f"  duck_search()  {len(d_items):>6} items in {t_d:.1f}s  ({(t_r / t_d):.1f}x faster)"
+        )
+        print(
+            f"  overlap: {len(overlap)} ids  "
+            f"(search only: {len(r_ids - d_ids)}, duck only: {len(d_ids - r_ids)})"
+            f"  files={info['files']}"
+        )
 
     def test_duck_search_cql2_vs_raw_json(self, catalog):
         """duck_search() with cql2.parse_text() vs raw JSON should match."""
@@ -462,4 +511,3 @@ class TestProductionPerformance:
         ids_cql2 = {it.id for it in items_cql2}
         match = "✅" if ids_raw == ids_cql2 else "❌"
         print(f"\n  {match} cql2.parse_text() == raw JSON: {len(ids_raw)} ids match")
-
