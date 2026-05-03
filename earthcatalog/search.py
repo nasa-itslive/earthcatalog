@@ -117,17 +117,19 @@ class _FileSearchEngine:
 
         Each yielded value is a ``list[dict]`` — one per file.
 
-        Note: ``datetime`` is intentionally passed through to ``rustac.search_sync``
-        as a top-level kwarg.  Rustac handles the STAC temporal filter correctly
-        this way.  Do **not** reference ``datetime`` inside a CQL2 ``filter`` —
-        rustac generates broken SQL when ``datetime`` appears in both places.
-        Use the top-level ``datetime`` kwarg instead.
+        Note: ``datetime`` is intentionally stripped before passing to
+        ``rustac.search_sync`` — rustac produces wrong spatial results when
+        it receives the ``datetime`` kwarg.  Instead, temporal filtering is
+        applied here (row level) after rustac returns, complementing the
+        year-level Iceberg partition pruning done upstream.
         """
         if not files:
             return
 
         max_items = kwargs.get("max_items")
         seen = 0
+        start_dt, end_dt = _extract_datetime_range(**kwargs)
+        _rustac_kwargs = {k: v for k, v in kwargs.items() if k != "datetime"}
 
         with _suppress_stderr():
             for f in files:
@@ -136,11 +138,14 @@ class _FileSearchEngine:
                     remaining = max_items - seen
                     if remaining <= 0:
                         break
-                file_kwargs = {**kwargs, "max_items": remaining} if remaining is not None else kwargs
+                file_kwargs = {**_rustac_kwargs, "max_items": remaining} if remaining is not None else _rustac_kwargs
                 items = _rustac_search_sync(f, **file_kwargs)
-                if items:
-                    yield items
-                    seen += len(items)
+                if not items:
+                    continue
+                filtered = [it for it in items if _item_in_datetime_range(it, start_dt, end_dt)]
+                if filtered:
+                    yield filtered
+                    seen += len(filtered)
 
     def search(self, **kwargs) -> list[dict]:
         """Collect all results into a single list (legacy path)."""
@@ -428,3 +433,21 @@ def _format_bytes(n: int) -> str:
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+def _item_in_datetime_range(item: dict, start: str | None, end: str | None) -> bool:
+    """Check if a STAC item's ``properties.datetime`` falls within *start*..*end*.
+
+    Both bounds are inclusive.  ``None`` means unbounded on that side.
+    If both are ``None`` (no temporal filter), all items pass.
+    """
+    if start is None and end is None:
+        return True
+    dt = item.get("properties", {}).get("datetime")
+    if dt is None:
+        return False
+    if start is not None and dt < start:
+        return False
+    if end is not None and dt > end:
+        return False
+    return True

@@ -650,15 +650,10 @@ class EarthCatalog:
         ``ids``, ``collections``, ``max_items``, ``limit``, ``sortby``,
         ``include``, ``exclude``, ``query``, etc.
 
-        For the ``filter`` parameter, prefer ``cql2.parse_text()`` for a
-        natural SQL-like syntax::
-
-            import cql2
-            catalog.search(
-                filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
-            )
-
-        Raw CQL2 JSON dicts are also accepted.
+        Use the top-level ``datetime`` kwarg for temporal filtering.  Do
+        **not** reference ``datetime`` inside the CQL2 ``filter`` —
+        rustac generates broken SQL when ``datetime`` appears in a CQL2
+        expression.
 
         Returns
         -------

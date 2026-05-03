@@ -50,8 +50,8 @@ cql2.parse_text('platform IN ("sentinel-2", "landsat-8", "landsat-9")')
 cql2.parse_text('platform = "landsat-8" AND percent_valid_pixels > 70')
 ```
 
-For temporal filtering use the top-level ``datetime`` kwarg (STAC-standard)
-instead of referencing ``datetime`` inside CQL2 — rustac generates broken SQL
+For temporal filtering use the top-level ``datetime`` kwarg (STAC-standard).
+Do **not** reference ``datetime`` inside CQL2 — rustac generates broken SQL
 when ``datetime`` appears in a CQL2 expression:
 
 ```python
@@ -59,11 +59,6 @@ when ``datetime`` appears in a CQL2 expression:
 results = catalog.search(
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
-)
-
-# ❌ Broken — rustac crashes when datetime is inside CQL2
-results = catalog.search(
-    filter=cql2.parse_text('datetime >= "2020-01-01" AND percent_valid_pixels >= 80').to_json(),
 )
 ```
 
