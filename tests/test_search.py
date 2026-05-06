@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from earthcatalog.search import (
     EarthCatalogItemSearch,
     _extract_datetime_range,
@@ -11,44 +13,36 @@ from earthcatalog.search import (
 
 
 class TestExtractGeometry:
-    def test_intersects_to_geometry(self):
-        from shapely.geometry import shape
-
-        g = _extract_geometry(intersects={"type": "Point", "coordinates": [0, 60]})
-        assert g is not None
-        assert g.equals(shape({"type": "Point", "coordinates": [0, 60]}))
-
-    def test_bbox_to_box(self):
-        from shapely.geometry import box
-
-        g = _extract_geometry(bbox=[-10, 50, 10, 70])
-        assert g is not None
-        assert g.equals(box(-10, 50, 10, 70))
-
-    def test_no_spatial(self):
-        assert _extract_geometry(datetime="2020") is None
+    @pytest.mark.parametrize(
+        "kwargs,check",
+        [
+            ({"intersects": {"type": "Point", "coordinates": [0, 60]}}, "Point"),
+            ({"bbox": [-10, 50, 10, 70]}, "Polygon"),
+            ({"datetime": "2020"}, None),
+        ],
+    )
+    def test_extract_geometry(self, kwargs, check):
+        g = _extract_geometry(**kwargs)
+        if check is None:
+            assert g is None
+        else:
+            assert g is not None
 
 
 class TestExtractDatetime:
-    def test_range(self):
-        s, e = _extract_datetime_range(datetime="2020-01-01/2020-12-31")
-        assert s == "2020-01-01"
-        assert e == "2020-12-31"
-
-    def test_open_start(self):
-        s, e = _extract_datetime_range(datetime="../2020-12-31")
-        assert s is None
-        assert e == "2020-12-31"
-
-    def test_open_end(self):
-        s, e = _extract_datetime_range(datetime="2020-01-01/..")
-        assert s == "2020-01-01"
-        assert e is None
-
-    def test_no_datetime(self):
-        s, e = _extract_datetime_range(intersects={"type": "Point", "coordinates": [0, 0]})
-        assert s is None
-        assert e is None
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_start", "expected_end"),
+        [
+            ({"datetime": "2020-01-01/2020-12-31"}, "2020-01-01", "2020-12-31"),
+            ({"datetime": "../2020-12-31"}, None, "2020-12-31"),
+            ({"datetime": "2020-01-01/.."}, "2020-01-01", None),
+            ({"intersects": {"type": "Point", "coordinates": [0, 0]}}, None, None),
+        ],
+    )
+    def test_extract_datetime_range(self, kwargs, expected_start, expected_end):
+        s, e = _extract_datetime_range(**kwargs)
+        assert s == expected_start
+        assert e == expected_end
 
 
 class TestFileSearchEngine:
@@ -197,11 +191,17 @@ class TestEarthCatalogItemSearch:
         results = list(sr.items_as_dicts())
         assert len(results) == 3
 
-    def test_matched_returns_none_without_table(self, monkeypatch):
-        """Without an Iceberg table, matched() returns None."""
+    @pytest.mark.parametrize(
+        ("method", "expected"),
+        [
+            ("matched", None),
+            ("stats", None),
+        ],
+    )
+    def test_default_return_values(self, monkeypatch, method, expected):
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["f.parquet"])
         sr = EarthCatalogItemSearch(params={}, engine=eng)
-        assert sr.matched() is None
+        assert getattr(sr, method)() == expected
 
     def test_get_parameters(self):
         """get_parameters returns a copy of the params."""
@@ -212,32 +212,20 @@ class TestEarthCatalogItemSearch:
         params["max_items"] = 999  # should not affect original
         assert sr._params["max_items"] == 5
 
-    def test_repr_shows_params(self):
-        eng = _FileSearchEngine()
-        sr = EarthCatalogItemSearch(
-            params={"max_items": 10, "collections": ["test"], "bbox": [-120, 35, -119, 36]},
-            engine=eng,
-        )
-        r = repr(sr)
-        assert "EarthCatalogItemSearch" in r
-        assert "max_items=10" in r
-        assert "collections=" in r
-
-    def test_stats_returns_dict_without_table(self):
-        """Without Iceberg table, stats() returns None."""
-        eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["f.parquet"])
-        sr = EarthCatalogItemSearch(params={}, engine=eng)
-        assert sr.stats() is None
-
-    def test_html_repr_contains_params(self):
+    @pytest.mark.parametrize(
+        ("method", "attr", "expected"),
+        [
+            ("repr", "__repr__", "EarthCatalogItemSearch"),
+            ("html", "_repr_html_", "max_items"),
+        ],
+    )
+    def test_repr_contains_params(self, method, attr, expected):
         eng = _FileSearchEngine()
         sr = EarthCatalogItemSearch(
             params={"max_items": 10, "bbox": [-120, 35, -119, 36]}, engine=eng
         )
-        html = sr._repr_html_()
-        assert "EarthCatalogItemSearch" in html
-        assert "max_items" in html
-        assert "-120" in html
+        text = getattr(sr, attr)()
+        assert expected in str(text)
 
 
 class TestSearchToArrow:

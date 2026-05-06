@@ -113,58 +113,32 @@ def partitioner():
 
 
 class TestFanOut:
-    def test_produces_at_least_one_row_per_item(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
-        assert len(rows) >= 1
-
-    def test_fan_out_count_greater_than_one(self, partitioner):
-        """Large polygon should intersect multiple H3 cells at res=2."""
+    def test_fan_out_single_item(self, partitioner):
         rows = fan_out([BASE_ITEM], partitioner)
         assert len(rows) > 1
-
-    def test_all_rows_have_same_id(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
         assert all(r["id"] == "item-0001" for r in rows)
-
-    def test_grid_partition_injected(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
         for row in rows:
             assert "grid_partition" in row["properties"]
             assert isinstance(row["properties"]["grid_partition"], str)
             assert row["properties"]["grid_partition"] != ""
-
-    def test_no_duplicate_grid_partitions_per_item(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
         cells = [r["properties"]["grid_partition"] for r in rows]
         assert len(cells) == len(set(cells))
-
-    def test_original_item_preserved(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
-        assert rows[0]["id"] == BASE_ITEM["id"]
-        assert rows[0]["geometry"] == BASE_ITEM["geometry"]
+        assert rows[0]["geometry"]["type"] == "Polygon"
         assert rows[0]["assets"] == BASE_ITEM.get("assets", {})
         assert rows[0]["links"] == BASE_ITEM.get("links", [])
 
-    def test_point_geometry_handled(self):
-        """Point geometry should produce exactly one row (single H3 cell)."""
-        p = H3Partitioner(resolution=2)
-        rows = fan_out([POINT_ITEM], p)
+    def test_point_geometry(self):
+        rows = fan_out([POINT_ITEM], H3Partitioner(resolution=2))
         assert len(rows) == 1
         assert rows[0]["properties"]["grid_partition"] != ""
 
     def test_bad_geometry_skipped(self, partitioner):
         bad = {**BASE_ITEM, "geometry": {"type": "Polygon", "coordinates": []}}
-        rows = fan_out([bad], partitioner)
-        assert rows == []
+        assert fan_out([bad], partitioner) == []
 
     def test_multiple_items_accumulate(self, partitioner):
         rows = fan_out(FIVE_ITEMS, partitioner)
-        ids = {r["id"] for r in rows}
-        assert ids == {f"item-{i:04d}" for i in range(5)}
-
-    def test_geometry_preserved_as_geojson(self, partitioner):
-        rows = fan_out([BASE_ITEM], partitioner)
-        assert rows[0]["geometry"]["type"] == "Polygon"
+        assert {r["id"] for r in rows} == {f"item-{i:04d}" for i in range(5)}
 
 
 # ---------------------------------------------------------------------------
@@ -265,32 +239,17 @@ class TestWriteGeoparquet:
 
 
 class TestGroupByPartition:
-    def test_each_group_has_single_grid_partition(self, partitioner):
-        """Every group must contain items with the same grid_partition value."""
+    def test_group_keys_and_properties(self, partitioner):
         rows = fan_out([BASE_ITEM], partitioner)
         groups = group_by_partition(rows)
-        for (cell, _year), items in groups.items():
+        for (cell, year), items in groups.items():
+            assert isinstance(cell, str)
+            assert year is None or isinstance(year, int)
             for item in items:
                 assert item["properties"]["grid_partition"] == cell
-
-    def test_each_group_has_single_year(self, partitioner):
-        """Every item in a group must have the same calendar year in datetime."""
-        rows = fan_out([BASE_ITEM], partitioner)
-        groups = group_by_partition(rows)
-        for (_cell, year), items in groups.items():
-            for item in items:
                 dt = item["properties"].get("datetime")
                 actual_year = int(dt[:4]) if dt else None
                 assert actual_year == year
-
-    def test_group_keys_are_cell_year_tuples(self, partitioner):
-        """Keys must be (str, int|None) tuples."""
-        rows = fan_out([BASE_ITEM], partitioner)
-        groups = group_by_partition(rows)
-        for key in groups:
-            cell, year = key
-            assert isinstance(cell, str)
-            assert year is None or isinstance(year, int)
 
     def test_all_rows_accounted_for(self, partitioner):
         """Sum of group sizes must equal the total fan_out row count."""

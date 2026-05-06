@@ -73,20 +73,23 @@ def _make_delta_parquet(pairs: list[tuple[str, str]], item_ids: list[str]) -> by
 
 
 class TestHashId:
-    def test_deterministic(self):
+    @pytest.mark.parametrize(
+        ("item_id", "check"),
+        [
+            ("item-1", "deterministic"),
+            ("item-2", "different"),
+            ("item-1", "length"),
+        ],
+    )
+    def test_hash_id(self, item_id, check):
         from scripts.daily_delta import _hash_id as hash_fn
 
-        assert hash_fn("item-1") == hash_fn("item-1")
-
-    def test_different_inputs_different_hashes(self):
-        from scripts.daily_delta import _hash_id as hash_fn
-
-        assert hash_fn("item-1") != hash_fn("item-2")
-
-    def test_returns_16_bytes(self):
-        from scripts.daily_delta import _hash_id as hash_fn
-
-        assert len(hash_fn("item-1")) == 16
+        if check == "deterministic":
+            assert hash_fn(item_id) == hash_fn(item_id)
+        elif check == "different":
+            assert hash_fn("item-1") != hash_fn("item-2")
+        elif check == "length":
+            assert len(hash_fn(item_id)) == 16
 
 
 # ---------------------------------------------------------------------------
@@ -153,24 +156,20 @@ class TestBuildHashSet:
 
 
 class TestListPendingDeltas:
-    def test_finds_parquets(self):
+    @pytest.mark.parametrize("n_parquets", [2, 0])
+    def test_list_pending_deltas(self, n_parquets):
         from scripts.daily_delta import _list_pending_deltas
 
         store = MemoryStore()
-        obstore.put(store, "pending/delta_2026-04-27.parquet", b"data")
-        obstore.put(store, "pending/delta_2026-04-28.parquet", b"data")
-        obstore.put(store, "pending/readme.txt", b"text")
+        if n_parquets:
+            obstore.put(store, "pending/delta_2026-04-27.parquet", b"data")
+            obstore.put(store, "pending/delta_2026-04-28.parquet", b"data")
+            obstore.put(store, "pending/readme.txt", b"text")
 
         result = _list_pending_deltas(store, "")
-        assert len(result) == 2
-        assert all(k.endswith(".parquet") for k in result)
-
-    def test_empty(self):
-        from scripts.daily_delta import _list_pending_deltas
-
-        store = MemoryStore()
-        result = _list_pending_deltas(store, "")
-        assert result == []
+        assert len(result) == n_parquets
+        if n_parquets:
+            assert all(k.endswith(".parquet") for k in result)
 
 
 # ---------------------------------------------------------------------------
@@ -179,28 +178,27 @@ class TestListPendingDeltas:
 
 
 class TestDeltaParquetRoundTrip:
-    def test_write_and_read(self):
+    @pytest.mark.parametrize("n_rows", [2, 0])
+    def test_write_and_read(self, n_rows):
         from scripts.daily_delta import _read_pending_delta, _write_delta_parquet
 
         store = MemoryStore()
-        rows = [
-            ("bucket-a", "path/item-1.stac.json", _hash_id("item-1")),
-            ("bucket-b", "path/item-2.stac.json", _hash_id("item-2")),
-        ]
+        rows = (
+            [
+                ("bucket-a", "path/item-1.stac.json", _hash_id("item-1")),
+                ("bucket-b", "path/item-2.stac.json", _hash_id("item-2")),
+            ][:n_rows]
+            if n_rows
+            else []
+        )
         n = _write_delta_parquet(rows, store, "pending/delta.parquet")
-        assert n == 2
+        assert n == n_rows
 
-        read_back = _read_pending_delta(store, "pending/delta.parquet")
-        assert len(read_back) == 2
-        assert read_back[0][0] == "bucket-a"
-        assert read_back[1][2] == _hash_id("item-2")
-
-    def test_empty_rows(self):
-        from scripts.daily_delta import _write_delta_parquet
-
-        store = MemoryStore()
-        n = _write_delta_parquet([], store, "pending/delta.parquet")
-        assert n == 0
+        if n_rows:
+            read_back = _read_pending_delta(store, "pending/delta.parquet")
+            assert len(read_back) == 2
+            assert read_back[0][0] == "bucket-a"
+            assert read_back[1][2] == _hash_id("item-2")
 
 
 # ---------------------------------------------------------------------------
@@ -338,20 +336,18 @@ class TestRunDailyDelta:
 
 
 class TestIsLocal:
-    def test_s3_uri_is_not_local(self):
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("s3://bucket/key", False),
+            ("/tmp/hashes.parquet", True),
+            ("./data/hashes.parquet", True),
+        ],
+    )
+    def test_is_local(self, path, expected):
         from scripts.daily_delta import _is_local
 
-        assert _is_local("s3://bucket/key") is False
-
-    def test_absolute_path_is_local(self):
-        from scripts.daily_delta import _is_local
-
-        assert _is_local("/tmp/hashes.parquet") is True
-
-    def test_relative_path_is_local(self):
-        from scripts.daily_delta import _is_local
-
-        assert _is_local("./data/hashes.parquet") is True
+        assert _is_local(path) is expected
 
 
 class TestLocalIO:

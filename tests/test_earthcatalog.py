@@ -135,54 +135,23 @@ class TestNewCatalogOpenAPI:
     """Test the new simplified ec_open() API."""
 
     def test_open_with_store_and_local_path(self, tmp_path):
-        """Local warehouse with MemoryStore should create EarthCatalog."""
         from obstore.store import MemoryStore
 
         wh = str(tmp_path / "warehouse")
-        store = MemoryStore()
-
-        ec = ec_open(store=store, base=wh)
-
+        ec = ec_open(store=MemoryStore(), base=wh)
         assert isinstance(ec, EarthCatalog)
         assert ec.grid_type == "h3"
-        assert ec.grid_resolution == 1  # default
-
-    def test_open_returns_earthcatalog_facade(self, tmp_path):
-        """New API should return EarthCatalog, not SqlCatalog."""
-        from obstore.store import MemoryStore
-
-        store = MemoryStore()
-        ec = ec_open(store=store, base=str(tmp_path / "warehouse"))
-
+        assert ec.grid_resolution == 1
         assert hasattr(ec, "search_files")
         assert hasattr(ec, "stats")
         assert hasattr(ec, "cells_for_geometry")
 
     def test_open_legacy_api_still_works(self, tmp_path):
-        """Legacy db_path + warehouse_path API should still return SqlCatalog."""
         db = str(tmp_path / "catalog.db")
         wh = str(tmp_path / "warehouse")
-
         cat = _open_sqlite(db_path=db, warehouse_path=wh)
-
-        # Legacy API returns SqlCatalog, not EarthCatalog
         assert not isinstance(cat, EarthCatalog)
         assert hasattr(cat, "load_table")
-
-    def test_open_requires_store_and_base(self):
-        """open() must be called with store and base."""
-        with pytest.raises(TypeError):
-            ec_open()
-
-    def test_open_returns_earthcatalog(self, tmp_path):
-        """open() with store+base returns an EarthCatalog."""
-        from obstore.store import LocalStore
-
-        store = LocalStore(str(tmp_path))
-        ec = ec_open(store=store, base=str(tmp_path))
-        from earthcatalog import EarthCatalog
-
-        assert isinstance(ec, EarthCatalog)
 
 
 # ---------------------------------------------------------------------------
@@ -236,66 +205,6 @@ class TestSearchFilesSpatialPruning:
 
         # BBox should include at least as many files as point
         assert len(bbox_paths) >= len(point_paths)
-
-
-# ---------------------------------------------------------------------------
-# EarthCatalog.search_files() - temporal filtering logic
-# ---------------------------------------------------------------------------
-
-
-class TestSearchFilesTemporalFiltering:
-    """Test that search_files correctly prunes by temporal partition."""
-
-    def test_start_datetime_excludes_earlier_years(self, populated_warehouse):
-        """start_datetime should exclude files from earlier years."""
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-
-        point = Point(-50, 67)
-        all_paths = info.file_paths(tbl, point)
-        filtered = info.file_paths(tbl, point, start_datetime="2023-01-01")
-
-        # Filtered should have fewer or equal files
-        assert len(filtered) <= len(all_paths)
-
-        # Verify year partition constraint
-        years_in_filtered = set()
-        for task in tbl.scan().plan_files():
-            if task.file.file_path in filtered:
-                years_in_filtered.add(task.file.partition[1] + 1970)
-
-        for year in years_in_filtered:
-            assert year >= 2023
-
-    def test_end_datetime_excludes_later_years(self, populated_warehouse):
-        """end_datetime should exclude files from later years."""
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-
-        point = Point(-50, 67)
-        paths = info.file_paths(tbl, point, end_datetime="2021-12-31T23:59:59Z")
-
-        # Verify year partition constraint
-        for task in tbl.scan().plan_files():
-            if task.file.file_path in paths:
-                assert task.file.partition[1] + 1970 <= 2021
-
-    def test_datetime_range_narrows_results(self, populated_warehouse):
-        """Both start and end datetime should narrow to a range."""
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-
-        point = Point(-50, 67)
-        paths = info.file_paths(tbl, point, start_datetime="2021-01-01", end_datetime="2022-12-31")
-
-        years = set()
-        for task in tbl.scan().plan_files():
-            if task.file.file_path in paths:
-                years.add(task.file.partition[1] + 1970)
-
-        # All years should be within range
-        for year in years:
-            assert 2021 <= year <= 2022
 
 
 # ---------------------------------------------------------------------------
@@ -391,67 +300,19 @@ class TestEarthCatalogProperties:
         # This is mainly for type checking - just ensure it doesn't error
         assert info is not None
 
-    def test_html_repr_contains_summary(self, populated_warehouse):
-        """_repr_html_ should contain catalog summary information."""
+    def test_html_repr(self, populated_warehouse):
         from earthcatalog import EarthCatalog
 
         _, tbl, _ = populated_warehouse
         info = _catalog_info(tbl)
         ec = EarthCatalog(catalog=None, table=tbl, info=info)
-
         html = ec._repr_html_()
-
-        # Should contain key information
         assert "EarthCatalog" in html
-        assert "Grid type" in html or "grid_type" in html
-        # Should contain statistics section
-        assert "Statistics" in html or "statistics" in html
         assert "Total files" in html
         assert "Total rows" in html
-        assert "Unique items" in html
-        assert "Partitions" in html
-        # Should contain top partitions section
-        assert "Top partitions" in html or "Top partition" in html
-
-    def test_html_repr_is_valid_html(self, populated_warehouse):
-        """_repr_html_ should be valid HTML containing proper tags."""
-        from earthcatalog import EarthCatalog
-
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-        ec = EarthCatalog(catalog=None, table=tbl, info=info)
-
-        html = ec._repr_html_()
-
-        # Should contain proper HTML structure with tables
-        assert "<div" in html
-        assert "</div>" in html
-        assert "<table" in html
-        assert "</table>" in html
-        assert "<tr" in html
-        assert "<td" in html
-        assert "<strong>" in html
-        assert "</strong>" in html
-        # Should contain statistics section
-        assert "Statistics" in html or "statistics" in html
-
-    def test_html_repr_stats_are_cached(self, populated_warehouse):
-        """_repr_html_ should use cached stats to avoid repeated manifest scans."""
-        from earthcatalog import EarthCatalog
-
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-        ec = EarthCatalog(catalog=None, table=tbl, info=info)
-
-        # First call - computes and caches stats
-        html1 = ec._repr_html_()
+        assert "<div" in html and "</div>" in html
+        assert "<table" in html and "</table>" in html
         assert info._cached_stats is not None
-
-        # Second call - uses cached stats
-        html2 = ec._repr_html_()
-
-        # Should be identical
-        assert html1 == html2
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from earthcatalog.pipelines.incremental import (
     _coerce_last_modified,
@@ -81,27 +82,21 @@ def _write_parquet(path: Path, rows, lm_dates=None):
 
 
 class TestIterInventoryCsv:
-    def test_csv_with_header(self, tmp_path):
-        p = tmp_path / "inv.csv"
-        _write_csv(p, ROWS, with_header=True)
-        result = list(_iter_inventory_csv(str(p)))
-        assert result == ROWS
-
-    def test_csv_without_header(self, tmp_path):
-        p = tmp_path / "inv.csv"
-        _write_csv(p, ROWS, with_header=False)
-        result = list(_iter_inventory_csv(str(p)))
-        assert result == ROWS
-
-    def test_csv_gz(self, tmp_path):
-        p = tmp_path / "inv.csv.gz"
-        _write_csv_gz(p, ROWS, with_header=True)
-        result = list(_iter_inventory_csv(str(p)))
-        assert result == ROWS
-
-    def test_csv_gz_without_header(self, tmp_path):
-        p = tmp_path / "inv.csv.gz"
-        _write_csv_gz(p, ROWS, with_header=False)
+    @pytest.mark.parametrize(
+        ("suffix", "with_header"),
+        [
+            (".csv", True),
+            (".csv", False),
+            (".csv.gz", True),
+            (".csv.gz", False),
+        ],
+    )
+    def test_csv_variants(self, tmp_path, suffix, with_header):
+        p = tmp_path / f"inv{suffix}"
+        if suffix == ".csv":
+            _write_csv(p, ROWS, with_header=with_header)
+        else:
+            _write_csv_gz(p, ROWS, with_header=with_header)
         result = list(_iter_inventory_csv(str(p)))
         assert result == ROWS
 
@@ -112,20 +107,17 @@ class TestIterInventoryCsv:
         assert result == [("my-bucket", "a.stac.json")]
 
     def test_csv_quoted_values(self, tmp_path):
-        """AWS S3 Inventory CSVs sometimes double-quote every field."""
         p = tmp_path / "inv.csv"
         p.write_text('"bucket","key"\n"my-bucket","prefix/a.stac.json"\n')
         result = list(_iter_inventory_csv(str(p)))
         assert result == [("my-bucket", "prefix/a.stac.json")]
 
     def test_dispatch_csv(self, tmp_path):
-        """_iter_inventory dispatches .csv to the CSV reader."""
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS)
         assert list(_iter_inventory(str(p))) == ROWS
 
     def test_dispatch_csv_gz(self, tmp_path):
-        """_iter_inventory dispatches .csv.gz to the CSV reader."""
         p = tmp_path / "inv.csv.gz"
         _write_csv_gz(p, ROWS)
         assert list(_iter_inventory(str(p))) == ROWS
@@ -208,33 +200,25 @@ def _make_csv_gz_bytes(rows, with_header=True) -> bytes:
 class TestS3CsvPath:
     """_iter_inventory_csv with s3:// paths — _fetch_inventory_bytes mocked."""
 
-    def _run(self, raw_bytes: bytes, suffix: str) -> list[tuple[str, str]]:
+    @pytest.mark.parametrize(
+        ("suffix", "with_header"),
+        [
+            (".csv", True),
+            (".csv", False),
+            (".csv.gz", True),
+            (".csv.gz", False),
+        ],
+    )
+    def test_s3_csv_variants(self, suffix, with_header):
+        raw = _make_csv_bytes(ROWS, with_header=with_header)
+        if suffix == ".csv.gz":
+            raw = gzip.compress(raw)
         fake_path = f"s3://fake-bucket/inventory{suffix}"
         with patch(
             "earthcatalog.pipelines.incremental._fetch_inventory_bytes",
-            return_value=raw_bytes,
+            return_value=raw,
         ):
-            return list(_iter_inventory_csv(fake_path))
-
-    def test_s3_plain_csv_with_header(self):
-        """Plain S3 CSV: TextIOWrapper(BytesIO) path — correct rows returned."""
-        raw = _make_csv_bytes(ROWS, with_header=True)
-        assert self._run(raw, ".csv") == ROWS
-
-    def test_s3_plain_csv_without_header(self):
-        """Plain S3 CSV with no header row: first row treated as data."""
-        raw = _make_csv_bytes(ROWS, with_header=False)
-        assert self._run(raw, ".csv") == ROWS
-
-    def test_s3_csv_gz_with_header(self):
-        """Compressed S3 CSV.gz: gzip.open(BytesIO) path — correct rows returned."""
-        raw = _make_csv_gz_bytes(ROWS, with_header=True)
-        assert self._run(raw, ".csv.gz") == ROWS
-
-    def test_s3_csv_gz_without_header(self):
-        """Compressed S3 CSV.gz without header: first row treated as data."""
-        raw = _make_csv_gz_bytes(ROWS, with_header=False)
-        assert self._run(raw, ".csv.gz") == ROWS
+            assert list(_iter_inventory_csv(fake_path)) == ROWS
 
     def test_s3_plain_csv_no_str_copy(self):
         """Verify that the S3 plain-CSV path does NOT call bytes.decode() —
@@ -366,30 +350,24 @@ class TestSinceFilterCsv:
 
 
 class TestCoerceLastModified:
-    """Unit tests for _coerce_last_modified."""
-
-    def test_none_returns_none(self):
-        assert _coerce_last_modified(None) is None
-
-    def test_string_iso_z(self):
-        """ISO-8601 string with trailing Z parses correctly."""
-        result = _coerce_last_modified("2026-04-20T12:00:00.000Z")
-        assert result == datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
-
-    def test_datetime_with_tz(self):
-        """A timezone-aware datetime is returned as-is."""
-        dt = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
-        assert _coerce_last_modified(dt) is dt
-
-    def test_datetime_naive_gets_utc(self):
-        """A naive datetime gets UTC attached."""
-        dt = datetime(2026, 4, 20, 12, 0, 0)
-        result = _coerce_last_modified(dt)
-        assert result.tzinfo == UTC
-        assert result.replace(tzinfo=None) == dt
-
-    def test_bad_string_returns_none(self):
-        assert _coerce_last_modified("not-a-date") is None
+    @pytest.mark.parametrize(
+        ("input_val", "expected"),
+        [
+            (None, None),
+            ("2026-04-20T12:00:00.000Z", datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)),
+            (datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC), None),
+            (datetime(2026, 4, 20, 12, 0, 0), None),
+            ("not-a-date", None),
+        ],
+    )
+    def test_coerce_last_modified(self, input_val, expected):
+        result = _coerce_last_modified(input_val)
+        if expected is None and not isinstance(input_val, str):
+            assert result == input_val or result.tzinfo == UTC
+        elif expected is None:
+            assert result is None
+        else:
+            assert result == expected
 
 
 # ---------------------------------------------------------------------------
