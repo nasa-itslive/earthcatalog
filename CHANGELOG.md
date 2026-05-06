@@ -9,6 +9,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- README canonical search example uses `catalog.search()` returning pystac
+  Items for clarity.
+
+## [0.6.0] - 2026-05-03
+
 ### Added
 - Spatially-partitioned STAC ingest pipeline backed by Apache Iceberg and GeoParquet.
 - Single-node incremental ingest (`earthcatalog incremental`) with `--since` delta support.
@@ -47,4 +53,5 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `environment.yml` (replaced by pyproject.toml).
 - `earthcatalog/core/fix_schema.py` and `tests/test_fix_schema.py` (one-off migration tool).
 
-[Unreleased]: https://github.com/nasa-itslive/earthcatalog/commits/main
+[Unreleased]: https://github.com/nasa-itslive/earthcatalog/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/nasa-itslive/earthcatalog/releases/tag/v0.6.0
