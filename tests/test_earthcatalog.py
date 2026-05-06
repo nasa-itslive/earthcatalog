@@ -508,6 +508,9 @@ class TestBulkIngest:
             catalog_key="catalog.db",
         )
 
+        # Mock credentials — bulk_ingest() requires AWS_ACCESS_KEY_ID
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+
         # Patch run_backfill to capture params instead of executing
         captured = {}
 

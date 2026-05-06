@@ -722,6 +722,7 @@ class EarthCatalog:
                 print(row.id, row.uri)
         """
         import json
+
         import duckdb
         from shapely.geometry import shape
 
@@ -733,17 +734,21 @@ class EarthCatalog:
             geom = shape(kwargs["intersects"])
         elif "bbox" in kwargs:
             from shapely.geometry import box
+
             b = kwargs["bbox"]
             geom = box(b[0], b[1], b[2], b[3])
 
         # --- Iceberg pruning ---
         start_dt, end_dt = _extract_datetime_range(**kwargs)
         paths = self._info.file_paths(
-            self._table, geom,
-            start_datetime=start_dt, end_datetime=end_dt,
+            self._table,
+            geom,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
         )
         if not paths:
             import pandas as pd
+
             return pd.DataFrame({"id": [], "uri": []})
 
         # --- build SQL (read only id + assets) ---
@@ -758,6 +763,7 @@ class EarthCatalog:
         raw_filter = kwargs.get("filter")
         if raw_filter is not None:
             from .search import _cql2_to_sql
+
             conditions.append(_cql2_to_sql(raw_filter))
         where = " AND ".join(conditions) if conditions else "TRUE"
         max_items = kwargs.get("max_items")
@@ -775,7 +781,6 @@ class EarthCatalog:
             table = table.slice(0, max_items)
 
         # --- extract data URIs from JSON assets ---
-        import pyarrow as pa
 
         ids = table.column("id").to_pylist()
         assets_list = table.column("assets").to_pylist()
@@ -790,6 +795,7 @@ class EarthCatalog:
             uris.append(href)
 
         import pandas as pd
+
         return pd.DataFrame({"id": ids, "uri": uris})
 
     def duck_search(self, **kwargs):
@@ -823,13 +829,17 @@ class EarthCatalog:
             geom = shape(kwargs["intersects"])
         elif "bbox" in kwargs:
             from shapely.geometry import box
+
             b = kwargs["bbox"]
             geom = box(b[0], b[1], b[2], b[3])
 
         start_dt, end_dt = _extract_datetime_range(**kwargs)
-        paths = self._info.file_paths(self._table, geom, start_datetime=start_dt, end_datetime=end_dt)
+        paths = self._info.file_paths(
+            self._table, geom, start_datetime=start_dt, end_datetime=end_dt
+        )
         if not paths:
             import pandas as pd
+
             return pd.DataFrame()
 
         path_list = ", ".join(repr(p) for p in paths)

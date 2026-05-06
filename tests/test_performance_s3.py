@@ -87,6 +87,7 @@ def _geom_to_wkt(geom_dict):
     return shape(geom_dict).wkt
 
 
+@pytest.mark.integration
 class TestCorrectness:
     """Verify rustac and DuckDB return the same items for identical geometry.
 
@@ -153,6 +154,7 @@ class TestCorrectness:
             print(f"\n  ✅ rustac & DuckDB match: {len(rustac_ids)} IDs identical")
 
 
+@pytest.mark.integration
 class TestProductionPerformance:
     """Latency benchmarks against the real S3 catalog.
 
@@ -481,9 +483,7 @@ class TestProductionPerformance:
         info = catalog.search(intersects=GREENLAND_POINT, datetime="1980-01-01/2015-12-31").stats()
 
         print(f"\n  search()       {len(r_items):>6} items in {t_r:.1f}s")
-        print(
-            f"  duck_search()  {len(d_df):>6} items in {t_d:.1f}s  ({(t_r / t_d):.1f}x faster)"
-        )
+        print(f"  duck_search()  {len(d_df):>6} items in {t_d:.1f}s  ({(t_r / t_d):.1f}x faster)")
         print(
             f"  overlap: {len(overlap)} ids  "
             f"(search only: {len(r_ids - d_ids)}, duck only: {len(d_ids - r_ids)})"
