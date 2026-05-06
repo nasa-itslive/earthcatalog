@@ -87,7 +87,6 @@ def _geom_to_wkt(geom_dict):
     return shape(geom_dict).wkt
 
 
-@pytest.mark.integration
 class TestCorrectness:
     """Verify rustac and DuckDB return the same items for identical geometry.
 

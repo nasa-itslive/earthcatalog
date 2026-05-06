@@ -478,7 +478,7 @@ class TestRunBackfillV2:
                 catalog_path=catalog_path,
                 staging_store=staging_store,
                 staging_prefix="ingest",
-                warehouse_store=MemoryStore(),
+                warehouse_store=LocalStore(str(wh_root)),
                 warehouse_root=str(wh_root),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
@@ -522,7 +522,7 @@ class TestRunBackfillV2:
                 catalog_path=catalog_path,
                 staging_store=staging_store,
                 staging_prefix="ingest",
-                warehouse_store=MemoryStore(),
+                warehouse_store=LocalStore(str(wh_root)),
                 warehouse_root=str(wh_root),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
@@ -543,7 +543,7 @@ class TestRunBackfillV2:
                 catalog_path=catalog_path2,
                 staging_store=staging_store,
                 staging_prefix="ingest",
-                warehouse_store=MemoryStore(),
+                warehouse_store=LocalStore(str(wh_root2)),
                 warehouse_root=str(wh_root2),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
@@ -593,7 +593,7 @@ class TestRunBackfillV2Delta:
                 catalog_path=catalog_path,
                 staging_store=staging_store,
                 staging_prefix="ingest",
-                warehouse_store=MemoryStore(),
+                warehouse_store=LocalStore(str(wh_root)),
                 warehouse_root=str(wh_root),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
@@ -605,6 +605,9 @@ class TestRunBackfillV2Delta:
         table = _open_sqlite(db_path=catalog_path, warehouse_path=str(wh_root)).load_table(
             "earthcatalog.stac_items"
         )
+
+        # Second run — same warehouse, delta mode
+        inv2 = tmp_path / "inv2.csv"
         first_ids = set(table.scan().to_arrow().column("id").to_pylist())
 
         # Second delta run with new items
@@ -656,7 +659,7 @@ class TestRunBackfillV2Delta:
                 catalog_path=catalog_path2,
                 staging_store=staging_store,
                 staging_prefix="ingest2",
-                warehouse_store=MemoryStore(),
+                warehouse_store=LocalStore(str(wh_root)),
                 warehouse_root=str(wh_root),
                 partitioner=_PARTITIONER,
                 chunk_size=4,
@@ -690,7 +693,6 @@ _REAL_ITEM_KEY = (
 )
 
 
-@pytest.mark.integration
 class TestFetchRealS3:
     @pytest.fixture()
     def public_store(self):
