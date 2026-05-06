@@ -693,6 +693,7 @@ _REAL_ITEM_KEY = (
 )
 
 
+@pytest.mark.integration
 class TestFetchRealS3:
     @pytest.fixture()
     def public_store(self):

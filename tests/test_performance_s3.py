@@ -87,6 +87,7 @@ def _geom_to_wkt(geom_dict):
     return shape(geom_dict).wkt
 
 
+@pytest.mark.integration
 class TestCorrectness:
     """Verify rustac and DuckDB return the same items for identical geometry.
 
@@ -153,7 +154,6 @@ class TestCorrectness:
             print(f"\n  ✅ rustac & DuckDB match: {len(rustac_ids)} IDs identical")
 
 
-@pytest.mark.integration
 class TestProductionPerformance:
     """Latency benchmarks against the real S3 catalog.
 
@@ -210,6 +210,7 @@ class TestProductionPerformance:
         elapsed = time.perf_counter() - t0
         return len(rows), elapsed
 
+    @pytest.mark.integration
     def test_rustac_vs_duckdb_latency_point(self, catalog):
         """Compare rustac vs DuckDB latency for point query with max_items=100."""
         from shapely.geometry import shape
@@ -235,6 +236,7 @@ class TestProductionPerformance:
         )
         print(f"  duckdb: {n_d} items in {t_d:.3f}s")
 
+    @pytest.mark.integration
     def test_rustac_vs_duckdb_latency_bbox(self, catalog):
         """Compare rustac vs DuckDB latency for bbox query with max_items=100."""
         from shapely.geometry import box
@@ -260,6 +262,7 @@ class TestProductionPerformance:
         )
         print(f"  duckdb: {n_d} items in {t_d:.3f}s")
 
+    @pytest.mark.integration
     def test_spatial_only(self, catalog):
         """Point query, no temporal or CQL2 filter, max_items=100."""
         n, elapsed, info = self._bench_rustac(
@@ -273,6 +276,7 @@ class TestProductionPerformance:
             f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
         )
 
+    @pytest.mark.integration
     def test_spatial_and_year(self, catalog):
         """Point in Greenland + single year, max_items=100."""
         n, elapsed, info = self._bench_rustac(
@@ -287,6 +291,7 @@ class TestProductionPerformance:
             f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
         )
 
+    @pytest.mark.integration
     def test_spatial_year_cql2(self, catalog):
         """Point + year + CQL2 percent_valid_pixels >= 80, max_items=100."""
         import cql2
@@ -304,6 +309,7 @@ class TestProductionPerformance:
             f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
         )
 
+    @pytest.mark.performance
     def test_wide_temporal_range(self, catalog):
         """Full temporal range (1980–2026) with no item limit."""
         n, elapsed, info = self._bench_rustac(
@@ -318,6 +324,7 @@ class TestProductionPerformance:
             f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
         )
 
+    @pytest.mark.performance
     def test_pages(self, catalog):
         """Materialize via pages(), measure per-page breakdown."""
         results = catalog.search(
@@ -335,6 +342,7 @@ class TestProductionPerformance:
             f"  (first page sizes: {page_sizes}...)"
         )
 
+    @pytest.mark.integration
     def test_out_of_range_datetime(self, catalog):
         """Datetime range that matches no data — Iceberg prunes to 0 files."""
         n, elapsed, info = self._bench_rustac(
@@ -349,6 +357,7 @@ class TestProductionPerformance:
             f"  (files={info['files']}, est.rows={info['rows_upper_bound']:,})"
         )
 
+    @pytest.mark.integration
     def test_bbox_vs_point(self, catalog):
         """Compare bbox vs point query latency side by side."""
         n_b, t_b, s_b = self._bench_rustac(
@@ -374,6 +383,7 @@ class TestProductionPerformance:
             f"  (files={s_p['files']}, est.rows={s_p['rows_upper_bound']:,})"
         )
 
+    @pytest.mark.performance
     def test_rustac_vs_duckdb_wide_range(self, catalog):
         """Compare rustac search() vs search_files() + DuckDB for wide temporal range.
 
@@ -454,6 +464,7 @@ class TestProductionPerformance:
                 f"  datetime={rustac_first.properties.get('datetime')}"
             )
 
+    @pytest.mark.performance
     def test_duck_search_vs_rustac(self, catalog):
         """Compare duck_search() vs search() (rustac) for wide temporal range.
 
@@ -489,6 +500,7 @@ class TestProductionPerformance:
             f"  files={info['files']}"
         )
 
+    @pytest.mark.integration
     def test_duck_search_cql2_vs_raw_json(self, catalog):
         """duck_search() with cql2.parse_text() vs raw JSON should match."""
         import cql2

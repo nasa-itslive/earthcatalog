@@ -33,10 +33,10 @@ jobs:
           source .venv/bin/activate
           uv sync --extra dev
 
-      - name: Run tests (unit + integration-free)
+      - name: Run tests (unit + integration)
         run: |
           source .venv/bin/activate
-          pytest --tb=short -q -m "not integration"
+          pytest --tb=short -q -m "not performance"
 
       - name: Upload test results
         if: failure()
