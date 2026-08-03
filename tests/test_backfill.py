@@ -146,6 +146,66 @@ class TestCompactCellYear:
         tbl = pq.ParquetFile(io.BytesIO(raw)).read()
         assert tbl.num_rows == len(items)
 
+    def test_tracks_source_index_when_enabled(self):
+        """compact_cell_year appends provenance rows when source index given."""
+        from earthcatalog.pipelines.backfill import compact_cell_year
+        from earthcatalog.source_index import stream_active
+        from earthcatalog.transform import fan_out, group_by_partition
+
+        store = MemoryStore()
+        wh_store = MemoryStore()
+        src_store = MemoryStore()
+
+        fo = fan_out(_STAC_ITEMS, _PARTITIONER)
+        (cell, year), items = list(group_by_partition(fo).items())[0]
+        for item in items:
+            item["properties"]["updated"] = "2024-01-01T00:00:00Z"
+            item["_source_bucket"] = "mock-bucket"
+            item["_source_key"] = f"stac/{item['id']}.stac.json"
+        ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
+        obstore.put(store, f"staging/{cell}/{year}/worker.ndjson", ndjson_data)
+
+        report = compact_cell_year(
+            cell=cell,
+            year=str(year),
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_store=wh_store,
+            source_index_store=src_store,
+            source_index_key="source.parquet",
+        )
+
+        assert report["output_rows"] > 0
+        rows = list(stream_active(src_store, "source.parquet"))
+        assert len(rows) == len(items)
+        for row in rows:
+            assert row["s3_key"].startswith("s3://mock-bucket/")
+            assert row["grid_partition"] == cell
+            assert row["year"] == year
+
+    def test_no_source_index_when_disabled(self):
+        """Without source index params, no provenance rows are written."""
+        from earthcatalog.pipelines.backfill import compact_cell_year
+        from earthcatalog.transform import fan_out, group_by_partition
+
+        store = MemoryStore()
+        wh_store = MemoryStore()
+        fo = fan_out(_STAC_ITEMS, _PARTITIONER)
+        (cell, year), items = list(group_by_partition(fo).items())[0]
+        ndjson_data = "\n".join(json.dumps(i) for i in items).encode()
+        obstore.put(store, f"staging/{cell}/{year}/worker.ndjson", ndjson_data)
+
+        report = compact_cell_year(
+            cell=cell,
+            year=str(year),
+            staging_store=store,
+            staging_prefix="staging",
+            warehouse_store=wh_store,
+        )
+        assert report["output_rows"] > 0
+        # Nothing writes to a source index — no side effect to assert beyond
+        # the report succeeding without source_index params.
+
 
 class TestCompactCellYearDelta:
     def test_writes_new_files_without_overwriting(self, tmp_path):

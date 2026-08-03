@@ -121,6 +121,20 @@ def main() -> None:
             "Only effective with --delta."
         ),
     )
+    parser.add_argument(
+        "--source-index",
+        default=None,
+        help="S3 URI for source index (default: {warehouse}_source_index.parquet)",
+    )
+    parser.add_argument(
+        "--update-source-index",
+        action="store_true",
+        help=(
+            "Track source provenance (s3_key, stac_id, grid_partition, year) in the "
+            "source index during ingest, so weekly garbage collection can detect "
+            "deleted S3 objects without re-fetching STAC JSONs."
+        ),
+    )
     args = parser.parse_args()
 
     since = None
@@ -148,6 +162,20 @@ def main() -> None:
         Path(args.staging).mkdir(parents=True, exist_ok=True)
         staging_store = LocalStore(str(args.staging))
         staging_prefix = ""
+
+    # Resolve source index store + key (default: {warehouse}_source_index.parquet)
+    source_index_store = None
+    source_index_key = None
+    if args.update_source_index:
+        src_path = args.source_index or f"{args.warehouse.rstrip('/')}_source_index.parquet"
+        if src_path.startswith("s3://"):
+            no_scheme = src_path.removeprefix("s3://")
+            src_bucket, _, src_key = no_scheme.partition("/")
+            source_index_store = _make_s3_store(src_bucket)
+            source_index_key = src_key
+        else:
+            source_index_store = LocalStore(str(Path(src_path).parent))
+            source_index_key = Path(src_path).name
 
     from earthcatalog import store_config
 
@@ -261,6 +289,9 @@ def main() -> None:
             upload=not args.skip_upload,
             hash_index_path=args.hash_index,
             update_hash_index=args.update_hash_index,
+            update_source_index=args.update_source_index,
+            source_index_store=source_index_store,
+            source_index_key=source_index_key,
         )
     elif args.scheduler == "local":
         from dask.distributed import Client, LocalCluster
@@ -292,6 +323,9 @@ def main() -> None:
                 upload=not args.skip_upload,
                 hash_index_path=args.hash_index,
                 update_hash_index=args.update_hash_index,
+                update_source_index=args.update_source_index,
+                source_index_store=source_index_store,
+                source_index_key=source_index_key,
             )
     else:
         from earthcatalog.pipelines.backfill import run_backfill
@@ -318,6 +352,9 @@ def main() -> None:
                 upload=not args.skip_upload,
                 hash_index_path=args.hash_index,
                 update_hash_index=args.update_hash_index,
+                update_source_index=args.update_source_index,
+                source_index_store=source_index_store,
+                source_index_key=source_index_key,
             )
 
 
