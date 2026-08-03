@@ -238,6 +238,10 @@ def write_chunks(
                 if not k.endswith(".stac.json"):
                     continue
                 total_items += 1
+                if total_items % 500_000 == 0:
+                    pbar.set_postfix_str(
+                        f"fast-forwarding {total_items:,} / {items_to_skip:,} items"
+                    )
                 if total_items >= items_to_skip:
                     break
             pbar.set_postfix_str(f"fast-forward done, at item {total_items:,}")
