@@ -550,6 +550,7 @@ def ingest(
     limit: int | None = None,
     since: datetime | None = None,
     update_hash_index: bool = False,
+    update_source_index: bool = False,
 ) -> dict:
     """Open an EarthCatalog and ingest STAC items from an inventory.
 
@@ -574,6 +575,9 @@ def ingest(
         Only process items modified after this datetime.
     update_hash_index:
         Update the warehouse hash index after ingest.
+    update_source_index:
+        Append source provenance rows (s3_key, stac_id, grid_partition, year)
+        to the source index during ingest.
 
     Returns
     -------
@@ -587,6 +591,7 @@ def ingest(
         limit=limit,
         since=since,
         update_hash_index=update_hash_index,
+        update_source_index=update_source_index,
     )
 
 
@@ -938,12 +943,18 @@ class EarthCatalog:
         limit: int | None = None,
         since: datetime | None = None,
         update_hash_index: bool = False,
+        update_source_index: bool = False,
     ) -> dict:
         """Ingest STAC items from an S3 Inventory into the catalog.
 
         Unified entry point replacing both ``backfill.run_backfill`` and
         ``incremental.run``.  Handles full backfill (drop+recreate table)
         and delta append (add files to existing table).
+
+        ``update_source_index`` records provenance rows
+        ``(s3_key, stac_id, grid_partition, year)`` so the weekly garbage
+        collection pipeline can detect deleted S3 objects without
+        re-fetching STAC JSONs.
 
         The caller is responsible for holding an S3Lock around this call
         when running against a shared store (use ``self.lock()``).
@@ -960,6 +971,7 @@ class EarthCatalog:
             read_hashes,
             write_hashes,
         )
+        from .source_index import append_source_index
         from .transform import (
             fan_out,
             group_by_partition,
@@ -995,6 +1007,10 @@ class EarthCatalog:
         warehouse_root = self._catalog.properties.get("warehouse", "")
         uri = self._catalog.properties.get("uri", "")
         local_db = uri.removeprefix("sqlite:///") if uri else "/tmp/earthcatalog.db"
+
+        source_index_key = f"{warehouse_root.rstrip('/')}_source_index.parquet"
+        if source_index_key.startswith("s3://"):
+            source_index_key = source_index_key.removeprefix("s3://").split("/", 1)[1]
 
         if self._store and self._catalog_key:
             self.download_catalog(local_db)
@@ -1038,6 +1054,19 @@ class EarthCatalog:
                 if n > 0:
                     written_keys.append(s3_key)
                     total_rows += n
+                    if update_source_index:
+                        source_rows = [
+                            (
+                                f"s3://{it['_source_bucket']}/{it['_source_key']}",
+                                it["id"],
+                                cell,
+                                int(year or 0),
+                            )
+                            for it in group_items
+                            if "_source_key" in it
+                        ]
+                        if source_rows:
+                            append_source_index(source_rows, self._store, source_index_key)
 
         print(f"Ingesting from: {inventory_path}")
         for bucket, key in _iter_inventory(inventory_path, since=since):
@@ -1231,6 +1260,54 @@ class EarthCatalog:
             warehouse_path=warehouse_path,
             catalog_path=local_db,
             threshold=threshold,
+            dry_run=dry_run,
+        )
+
+    def garbage_collect(
+        self,
+        inventory_path: str,
+        *,
+        dry_run: bool = False,
+    ) -> dict:
+        """Remove orphaned STAC items whose source objects left the S3 Inventory.
+
+        Wraps :func:`earthcatalog.pipelines.delete.run_garbage_collection`
+        using this catalog's store, hash index, and warehouse path.
+
+        Detects deletions via a Bloom filter of the current inventory keys,
+        then rewrites only the affected GeoParquet files.  See the v2 GC
+        plan (``docs/delete_plan_v2.md``) for details.
+
+        Parameters
+        ----------
+        inventory_path:
+            Path or ``s3://`` URI to the current S3 Inventory.
+        dry_run:
+            When ``True``, detect and report orphans but make no changes.
+
+        Returns
+        -------
+        Summary dict: ``candidates``, ``confirmed``, ``orphaned``,
+        ``files_rewritten``, ``rows_removed``, ``partitions_affected``.
+        """
+        from earthcatalog.pipelines.delete import run_garbage_collection
+
+        warehouse_root = self._catalog.properties.get("warehouse", "")
+
+        hash_index_path = self._table.properties.get("earthcatalog.hash_index_path", "")
+        if not hash_index_path:
+            hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
+
+        source_index_path = f"{warehouse_root.rstrip('/')}_source_index.parquet"
+
+        def _strip(uri: str) -> str:
+            return uri.removeprefix("s3://").split("/", 1)[1] if uri.startswith("s3://") else uri
+
+        return run_garbage_collection(
+            inventory_path=inventory_path,
+            store=self._store,
+            source_index_key=_strip(source_index_path),
+            hash_index_key=_strip(hash_index_path),
             dry_run=dry_run,
         )
 

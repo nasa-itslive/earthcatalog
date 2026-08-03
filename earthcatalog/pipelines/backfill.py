@@ -316,7 +316,12 @@ async def _fetch_item_async(store: object, bucket: str, key: str) -> dict | None
                     file=sys.stderr,
                 )
                 return None
-            return orjson.loads(raw)
+            item = orjson.loads(raw)
+            # Provenance for the source index — survives fan_out() and
+            # group_by_partition() because both preserve top-level keys.
+            item["_source_bucket"] = bucket
+            item["_source_key"] = key
+            return item
         except FileNotFoundError:
             print(f"WARN: s3://{bucket}/{key} not found — skipping", file=sys.stderr)
             return None
@@ -523,11 +528,18 @@ def _stream_compact(
     compact_rows: int,
     write_fn: Callable[[list[dict], str], int],
     out_key_fn: Callable[[int], str],
+    source_index_store: object | None = None,
+    source_index_key: str | None = None,
 ) -> dict[str, Any]:
     """
     Stream NDJSON → dedup → write GeoParquet in batches.
 
     Only holds ``compact_rows`` items + a set of seen IDs in memory.
+
+    When *source_index_store* / *source_index_key* are provided, provenance
+    rows (``(s3_key, stac_id, grid_partition, year)``) are appended to the
+    source index for every batch written.  Items must carry the injected
+    ``_source_bucket`` / ``_source_key`` keys (see ``_fetch_item_async``).
     """
     seen_ids: set[str] = set()
     batch: list[dict] = []
@@ -536,6 +548,24 @@ def _stream_compact(
     out_keys: list[str] = []
     total_rows = 0
     part_idx = 0
+
+    def _track_source(batch: list[dict]) -> None:
+        if source_index_store is None or source_index_key is None:
+            return
+        rows = [
+            (
+                f"s3://{it['_source_bucket']}/{it['_source_key']}",
+                it["id"],
+                cell,
+                int(year or 0),
+            )
+            for it in batch
+            if "_source_key" in it
+        ]
+        if rows:
+            from earthcatalog.source_index import append_source_index
+
+            append_source_index(rows, source_index_store, source_index_key)
 
     for key in ndjson_keys:
         try:
@@ -561,6 +591,7 @@ def _stream_compact(
                 if n > 0:
                     out_keys.append(out_path)
                     total_rows += n
+                    _track_source(batch)
                 part_idx += 1
                 batch = []
 
@@ -570,6 +601,7 @@ def _stream_compact(
         if n > 0:
             out_keys.append(out_path)
             total_rows += n
+            _track_source(batch)
 
     return {
         "cell": cell,
@@ -609,6 +641,8 @@ def compact_cell_year(
     staging_prefix: str,
     warehouse_store: object,
     compact_rows: int = 100_000,
+    source_index_store: object | None = None,
+    source_index_key: str | None = None,
 ) -> dict[str, Any]:
     """Phase 3 worker: stream NDJSON → write GeoParquet to *warehouse_store*."""
     prefix = f"{staging_prefix}/{cell}/{year}/"
@@ -626,7 +660,15 @@ def compact_cell_year(
         return f"{key_prefix}/part_{idx:06d}.parquet"
 
     return _stream_compact(
-        cell, year, staging_store, ndjson_keys, compact_rows, _write_fn, _out_key
+        cell,
+        year,
+        staging_store,
+        ndjson_keys,
+        compact_rows,
+        _write_fn,
+        _out_key,
+        source_index_store=source_index_store,
+        source_index_key=source_index_key,
     )
 
 
@@ -669,6 +711,8 @@ def compact_cell_year_delta(
     staging_prefix: str,
     warehouse_store: object,
     compact_rows: int = 100_000,
+    source_index_store: object | None = None,
+    source_index_key: str | None = None,
 ) -> dict[str, Any]:
     """Phase 3 delta worker: compact NDJSON → new GeoParquet (no overwrite)."""
     prefix = f"{staging_prefix}/{cell}/{year}/"
@@ -687,7 +731,15 @@ def compact_cell_year_delta(
         return f"{key_prefix}/part_{start_idx + idx:06d}.parquet"
 
     return _stream_compact(
-        cell, year, staging_store, ndjson_keys, compact_rows, _write_fn, _out_key
+        cell,
+        year,
+        staging_store,
+        ndjson_keys,
+        compact_rows,
+        _write_fn,
+        _out_key,
+        source_index_store=source_index_store,
+        source_index_key=source_index_key,
     )
 
 
@@ -1016,6 +1068,9 @@ def run_backfill(
     create_client: Callable[[], object] | None = None,
     hash_index_path: str | None = None,
     update_hash_index: bool = False,
+    update_source_index: bool = False,
+    source_index_store: object | None = None,
+    source_index_key: str | None = None,
 ) -> None:
     """
     Four-phase staging-based backfill pipeline.
@@ -1063,6 +1118,16 @@ def run_backfill(
         Optional callable that returns a Dask Client. Called lazily
         right before Phase 2 (after Phase 1 completes). Used for
         Coiled to avoid idle cluster timeout during long Phase 1 runs.
+    update_source_index:
+        When True, append provenance rows to the source index during
+        Phase 3 for every GeoParquet file written.  Requires
+        *source_index_store* and *source_index_key*.
+    source_index_store:
+        obstore-compatible store for the source index (usually the
+        warehouse store).
+    source_index_key:
+        Key of the source index within *source_index_store* (e.g.
+        ``path/to/warehouse_source_index.parquet``).
     """
     if partitioner is None:
         if h3_resolution is not None:
@@ -1242,6 +1307,9 @@ def run_backfill(
                 "compact_rows": compact_rows,
                 "warehouse_store": warehouse_store,
             }
+            if update_source_index:
+                common_kwargs["source_index_store"] = source_index_store
+                common_kwargs["source_index_key"] = source_index_key
 
             print(f"Submitting {len(bucket_list)} compact tasks …")
 

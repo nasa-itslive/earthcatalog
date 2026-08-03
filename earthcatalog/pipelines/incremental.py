@@ -468,7 +468,12 @@ def _iter_inventory(
 def _fetch_item(bucket: str, key: str) -> dict | None:
     try:
         raw = obstore.get(_get_store(bucket), key).bytes()
-        return json.loads(bytes(raw))
+        item = json.loads(bytes(raw))
+        # Provenance for the source index — survives fan_out() and
+        # group_by_partition() because both preserve top-level keys.
+        item["_source_bucket"] = bucket
+        item["_source_key"] = key
+        return item
     except Exception as exc:
         print(f"WARN: failed to fetch s3://{bucket}/{key}: {exc}")
         return None
