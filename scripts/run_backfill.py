@@ -196,8 +196,12 @@ def main() -> None:
     store_config.set_store(
         _make_s3_store(wh_bucket if args.warehouse.startswith("s3://") else "its-live-data")
     )
-    store_config.set_catalog_key("test-space/stac/catalog/earthcatalog.db")
-    store_config.set_lock_key("test-space/stac/catalog/.lock")
+    store_config.set_catalog_key(
+        os.environ.get("EARTHCATALOG_CATALOG_KEY", "test-space/stac/catalog/earthcatalog.db")
+    )
+    store_config.set_lock_key(
+        os.environ.get("EARTHCATALOG_LOCK_KEY", "test-space/stac/catalog/.lock")
+    )
 
     if args.delta and args.warehouse.startswith("s3://"):
         from earthcatalog.catalog import download_catalog
