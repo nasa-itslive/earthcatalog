@@ -1,0 +1,112 @@
+# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
+name: Garbage Collection
+
+# Runs every Sunday at 08:00 UTC — after the daily delta+ingest pipeline.
+# Detects STAC items whose source S3 objects have been deleted, rewrites the
+# affected GeoParquet partition files, and rebuilds the Iceberg catalog.
+
+on:
+  # schedule:
+  #   - cron: "0 8 * * 0"   # 08:00 UTC every Sunday
+  workflow_dispatch:
+    inputs:
+      inventory_url:
+        description: "S3 URI to manifest.json (defaults to latest Sunday snapshot)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run (detect orphans, make no changes)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  WAREHOUSE:    s3://its-live-data/test-space/stac/catalog/warehouse
+  CATALOG_KEY:  test-space/stac/catalog/earthcatalog.db
+  INVENTORY_BASE: s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
+
+jobs:
+  garbage-collect:
+    name: Garbage collect orphaned items
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve inventory URL
+        id: inventory
+        run: |
+          if [ -n "${{ github.event.inputs.inventory_url }}" ]; then
+            echo "url=${{ github.event.inputs.inventory_url }}" >> "$GITHUB_OUTPUT"
+          else
+            # Default: today's snapshot (workflows run Sunday 08:00, inventory lands ~01:00)
+            DATE=$(date -u +%Y-%m-%d)
+            echo "url=${{ env.INVENTORY_BASE }}/${DATE}T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download catalog
+        run: |
+          uv run python -c "
+          from obstore.store import S3Store
+          from earthcatalog import store_config
+          from earthcatalog.catalog import download_catalog
+
+          store = S3Store(bucket='its-live-data', region='us-west-2')
+          store_config.set_store(store)
+          store_config.set_catalog_key('${{ env.CATALOG_KEY }}')
+          download_catalog('/tmp/earthcatalog.db')
+          "
+
+      - name: Catalog info (before)
+        run: |
+          uv run python scripts/info.py \
+            --catalog   /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
+
+      - name: Run garbage collection
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          uv run python scripts/run_gc.py \
+            --catalog     /tmp/earthcatalog.db \
+            --warehouse   ${{ env.WAREHOUSE }} \
+            --inventory   "${{ steps.inventory.outputs.url }}" \
+            --catalog-key ${{ env.CATALOG_KEY }} \
+            $DRY_RUN_FLAG
+
+      - name: Catalog info (after)
+        if: always()
+        run: |
+          uv run python scripts/info.py \
+            --catalog   /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### GC Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Inventory: \`${{ steps.inventory.outputs.url }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: ${{ github.event.inputs.dry_run || 'false' }}" >> "$GITHUB_STEP_SUMMARY"

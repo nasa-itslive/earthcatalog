@@ -1,15 +1,46 @@
-# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
-name: Daily Delta
+name: Daily Catalog Update
+
+# Runs every day at 02:00 UTC.
+# Job 1 (produce-delta): scans the latest S3 Inventory against the hash
+#   index and writes a delta Parquet of new item keys to the pending prefix.
+# Job 2 (ingest): consumes that delta Parquet, fetches the STAC JSONs,
+#   and appends rows to the warehouse + source index.
+#
+# Uncomment the schedule block and set the AWS_ROLE_ARN secret to enable.
 
 on:
   # schedule:
-  #   - cron: "0 2 * * *" # 02:00 UTC daily
+  #   - cron: "0 2 * * *"   # 02:00 UTC daily
   workflow_dispatch:
     inputs:
       date:
-        description: "Date for delta file name (YYYY-MM-DD). Defaults to today."
+        description: "Override date (YYYY-MM-DD). Defaults to yesterday."
         required: false
         default: ""
+      scheduler:
+        description: "Dask scheduler for the ingest job"
+        type: choice
+        options:
+          - local
+          - coiled
+          - synchronous
+        default: local
+      workers:
+        description: "Dask local workers"
+        required: false
+        default: "4"
+      coiled_n_workers:
+        description: "Coiled worker count"
+        required: false
+        default: "10"
+      coiled_vm_type:
+        description: "Coiled VM type"
+        required: false
+        default: "c6i.xlarge"
+      chunk_size:
+        description: "STAC items per ingest chunk"
+        required: false
+        default: "10000"
 
 permissions:
   contents: read
@@ -17,12 +48,78 @@ permissions:
 
 env:
   AWS_REGION: us-west-2
-  WAREHOUSE_HASH: s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
-  DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
+  WAREHOUSE:       s3://its-live-data/test-space/stac/catalog/warehouse
+  WAREHOUSE_HASH:  s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
+  DELTA_PREFIX:    s3://its-live-data/test-space/stac/catalog/delta
+  STAGING:         s3://its-live-data/test-space/stac/catalog/ingest
+  CATALOG_KEY:     test-space/stac/catalog/earthcatalog.db
+  INVENTORY_BASE:  s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
 
+# ---------------------------------------------------------------------------
+# Job 1 — Produce delta
+# ---------------------------------------------------------------------------
 jobs:
   produce-delta:
     name: Produce daily delta
+    runs-on: ubuntu-latest
+    outputs:
+      date:        ${{ steps.manifest.outputs.date }}
+      manifest_url: ${{ steps.manifest.outputs.manifest_url }}
+      delta_path:  ${{ steps.manifest.outputs.delta_path }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve date and paths
+        id: manifest
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            DATE="${{ github.event.inputs.date }}"
+          else
+            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+          echo "date=$DATE"                                                                        >> "$GITHUB_OUTPUT"
+          echo "manifest_url=${{ env.INVENTORY_BASE }}/${DATE}T01-00Z/manifest.json"             >> "$GITHUB_OUTPUT"
+          echo "delta_path=${{ env.DELTA_PREFIX }}/pending/delta_${DATE}.parquet"                >> "$GITHUB_OUTPUT"
+
+      - name: Run daily delta
+        run: |
+          uv run python scripts/daily_delta.py \
+            "${{ steps.manifest.outputs.manifest_url }}" \
+            --warehouse-hash ${{ env.WAREHOUSE_HASH }} \
+            --delta-prefix   ${{ env.DELTA_PREFIX }} \
+            --date           "${{ steps.manifest.outputs.date }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Delta Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Date: ${{ steps.manifest.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Manifest: \`${{ steps.manifest.outputs.manifest_url }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Delta written to: \`${{ steps.manifest.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+# ---------------------------------------------------------------------------
+# Job 2 — Ingest delta (runs only after produce-delta succeeds)
+# ---------------------------------------------------------------------------
+  ingest:
+    name: Ingest delta
+    needs: produce-delta
     runs-on: ubuntu-latest
 
     steps:
@@ -44,28 +141,75 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Determine manifest URL
-        id: manifest
+      - name: Verify delta file exists
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            DATE="${{ github.event.inputs.date }}"
-          else
-            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
-          fi
-          echo "date=$DATE" >> "$GITHUB_OUTPUT"
-          echo "manifest_url=s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory/${DATE}T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
+          aws s3 ls "${{ needs.produce-delta.outputs.delta_path }}" || {
+            echo "::error::Delta file not found: ${{ needs.produce-delta.outputs.delta_path }}"
+            exit 1
+          }
 
-      - name: Run daily delta
+      - name: Download catalog
         run: |
-          uv run python scripts/daily_delta.py \
-            "${{ steps.manifest.outputs.manifest_url }}" \
-            --warehouse-hash ${{ env.WAREHOUSE_HASH }} \
-            --delta-prefix ${{ env.DELTA_PREFIX }} \
-            --date "${{ steps.manifest.outputs.date }}"
+          uv run python -c "
+          from obstore.store import S3Store
+          from earthcatalog import store_config
+          from earthcatalog.catalog import download_catalog
+          store = S3Store(bucket='its-live-data', region='us-west-2')
+          store_config.set_store(store)
+          store_config.set_catalog_key('${{ env.CATALOG_KEY }}')
+          download_catalog('/tmp/earthcatalog.db')
+          "
+
+      - name: Catalog info (before)
+        run: |
+          uv run python scripts/info.py \
+            --catalog   /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
+
+      - name: Run delta ingest
+        run: |
+          SCHEDULER="${{ github.event.inputs.scheduler || 'local' }}"
+          STAGING_PATH="${{ env.STAGING }}/delta_${{ needs.produce-delta.outputs.date }}"
+
+          if [ "$SCHEDULER" = "local" ]; then
+            EXTRA="--workers ${{ github.event.inputs.workers || '4' }}"
+          elif [ "$SCHEDULER" = "coiled" ]; then
+            EXTRA="--coiled-n-workers ${{ github.event.inputs.coiled_n_workers || '10' }} --coiled-vm-type ${{ github.event.inputs.coiled_vm_type || 'c6i.xlarge' }}"
+          else
+            EXTRA=""
+          fi
+
+          uv run python scripts/run_backfill.py \
+            --inventory          "${{ needs.produce-delta.outputs.delta_path }}" \
+            --catalog            /tmp/earthcatalog.db \
+            --warehouse          ${{ env.WAREHOUSE }} \
+            --staging            "$STAGING_PATH" \
+            --delta \
+            --update-hash-index \
+            --update-source-index \
+            --scheduler          "$SCHEDULER" \
+            --chunk-size         "${{ github.event.inputs.chunk_size || '10000' }}" \
+            --hash-index         ${{ env.WAREHOUSE_HASH }} \
+            $EXTRA
+
+      - name: Mark delta as ingested
+        if: success()
+        run: |
+          INGESTED="${{ env.DELTA_PREFIX }}/ingested/delta_${{ needs.produce-delta.outputs.date }}.done"
+          aws s3 mv "${{ needs.produce-delta.outputs.delta_path }}" "$INGESTED"
+
+      - name: Catalog info (after)
+        if: always()
+        run: |
+          uv run python scripts/info.py \
+            --catalog   /tmp/earthcatalog.db \
+            --warehouse ${{ env.WAREHOUSE }}
 
       - name: Summary
         if: always()
         run: |
-          echo "### Delta Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "Date: ${{ steps.manifest.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Manifest: \`${{ steps.manifest.outputs.manifest_url }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Ingest Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Date: ${{ needs.produce-delta.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Delta: \`${{ needs.produce-delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Hash index: updated" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source index: updated" >> "$GITHUB_STEP_SUMMARY"

@@ -126,6 +126,7 @@ jobs:
             --staging "${{ steps.delta.outputs.staging_path }}" \
             --delta \
             --update-hash-index \
+            --update-source-index \
             --scheduler "$SCHEDULER" \
             --chunk-size "${{ github.event.inputs.chunk_size || '10000' }}" \
             --hash-index ${{ env.WAREHOUSE_HASH }} \
@@ -152,3 +153,4 @@ jobs:
           echo "Delta: \`${{ steps.delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Staging: \`${{ steps.delta.outputs.staging_path }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Hash index: updated via --update-hash-index" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source index: updated via --update-source-index" >> "$GITHUB_STEP_SUMMARY"
