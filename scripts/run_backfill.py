@@ -295,6 +295,26 @@ def run(
             )
             client = Client(cluster)
             print(f"Coiled dashboard: {client.dashboard_link}")
+
+            # Forward AWS credentials so workers can read/write S3.
+            # send_private_envs transmits directly to the cluster over an
+            # encrypted connection — values are never stored by Coiled.
+            aws_envs = {
+                k: os.environ[k]
+                for k in (
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_DEFAULT_REGION",
+                )
+                if k in os.environ
+            }
+            if aws_envs:
+                cluster.send_private_envs(aws_envs)
+                print(f"AWS credentials forwarded to workers ({', '.join(aws_envs)}).")
+            else:
+                print("WARN: no AWS credentials found in environment — workers may lack S3 access.")
+
             print(f"Installing local wheel on workers ({len(whl_bytes):,} bytes) …")
             client.run(_install, whl_bytes=whl_bytes, whl_name=whl_name)
             print("Verifying worker code …")
