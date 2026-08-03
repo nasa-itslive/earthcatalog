@@ -236,55 +236,11 @@ def run(
         )
 
     elif scheduler == "coiled":
-        import glob
-        import subprocess
-        import sys
-        import tempfile
-
         import coiled
         from dask.distributed import Client
 
-        wheel_dir = tempfile.mkdtemp(prefix="earthcatalog-wheel-")
-        print("Building local wheel …")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "-w", wheel_dir, "--quiet"]
-        )
-        wheels = glob.glob(f"{wheel_dir}/*.whl")
-        if not wheels:
-            raise RuntimeError(f"No wheel built in {wheel_dir}")
-        wheel_path = wheels[0]
-        print(f"Built wheel: {os.path.basename(wheel_path)}")
-
-        with open(wheel_path, "rb") as f:
-            whl_bytes = f.read()
-        whl_name = os.path.basename(wheel_path)
-
-        def _install(whl_bytes, whl_name):
-            import os, subprocess, sys, tempfile
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "uninstall", "-y", "earthcatalog", "--quiet"]
-            )
-            td = tempfile.mkdtemp()
-            path = os.path.join(td, whl_name)
-            with open(path, "wb") as f:
-                f.write(whl_bytes)
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--no-deps", path, "--quiet"]
-            )
-            for mod in list(sys.modules):
-                if "earthcatalog" in mod:
-                    del sys.modules[mod]
-
-        def _verify():
-            import inspect
-            from earthcatalog.pipelines import backfill
-            src = inspect.getsource(backfill._fetch_item_async)
-            if "memoryview" not in src:
-                raise RuntimeError(f"WRONG CODE: {backfill.__file__}")
-            print(f"VERIFIED: {backfill.__file__}")
-
         def _create_cluster():
-            print("Starting Coiled cluster (spot with fallback) …")
+            print("Starting Coiled cluster …")
             cluster = coiled.Cluster(
                 n_workers=coiled_n_workers,
                 worker_vm_types=[coiled_vm_type],
@@ -315,10 +271,6 @@ def run(
             else:
                 print("WARN: no AWS credentials found in environment — workers may lack S3 access.")
 
-            print(f"Installing local wheel on workers ({len(whl_bytes):,} bytes) …")
-            client.run(_install, whl_bytes=whl_bytes, whl_name=whl_name)
-            print("Verifying worker code …")
-            client.run(_verify)
             return client
 
         run_backfill(

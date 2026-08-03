@@ -20,16 +20,18 @@ dependencies = [
   "pyyaml",
   "typer",
   "dask[distributed]",
+  "bokeh>=3.1.0",
   "orjson",
   "xxhash",
+  "duckdb",
   "pybloom-live",
   "tqdm",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "duckdb",
   "pandas",
+  "coiled",
   "jupyterlab",
   "dask-labextension",
   "pytest",
