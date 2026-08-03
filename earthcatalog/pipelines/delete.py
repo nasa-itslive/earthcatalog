@@ -183,8 +183,12 @@ def _list_partition_files(
 ) -> list[str]:
     """List GeoParquet keys in one (cell, year) partition, newest first.
 
-    Stale ``gc_*`` files from a crashed previous run are excluded (they are
-    either already merged or will be cleaned up by a prior successful run).
+    All ``.parquet`` files are included regardless of prefix (``part_*`` or
+    ``gc_*``).  After a successful GC run the canonical file in the directory
+    is the ``gc_*`` file written by that run; excluding it would make
+    subsequent GC passes blind to items in previously-collected partitions.
+    Leftover ``gc_*`` files from *crashed* runs are handled separately by
+    :func:`cleanup_stale_gc_files` and do not need special-casing here.
     """
     year_str = str(year) if year is not None else "unknown"
     prefix = f"{warehouse_prefix}grid_partition={cell}/year={year_str}/"
@@ -192,7 +196,7 @@ def _list_partition_files(
     for batch in obstore.list(store, prefix=prefix):
         for obj in batch:
             k: str = obj["path"]
-            if k.endswith(".parquet") and "/gc_" not in k:
+            if k.endswith(".parquet"):
                 keys.append(k)
     keys.sort(reverse=True)
     return keys

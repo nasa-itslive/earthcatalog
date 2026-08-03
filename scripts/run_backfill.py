@@ -108,6 +108,20 @@ def main() -> None:
     parser.add_argument("--coiled-n-workers", type=int, default=10)
     parser.add_argument("--coiled-vm-type", default="c6i.xlarge")
     parser.add_argument(
+        "--coiled-scheduler-address",
+        default=None,
+        metavar="ADDRESS",
+        help=(
+            "Connect to an already-running Coiled (or Dask distributed) scheduler "
+            "instead of provisioning a new cluster.  Accepts any address accepted "
+            "by ``dask.distributed.Client``, e.g. "
+            "``tls://scheduler-abc123.us-west-2.aws.dask.host:8786``.  "
+            "When set, ``--scheduler coiled`` is implied and the wheel-install / "
+            "cluster-creation steps are skipped — the cluster is assumed to already "
+            "have the correct earthcatalog version installed."
+        ),
+    )
+    parser.add_argument(
         "--hash-index",
         default=None,
         help="S3 URI for hash index (default: {warehouse}_id_hashes.parquet)",
@@ -190,7 +204,48 @@ def main() -> None:
 
         download_catalog(args.catalog)
 
-    if args.scheduler == "coiled":
+    if args.coiled_scheduler_address:
+        # ----------------------------------------------------------------
+        # Connect to a pre-provisioned Coiled / Dask distributed scheduler.
+        # The cluster is assumed to already have earthcatalog installed;
+        # wheel build and worker-install steps are intentionally skipped so
+        # infra provisioning stays fully separate from this script.
+        # ----------------------------------------------------------------
+        from dask.distributed import Client
+
+        print(f"Connecting to existing scheduler: {args.coiled_scheduler_address} …")
+        client = Client(args.coiled_scheduler_address)
+        print(f"Connected. Dashboard: {client.dashboard_link}")
+
+        from earthcatalog.pipelines.backfill import run_backfill
+
+        run_backfill(
+            inventory_path=args.inventory,
+            catalog_path=args.catalog,
+            staging_store=staging_store,
+            staging_prefix=staging_prefix,
+            warehouse_store=warehouse_store,
+            warehouse_root=warehouse_root,
+            h3_resolution=args.h3_resolution,
+            chunk_size=args.chunk_size,
+            compact_rows=args.compact_rows,
+            fetch_concurrency=args.fetch_concurrency,
+            limit=args.limit,
+            since=since,
+            use_lock=not args.no_lock,
+            skip_inventory=args.skip_inventory,
+            skip_ingest=args.skip_ingest,
+            retry_pending=args.retry_pending,
+            delta=args.delta,
+            create_client=lambda: client,
+            upload=not args.skip_upload,
+            hash_index_path=args.hash_index,
+            update_hash_index=args.update_hash_index,
+            update_source_index=args.update_source_index,
+            source_index_store=source_index_store,
+            source_index_key=source_index_key,
+        )
+    elif args.scheduler == "coiled":
         import glob
         import subprocess
         import sys

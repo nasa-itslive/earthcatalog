@@ -1278,6 +1278,9 @@ class EarthCatalog:
         then rewrites only the affected GeoParquet files.  See the v2 GC
         plan (``docs/delete_plan_v2.md``) for details.
 
+        After any files are rewritten the Iceberg catalog is rebuilt from the
+        current warehouse state so that subsequent searches reflect the changes.
+
         Parameters
         ----------
         inventory_path:
@@ -1290,9 +1293,21 @@ class EarthCatalog:
         Summary dict: ``candidates``, ``confirmed``, ``orphaned``,
         ``files_rewritten``, ``rows_removed``, ``partitions_affected``.
         """
+        import os
+
         from earthcatalog.pipelines.delete import run_garbage_collection
 
         warehouse_root = self._catalog.properties.get("warehouse", "")
+
+        # Derive the key prefix *within the store* for _list_partition_files.
+        # self._store is a bucket-level S3Store, so keys inside it look like
+        # "test-space/stac/catalog/warehouse/grid_partition=.../year=.../...".
+        # Stripping "s3://bucket/" from warehouse_root gives us that prefix.
+        if warehouse_root.startswith("s3://"):
+            _, _, key_path = warehouse_root.removeprefix("s3://").partition("/")
+            warehouse_prefix = key_path.rstrip("/") + "/"
+        else:
+            warehouse_prefix = warehouse_root.rstrip("/") + "/"
 
         hash_index_path = self._table.properties.get("earthcatalog.hash_index_path", "")
         if not hash_index_path:
@@ -1303,13 +1318,44 @@ class EarthCatalog:
         def _strip(uri: str) -> str:
             return uri.removeprefix("s3://").split("/", 1)[1] if uri.startswith("s3://") else uri
 
-        return run_garbage_collection(
+        result = run_garbage_collection(
             inventory_path=inventory_path,
             store=self._store,
             source_index_key=_strip(source_index_path),
             hash_index_key=_strip(hash_index_path),
+            warehouse_prefix=warehouse_prefix,
             dry_run=dry_run,
         )
+
+        # After files have been physically rewritten the Iceberg table still
+        # points to the now-deleted part_*.parquet paths and has no knowledge
+        # of the new gc_*.parquet files.  Rebuild the table so searches work.
+        if not dry_run and result.get("files_rewritten", 0) > 0:
+            from earthcatalog.pipelines.backfill import rebuild_iceberg_from_warehouse
+
+            uri = self._catalog.properties.get("uri", "")
+            local_db = uri.removeprefix("sqlite:///") if uri else None
+
+            if local_db and os.path.exists(local_db) and self._store and self._catalog_key:
+                n = rebuild_iceberg_from_warehouse(
+                    catalog_path=local_db,
+                    warehouse_root=warehouse_root,
+                    warehouse_store=self._store,
+                    upload=False,  # we upload manually below with our store + key
+                )
+                obstore.put(
+                    self._store,
+                    self._catalog_key,
+                    Path(local_db).read_bytes(),
+                )
+                print(f"Iceberg catalog rebuilt and uploaded ({n:,} files).")
+            else:
+                print(
+                    "WARN: could not rebuild Iceberg catalog after GC — "
+                    "local_db or catalog_key unavailable."
+                )
+
+        return result
 
     def lock(self, owner: str, ttl_hours: int = 12):
         """Return an S3Lock that uses this EarthCatalog's store and key."""

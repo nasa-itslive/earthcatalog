@@ -793,7 +793,7 @@ def register_and_cleanup(
     """
     Phase 4: rebuild Iceberg catalog from warehouse files, upload, cleanup staging.
 
-    1. Drop and recreate the Iceberg table.
+    1. Drop and recreate the Iceberg table (via :func:`rebuild_iceberg_from_warehouse`).
     2. Scan warehouse for all Parquet files.
     3. Register via table.add_files().
     4. Upload catalog.
@@ -804,60 +804,69 @@ def register_and_cleanup(
     When *warehouse_store* is provided it is used for store-based listing
     instead of local filesystem glob (which was the pre-Phase-C fallback).
     """
-    from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+    from pyiceberg.exceptions import NoSuchTableError
 
-    from earthcatalog.catalog import FULL_NAME, ICEBERG_SCHEMA, NAMESPACE, PARTITION_SPEC
+    from earthcatalog.catalog import FULL_NAME, _open_sqlite
 
     if hash_index_path is None:
         hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
 
+    # Inject hash_index_path and h3_resolution into the table properties before
+    # rebuild so rebuild_iceberg_from_warehouse picks them up from the catalog.
+    # We need to set them on the existing table (or create a stub) before dropping.
     catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
-
     try:
-        catalog.create_namespace(NAMESPACE)
-    except NamespaceAlreadyExistsError:
-        pass
-
-    try:
-        catalog.drop_table(FULL_NAME)
-        print("Dropped stale Iceberg table.")
+        existing_tbl = catalog.load_table(FULL_NAME)
+        props_to_set: dict[str, str] = {}
+        if PROP_HASH_INDEX_PATH not in existing_tbl.properties:
+            props_to_set[PROP_HASH_INDEX_PATH] = hash_index_path
+        if h3_resolution is not None and PROP_GRID_RESOLUTION not in existing_tbl.properties:
+            props_to_set[PROP_GRID_RESOLUTION] = str(h3_resolution)
+        if props_to_set:
+            with existing_tbl.transaction() as tx:
+                tx.set_properties(**props_to_set)
     except NoSuchTableError:
+        # No existing table — seed properties via a temporary props dict that
+        # rebuild_iceberg_from_warehouse will inherit from preserved_props={}.
+        # We patch the catalog directly after the call below.
         pass
 
-    props: dict[str, str] = {PROP_GRID_TYPE: "h3", PROP_HASH_INDEX_PATH: hash_index_path}
-    if h3_resolution is not None:
-        props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+    if warehouse_store is None:
+        # Fallback: local filesystem glob — build a dummy store that lists local paths.
+        # rebuild_iceberg_from_warehouse handles the local-path case via
+        # _list_warehouse_keys when warehouse_root is a local path and
+        # warehouse_store is a LocalStore.
+        from obstore.store import LocalStore
 
-    table = catalog.create_table(
-        identifier=FULL_NAME,
-        schema=ICEBERG_SCHEMA,
-        partition_spec=PARTITION_SPEC,
-        properties=props,
+        Path(warehouse_root).mkdir(parents=True, exist_ok=True)
+        warehouse_store = LocalStore(str(warehouse_root))
+
+    n = rebuild_iceberg_from_warehouse(
+        catalog_path=catalog_path,
+        warehouse_root=warehouse_root,
+        warehouse_store=warehouse_store,
+        upload=upload,
     )
 
-    if warehouse_store is not None:
-        all_paths = _list_warehouse_keys(warehouse_store, warehouse_root)
-    else:
-        # Fallback: local filesystem glob (legacy path)
-        import re as _re
-
-        all_paths = [
-            str(f)
-            for f in Path(warehouse_root).glob("**/*.parquet")
-            if _re.search(
-                r"grid_partition=[^/]+/year=[^/]+/[^/]+\.parquet$",
-                str(f.relative_to(warehouse_root)),
-            )
-        ]
-
-    if all_paths:
-        batch_size = 2000
-        for i in range(0, len(all_paths), batch_size):
-            table.add_files(all_paths[i : i + batch_size])
-        print(f"Registered {len(all_paths):,} files in Iceberg catalog.")
-
-    if upload:
-        upload_catalog(catalog_path)
+    # If the table was freshly created (no prior properties), inject the
+    # explicitly-supplied h3_resolution / hash_index_path now.
+    catalog2 = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
+    try:
+        tbl2 = catalog2.load_table(FULL_NAME)
+        late_props: dict[str, str] = {}
+        if PROP_HASH_INDEX_PATH not in tbl2.properties:
+            late_props[PROP_HASH_INDEX_PATH] = hash_index_path
+        if h3_resolution is not None and PROP_GRID_RESOLUTION not in tbl2.properties:
+            late_props[PROP_GRID_RESOLUTION] = str(h3_resolution)
+        if PROP_GRID_TYPE not in tbl2.properties:
+            late_props[PROP_GRID_TYPE] = "h3"
+        if late_props:
+            with tbl2.transaction() as tx:
+                tx.set_properties(**late_props)
+            if upload:
+                upload_catalog(catalog_path)
+    except NoSuchTableError:
+        pass
 
     cleanup_staging(staging_store, staging_prefix)
 
@@ -1001,6 +1010,99 @@ def register_delta(
         upload_catalog(catalog_path)
 
     cleanup_staging(staging_store, staging_prefix)
+
+
+def rebuild_iceberg_from_warehouse(
+    catalog_path: str,
+    warehouse_root: str,
+    warehouse_store: object,
+    *,
+    upload: bool = True,
+) -> int:
+    """
+    Drop-recreate the Iceberg table and re-register every current warehouse file.
+
+    Reads existing table properties (grid type, resolution, hash-index path,
+    etc.) from the SQLite catalog *before* dropping the table so they are
+    preserved in the recreated table.  All ``.parquet`` files found by
+    :func:`_list_warehouse_keys` — including ``gc_*`` files written by a
+    previous garbage-collection run — are registered via ``table.add_files()``.
+
+    Called by :func:`register_and_cleanup` (full ingest Phase 4) and by
+    ``EarthCatalog.garbage_collect`` after rewriting warehouse files.
+
+    Parameters
+    ----------
+    catalog_path:
+        Local path to the SQLite catalog file.
+    warehouse_root:
+        ``s3://`` URI or local path for the warehouse root, used both by
+        PyIceberg for file-path storage and by :func:`_list_warehouse_keys`
+        to enumerate current files.
+    warehouse_store:
+        obstore-compatible store used to list the warehouse.  For S3 this
+        should be a bucket-level ``S3Store``; :func:`_list_warehouse_keys`
+        derives the correct key prefix from *warehouse_root*.
+    upload:
+        When ``True`` (default) call :func:`upload_catalog` after rebuilding
+        so the updated SQLite file is pushed back to S3.  Pass ``False`` when
+        the caller will handle the upload itself.
+
+    Returns
+    -------
+    int
+        Number of Parquet files registered in the rebuilt Iceberg table.
+    """
+    from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+
+    from earthcatalog.catalog import (
+        FULL_NAME,
+        ICEBERG_SCHEMA,
+        NAMESPACE,
+        PARTITION_SPEC,
+        _open_sqlite,
+        upload_catalog,
+    )
+
+    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
+
+    # Preserve all existing table properties so grid metadata and the hash-index
+    # path survive the drop-recreate cycle.
+    try:
+        existing = catalog.load_table(FULL_NAME)
+        preserved_props: dict[str, str] = dict(existing.properties)
+    except NoSuchTableError:
+        preserved_props = {}
+
+    try:
+        catalog.create_namespace(NAMESPACE)
+    except NamespaceAlreadyExistsError:
+        pass
+
+    try:
+        catalog.drop_table(FULL_NAME)
+        print("Iceberg rebuild: dropped stale table.")
+    except NoSuchTableError:
+        pass
+
+    table = catalog.create_table(
+        identifier=FULL_NAME,
+        schema=ICEBERG_SCHEMA,
+        partition_spec=PARTITION_SPEC,
+        properties=preserved_props,
+    )
+
+    all_paths = _list_warehouse_keys(warehouse_store, warehouse_root)
+    if all_paths:
+        batch_size = 2000
+        for i in range(0, len(all_paths), batch_size):
+            table.add_files(all_paths[i : i + batch_size])
+    print(f"Iceberg rebuild: registered {len(all_paths):,} files.")
+
+    if upload:
+        upload_catalog(catalog_path)
+
+    return len(all_paths)
 
 
 def cleanup_staging(staging_store: object, staging_prefix: str) -> int:
