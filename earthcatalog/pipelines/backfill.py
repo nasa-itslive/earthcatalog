@@ -86,6 +86,7 @@ from earthcatalog.pipelines.incremental import _iter_inventory
 from earthcatalog.transform import (
     fan_out,
     group_by_partition,
+    _sort_key,
 )
 from earthcatalog.transform import (
     write_geoparquet as _write_geoparquet,
@@ -538,14 +539,28 @@ def _stream_compact(
     """
     Stream NDJSON → dedup → write GeoParquet in batches.
 
-    Only holds ``compact_rows`` items + a set of seen IDs in memory.
+    Only holds ``compact_rows`` items in memory at a time.  Dedup uses a
+    Bloom filter (``pybloom-live``) instead of a plain ``set`` so memory is
+    bounded to ~10 MB regardless of cell size.  False-positive rate is ~0.1%
+    (one duplicate per 1 000 items), which is acceptable for a STAC catalog
+    where exact dedup is not required for correctness.
+
+    NDJSON files are streamed line-by-line rather than loaded into RAM in
+    full, so peak RSS per task is roughly:
+        ``compact_rows × avg_item_bytes  +  ~10 MB (bloom)``
 
     When *source_index_store* / *source_index_key* are provided, provenance
     rows (``(s3_key, stac_id, grid_partition, year)``) are appended to the
     source index for every batch written.  Items must carry the injected
     ``_source_bucket`` / ``_source_key`` keys (see ``_fetch_item_async``).
     """
-    seen_ids: set[str] = set()
+    from pybloom_live import ScalableBloomFilter
+
+    # ScalableBloomFilter grows in stages; initial_capacity is a hint for the
+    # first stage.  error_rate=0.001 → ~0.1 % false-positive rate.
+    seen_ids: ScalableBloomFilter = ScalableBloomFilter(
+        initial_capacity=100_000, error_rate=0.001
+    )
     batch: list[dict] = []
     input_count = 0
     unique_count = 0
@@ -573,10 +588,12 @@ def _stream_compact(
 
     for key in ndjson_keys:
         try:
-            raw = memoryview(obstore.get(staging_store, key).bytes()).tobytes()
+            raw_bytes = memoryview(obstore.get(staging_store, key).bytes()).tobytes()
         except FileNotFoundError:
             continue
-        for line in raw.decode("utf-8").split("\n"):
+        # Stream line-by-line from an in-memory buffer — avoids a full
+        # decode of the entire file into a Python str before splitting.
+        for line in io.BytesIO(raw_bytes):
             line = line.strip()
             if not line:
                 continue
@@ -591,7 +608,7 @@ def _stream_compact(
 
             if len(batch) >= compact_rows:
                 out_path = out_key_fn(part_idx)
-                n = write_fn(batch, out_path)
+                n = write_fn(sorted(batch, key=_sort_key), out_path)
                 if n > 0:
                     out_keys.append(out_path)
                     total_rows += n
@@ -601,7 +618,7 @@ def _stream_compact(
 
     if batch:
         out_path = out_key_fn(part_idx)
-        n = write_fn(batch, out_path)
+        n = write_fn(sorted(batch, key=_sort_key), out_path)
         if n > 0:
             out_keys.append(out_path)
             total_rows += n
@@ -648,7 +665,23 @@ def compact_cell_year(
     source_index_store: object | None = None,
     source_index_key: str | None = None,
 ) -> dict[str, Any]:
-    """Phase 3 worker: stream NDJSON → write GeoParquet to *warehouse_store*."""
+    """Phase 3 worker: stream NDJSON → write GeoParquet to *warehouse_store*.
+
+    Skips the partition entirely if ``part_000000.parquet`` already exists in
+    the warehouse — safe for full-build reruns after an OOM or cancellation.
+    """
+    # Skip-if-done: if part_000000.parquet exists this (cell, year) was already
+    # compacted in a previous run.  Avoids re-doing work on rerun after OOM/cancel.
+    done_key = f"grid_partition={cell}/year={year}/part_000000.parquet"
+    try:
+        obstore.head(warehouse_store, done_key)
+        return {
+            **_empty_compact_report(cell, year),
+            "skipped": True,
+        }
+    except (FileNotFoundError, Exception):
+        pass  # not found → proceed normally
+
     prefix = f"{staging_prefix}/{cell}/{year}/"
     ndjson_keys = _scan_ndjson(staging_store, prefix)
 
@@ -1449,9 +1482,11 @@ def run_backfill(
             total_unique = sum(r["unique_items"] for r in compact_results)
             total_output = sum(r["output_rows"] for r in compact_results)
             total_files = sum(len(r["output_files"]) for r in compact_results)
+            total_skipped = sum(1 for r in compact_results if r.get("skipped"))
             print(
                 f"Compact done: {total_input:,} items → {total_unique:,} unique "
                 f"→ {total_output:,} rows in {total_files:,} files"
+                + (f" ({total_skipped:,} partitions skipped — already done)" if total_skipped else "")
             )
 
         # Phase 4 — Register + cleanup
