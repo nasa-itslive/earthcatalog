@@ -215,7 +215,7 @@ class TestS3CsvPath:
             raw = gzip.compress(raw)
         fake_path = f"s3://fake-bucket/inventory{suffix}"
         with patch(
-            "earthcatalog.pipelines.incremental._fetch_inventory_bytes",
+            "earthcatalog.inventory._fetch_inventory_bytes",
             return_value=raw,
         ):
             assert list(_iter_inventory_csv(fake_path)) == ROWS
@@ -239,7 +239,7 @@ class TestS3CsvPath:
         spy = _Spy(raw)
         fake_path = "s3://fake-bucket/inventory.csv"
         with patch(
-            "earthcatalog.pipelines.incremental._fetch_inventory_bytes",
+            "earthcatalog.inventory._fetch_inventory_bytes",
             return_value=spy,
         ):
             list(_iter_inventory_csv(fake_path))

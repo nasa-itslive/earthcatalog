@@ -82,11 +82,11 @@ from earthcatalog.catalog import (
     upload_catalog,
 )
 from earthcatalog.grids.h3_partitioner import H3Partitioner
-from earthcatalog.pipelines.incremental import _iter_inventory
+from earthcatalog.inventory import _iter_inventory
 from earthcatalog.transform import (
+    _sort_key,
     fan_out,
     group_by_partition,
-    _sort_key,
 )
 from earthcatalog.transform import (
     write_geoparquet as _write_geoparquet,
@@ -878,7 +878,7 @@ def register_and_cleanup(
         Path(warehouse_root).mkdir(parents=True, exist_ok=True)
         warehouse_store = LocalStore(str(warehouse_root))
 
-    n = rebuild_iceberg_from_warehouse(
+    rebuild_iceberg_from_warehouse(
         catalog_path=catalog_path,
         warehouse_root=warehouse_root,
         warehouse_store=warehouse_store,

@@ -55,7 +55,7 @@ import pyarrow.parquet as pq
 from pybloom_live import ScalableBloomFilter
 
 from earthcatalog.hash_index import hash_id, read_hashes, write_hashes
-from earthcatalog.pipelines.incremental import _iter_inventory
+from earthcatalog.inventory import _iter_inventory
 from earthcatalog.source_index import mark_deleted, stream_active
 
 _GC_FILE_RE = re.compile(r"(.*/)(gc_[0-9a-f]+\.parquet)$")

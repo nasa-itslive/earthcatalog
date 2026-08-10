@@ -8,7 +8,6 @@ discovery into a single object.
 from __future__ import annotations
 
 import io
-import re
 import struct
 from collections import defaultdict
 from collections.abc import Callable
@@ -20,82 +19,26 @@ from typing import TYPE_CHECKING
 import obstore
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
-from pyiceberg.partitioning import PartitionField, PartitionSpec
-from pyiceberg.schema import Schema
-from pyiceberg.transforms import IdentityTransform, YearTransform
-from pyiceberg.types import (
-    BinaryType,
-    DoubleType,
-    LongType,
-    NestedField,
-    StringType,
-    TimestamptzType,
-)
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table
 
 from . import store_config
-
-# Regex for matching hive-style warehouse partition paths.
-_HIVE_RE = re.compile(
-    r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+from .schema import (
+    _HIVE_RE,
+    FULL_NAME,
+    ICEBERG_SCHEMA,
+    NAMESPACE,
+    PARTITION_SPEC,
+    PROP_GRID_BOUNDARIES_PATH,
+    PROP_GRID_ID_FIELD,
+    PROP_GRID_RESOLUTION,
+    PROP_GRID_TYPE,
+    PROP_HASH_INDEX_PATH,  # noqa: F401  (re-export: consumers import from catalog)
+    TABLE_NAME,  # noqa: F401  (re-export: consumers import from catalog)
 )
 
-# ---------------------------------------------------------------------------
-# Iceberg catalog constants
-# ---------------------------------------------------------------------------
-
-NAMESPACE = "earthcatalog"
-TABLE_NAME = "stac_items"
-FULL_NAME = f"{NAMESPACE}.{TABLE_NAME}"
-
-# Iceberg table property keys for grid metadata.
-# Written at table-creation time so downstream readers don't need a priori
-# knowledge of the grid system or resolution used during ingest.
-PROP_GRID_TYPE = "earthcatalog.grid.type"
-PROP_GRID_RESOLUTION = "earthcatalog.grid.resolution"
-PROP_GRID_BOUNDARIES_PATH = "earthcatalog.grid.boundaries_path"
-PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
-PROP_HASH_INDEX_PATH = "earthcatalog.hash_index_path"
-
-# PyIceberg schema — matches normalized rustac stac-geoparquet output.
-ICEBERG_SCHEMA = Schema(
-    NestedField(1, "id", StringType(), required=False),
-    NestedField(2, "grid_partition", StringType(), required=False),
-    NestedField(3, "geometry", BinaryType(), required=False),
-    NestedField(4, "datetime", TimestamptzType(), required=False),
-    NestedField(5, "platform", StringType(), required=False),
-    NestedField(6, "percent_valid_pixels", LongType(), required=False),
-    NestedField(7, "date_dt", LongType(), required=False),
-    NestedField(8, "proj:code", StringType(), required=False),
-    NestedField(9, "assets", StringType(), required=False),
-    NestedField(10, "links", StringType(), required=False),
-    NestedField(11, "stac_version", StringType(), required=False),
-    NestedField(12, "type", StringType(), required=False),
-    NestedField(13, "start_datetime", TimestamptzType(), required=False),
-    NestedField(14, "version", StringType(), required=False),
-    NestedField(15, "sat:orbit_state", StringType(), required=False),
-    NestedField(16, "scene_1_id", StringType(), required=False),
-    NestedField(17, "scene_2_id", StringType(), required=False),
-    NestedField(18, "scene_1_frame", StringType(), required=False),
-    NestedField(19, "scene_2_frame", StringType(), required=False),
-    NestedField(20, "mid_datetime", StringType(), required=False),
-    NestedField(21, "created", TimestamptzType(), required=False),
-    NestedField(22, "updated", TimestamptzType(), required=False),
-    NestedField(23, "end_datetime", TimestamptzType(), required=False),
-    NestedField(24, "stac_extensions", StringType(), required=False),
-    NestedField(25, "collection", StringType(), required=False),
-    NestedField(26, "latitude", DoubleType(), required=False),
-    NestedField(27, "longitude", DoubleType(), required=False),
-    NestedField(28, "bbox", StringType(), required=False),
-)
-
-# Partition spec: grid cell (identity) + year of acquisition.
-PARTITION_SPEC = PartitionSpec(
-    PartitionField(source_id=2, field_id=100, transform=IdentityTransform(), name="grid_partition"),
-    PartitionField(source_id=4, field_id=101, transform=YearTransform(), name="year"),
-)
+HIVE_RE = _HIVE_RE
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +907,7 @@ class EarthCatalog:
         from concurrent.futures import ThreadPoolExecutor
 
         from earthcatalog.grids import build_partitioner
-        from earthcatalog.pipelines.incremental import _fetch_item, _iter_inventory
+        from earthcatalog.inventory import _fetch_item, _iter_inventory
 
         from .hash_index import (
             merge_hashes_from_parquets,
