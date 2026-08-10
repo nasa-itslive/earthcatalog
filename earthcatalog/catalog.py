@@ -1067,6 +1067,62 @@ class EarthCatalog:
         print(f"Done. {total_items} items -> {total_rows} rows in {len(written_keys)} files")
         return result
 
+    def ingest_resumable(
+        self,
+        inventory_path: str,
+        *,
+        stage: str = "direct",
+        index_key: str | None = None,
+        since: datetime | None = None,
+    ) -> dict:
+        """Ingest via the resumable pipeline (index-as-checkpoint).
+
+        Unlike :meth:`ingest`, this path skips source keys already recorded
+        in the unified index, so a failed run can be re-invoked safely and
+        only unfinished work is reprocessed.  *stage* selects the write path:
+        ``"direct"`` (GeoParquet straight away) or ``"ndjson"`` (fan out to
+        NDJSON first, for PGSTAC interchange).
+        """
+        from earthcatalog.config import GridConfig
+        from earthcatalog.grids import build_partitioner
+        from earthcatalog.index import Index
+        from earthcatalog.ingest import Ingester
+        from earthcatalog.inventory import iter_inventory
+
+        warehouse_root = self._catalog.properties.get("warehouse", "")
+        uri = self._catalog.properties.get("uri", "")
+        local_db = uri.removeprefix("sqlite:///") if uri else "/tmp/earthcatalog.db"
+
+        if index_key is None:
+            index_key = f"{warehouse_root.rstrip('/')}_index.parquet"
+            if index_key.startswith("s3://"):
+                index_key = index_key.removeprefix("s3://").split("/", 1)[1]
+
+        if self._store and self._catalog_key:
+            self.download_catalog(local_db)
+
+        partitioner = build_partitioner(
+            GridConfig(
+                type=self._info.grid_type,
+                resolution=self._info.grid_resolution,
+                boundaries_path=self._info.boundaries_path,
+                id_field=self._info.id_field,
+            )
+        )
+
+        ing = Ingester(
+            store=self._store,
+            index=Index(self._store, index_key),
+            table=self._table,
+            partitioner=partitioner,
+            stage=stage,
+        )
+        summary = ing.run(iter_inventory(inventory_path, since=since))
+
+        if self._store and self._catalog_key:
+            self.upload_catalog(local_db)
+        return summary
+
     def bulk_ingest(
         self,
         inventory_path: str,
