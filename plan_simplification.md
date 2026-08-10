@@ -1,7 +1,32 @@
 # Architecture Simplification Plan
 
-Status: **Draft — awaiting review**
-Branch: `feature/garbage-collection` (checkpointed at `bac1a13`)
+Status: **In progress — Phases 0–4 done, Phase 6 partially done**
+Branch: `feature/garbage-collection`
+
+## Implementation status
+
+| Phase | Status |
+|---|---|
+| 0 — Guard tests (`tests/test_architecture.py`) | ✅ done |
+| 1 — Extract `schema.py` + `inventory.py` | ✅ done |
+| 2 — Unified `index.py` (merges hash + source index) | ✅ done |
+| 3 — Resumable `ingest.py` (`Ingester`, direct + ndjson) | ✅ done |
+| 4 — Rewire `EarthCatalog.ingest_resumable()` → `Ingester` | ✅ done |
+| 6a — `earthcatalog info` CLI subcommand | ✅ done |
+| 6b — Search SQL dedup (`build_query`) | ⏸ deferred |
+| 7 — Cleanup dead code + `migrate_indices()` | ⏸ deferred |
+
+Also done while implementing: added `pyrightconfig.json` (fixes "could not be
+resolved" type errors), installed dev extra `coiled`, fixed pre-existing ruff
+errors in `tests/test_gc_bugs.py`, simplified `Ingester` kwargs.
+
+**Deferred (explicitly, to avoid breaking things):**
+- `run_backfill` kwargs (23 params) — internal, ~10 call sites incl. tests;
+  simplifying risks the distributed path. Left intact.
+- CLI `incremental` options — deferred; `info` subcommand shipped as the
+  pattern to follow.
+- `migrate_indices()` — old `*_id_hashes.parquet` / `*_source_index.parquet`
+  files still produced by legacy paths; migration not yet run.
 
 Goal: simplify an over-architected library into something rock-solid and
 resumable, where ingest never loses progress, GC/consolidation/search keep
