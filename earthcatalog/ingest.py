@@ -49,7 +49,6 @@ class Ingester:
         stage: str = "direct",
         warehouse_prefix: str = "",
         batch_size: int = 10_000,
-        ndjson_prefix: str = "staging/ndjson",
     ) -> None:
         self._store = store
         self._index = index
@@ -59,7 +58,7 @@ class Ingester:
         self._stage = stage
         self._warehouse_prefix = warehouse_prefix.rstrip("/")
         self._batch_size = batch_size
-        self._ndjson_prefix = ndjson_prefix.rstrip("/")
+        self._ndjson_prefix = f"{self._warehouse_prefix}/staging/ndjson" if self._warehouse_prefix else "staging/ndjson"
 
     # -- public ---------------------------------------------------------------
 

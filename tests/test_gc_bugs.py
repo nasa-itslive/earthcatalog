@@ -24,23 +24,19 @@ from __future__ import annotations
 
 import csv
 import io
-import tempfile
 from pathlib import Path
 
 import obstore
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 from obstore.store import MemoryStore
 
-from earthcatalog.hash_index import hash_id, read_hashes, write_hashes
+from earthcatalog.hash_index import hash_id, write_hashes
 from earthcatalog.pipelines.delete import (
     _list_partition_files,
-    execute_cleanup,
     run_garbage_collection,
 )
 from earthcatalog.source_index import append_source_index
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -391,9 +387,7 @@ class TestIcebergRebuildAfterGC:
         After garbage_collect rewrites a partition file the Iceberg table
         must reference the new gc_*.parquet, not the deleted part_*.parquet.
         """
-        from obstore.store import LocalStore
 
-        from earthcatalog import open as ec_open
         from earthcatalog.catalog import _open_sqlite, get_or_create
         from earthcatalog.config import GridConfig
         from earthcatalog.grids.h3_partitioner import H3Partitioner
@@ -433,9 +427,9 @@ class TestIcebergRebuildAfterGC:
 
         # Simulate GC: rewrite part_000000 → gc_*.parquet (drop "deleted"),
         # then delete the original.  This mimics what execute_cleanup does.
-        from earthcatalog.pipelines.delete import rewrite_file_without_orphans
-
         from obstore.store import LocalStore as _LS
+
+        from earthcatalog.pipelines.delete import rewrite_file_without_orphans
 
         wh_store = _LS(wh_path)
         # Map full path to key relative to wh_store.
@@ -470,8 +464,6 @@ class TestIcebergRebuildAfterGC:
         """dry_run=True must skip the Iceberg rebuild entirely."""
         import csv
 
-        from obstore.store import LocalStore
-
         from earthcatalog import open as ec_open
         from earthcatalog.catalog import _open_sqlite, get_or_create
         from earthcatalog.config import GridConfig
@@ -496,8 +488,6 @@ class TestIcebergRebuildAfterGC:
             tbl.add_files([out_path])
 
         # Set up source + hash index with a "deleted" item.
-        si_path = str(tmp_path / "warehouse_source_index.parquet")
-        hi_path = str(tmp_path / "warehouse_id_hashes.parquet")
         from obstore.store import LocalStore as _LS
 
         si_store = _LS(str(tmp_path))
