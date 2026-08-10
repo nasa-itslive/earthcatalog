@@ -108,6 +108,90 @@ def incremental(
 
 
 # ---------------------------------------------------------------------------
+# `info` sub-command — catalog summary (grid, stats, hash index)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def info(
+    catalog: str | None = typer.Option(None, "--catalog", help="Local SQLite catalog path."),
+    catalog_s3: str | None = typer.Option(
+        None,
+        "--catalog-s3",
+        help="s3:// URI to auto-download the catalog from.",
+    ),
+    warehouse: str = typer.Option(
+        "s3://its-live-data/test-space/stac/catalog/warehouse",
+        "--warehouse",
+        help="Warehouse root path (s3:// URI).",
+    ),
+) -> None:
+    """Print a catalog summary: grid metadata, file/row counts, year distribution."""
+    import os
+    from pathlib import Path
+
+    if not catalog and not catalog_s3:
+        typer.echo("ERROR: specify --catalog or --catalog-s3")
+        raise typer.Exit(1)
+
+    catalog_path = catalog
+    if catalog_s3:
+        import obstore
+        from obstore.store import S3Store
+
+        no_scheme = catalog_s3.removeprefix("s3://")
+        bucket, key = no_scheme.split("/", 1)
+        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+        store = S3Store(bucket=bucket, region=region, skip_signature=True)
+        catalog_path = f"/tmp/earthcatalog_info_{key.rsplit('/', 1)[-1]}.db"
+        data = bytes(obstore.get(store, key).bytes())
+        Path(catalog_path).write_bytes(data)
+        typer.echo(f"Downloaded catalog from s3://{bucket}/{key}")
+
+    os.environ.pop("AWS_ACCESS_KEY_ID", None)
+    os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+    os.environ.pop("AWS_SESSION_TOKEN", None)
+
+    from earthcatalog.catalog import FULL_NAME, PROP_HASH_INDEX_PATH, _catalog_info, _open_sqlite
+
+    cat = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse)
+    try:
+        table = cat.load_table(FULL_NAME)
+    except Exception:
+        typer.echo("ERROR: could not load table from catalog")
+        raise typer.Exit(1)
+
+    info = _catalog_info(table)
+    typer.echo(f"\n{'=' * 60}")
+    typer.echo("  Catalog Info")
+    typer.echo(f"{'=' * 60}")
+    typer.echo(f"  Grid type     : {info.grid_type}")
+    typer.echo(f"  Resolution    : {info.grid_resolution}")
+    typer.echo(f"  Warehouse     : {warehouse}")
+
+    hash_index_path = table.properties.get(PROP_HASH_INDEX_PATH)
+    if hash_index_path:
+        typer.echo(f"  Hash index    : {hash_index_path}")
+
+    stats = info.stats(table)
+    total_rows = sum(s["row_count"] for s in stats)
+    total_files = sum(s["file_count"] for s in stats)
+    total_bytes = sum(s["total_bytes"] for s in stats)
+    cells = {s["grid_partition"] for s in stats}
+    years = sorted({s["year"] for s in stats})
+
+    typer.echo(f"\n{'=' * 60}")
+    typer.echo("  Summary")
+    typer.echo(f"{'=' * 60}")
+    typer.echo(f"  Total rows    : {total_rows:,}")
+    typer.echo(f"  Total files   : {total_files:,}")
+    typer.echo(f"  Total size    : {total_bytes / 1e9:.2f} GB")
+    typer.echo(f"  Unique cells  : {len(cells):,}")
+    if years:
+        typer.echo(f"  Years         : {years[0]}-{years[-1]} ({len(years)} years)")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
