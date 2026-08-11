@@ -178,14 +178,14 @@ class Ingester:
         """Memory-bounded compact: stream NDJSON → dedup → write GeoParquet.
 
         Only ``compact_rows`` items are held in memory at a time.  Dedup uses
-        a ScalableBloomFilter (~10 MB, bounded regardless of bucket size) so a
-        large (cell, year) bucket never exhausts RAM.  Each batch is sorted by
+        an exact ``set`` of item IDs — for the largest cells (~500k items per
+        cell/year) this is ~25–50 MB, and unlike a Bloom filter it never
+        drops a legitimate item (a Bloom filter's ~0.1% false-positive rate
+        would lose ~500 real items per hot cell).  Each batch is sorted by
         ``(platform, datetime)`` and written to its own ``part_NNNNNN.parquet``.
 
         Returns ``(new_paths, index_rows, rows)`` — the caller commits once.
         """
-        from pybloom_live import ScalableBloomFilter
-
         bucket_dir = f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/"
         jsonl_keys: list[str] = []
         try:
@@ -199,9 +199,7 @@ class Ingester:
         if not jsonl_keys:
             return [], [], 0
 
-        seen: ScalableBloomFilter = ScalableBloomFilter(
-            initial_capacity=100_000, error_rate=0.001
-        )
+        seen: set[str] = set()
         batch: list[dict] = []
         index_rows: list[dict] = []
         new_paths: list[str] = []

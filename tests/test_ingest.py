@@ -390,3 +390,62 @@ class TestMemoryBoundedCompact:
         ]
         assert len(part_files) == 1
         assert _read_ids(store, part_files[0]) == ["item-p1.stac.json", "item-p2.stac.json", "item-p3.stac.json"]
+
+    def test_exact_dedup_keeps_every_unique_item(self):
+        """Duplicate NDJSON lines are deduped exactly — no legitimate item is
+        dropped (unlike a Bloom filter, which would lose ~0.1% of items in a
+        large cell/year bucket)."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json"]
+
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            compact_rows=2,
+        )
+        # Run once to build the NDJSON, then append duplicate lines manually to
+        # simulate a crash-resume that re-wrote the same items.
+        ing.run(_inventory(keys))
+        ndjson = [k for k in _list_files(store, "warehouse/") if k.endswith(".jsonl")]
+        assert ndjson
+        key = ndjson[0]
+        dup = bytes(store.get(key).bytes())
+        store.put(key, dup + dup)  # double every line
+
+        # Re-run with a fresh ingester: index is empty of hashes only if the
+        # first run indexed nothing — it did, so instead compact the bucket
+        # directly via a second ingester that skips the index check.
+        ing2 = Ingester(
+            store=store,
+            index=Index(store, "warehouse/other.parquet"),  # fresh, empty index
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            compact_rows=2,
+        )
+        # Feed nothing new; Stage A writes nothing, but we compact the stale
+        # bucket manually to prove dedup drops duplicates exactly.
+        cell, year = "cellA", "2020"
+        np, _, rows = ing2._compact_ndjson_bucket(cell, year)
+
+        # 2 unique items -> exactly 2 rows, never 4, and both ids survive.
+        assert rows == 2, rows
+        all_ids = []
+        for f in np:
+            all_ids.extend(_read_ids(store, f))
+        assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json"]
