@@ -53,6 +53,24 @@ def _make_hash_index_parquet(item_ids: list[str]) -> bytes:
     return buf.getvalue()
 
 
+def _make_unified_index(store, key: str, item_ids: list[str]) -> None:
+    """Write a unified Index (via the Index API) for a set of item ids."""
+    from earthcatalog.index import Index
+
+    idx = Index(store, key)
+    idx.append(
+        [
+            {
+                "s3_key": f"s3://its-live-data/dir/{i}.stac.json",
+                "stac_id": i,
+                "grid_partition": "cellA",
+                "year": 2020,
+            }
+            for i in item_ids
+        ]
+    )
+
+
 def _make_delta_parquet(pairs: list[tuple[str, str]], item_ids: list[str]) -> bytes:
     hashes = [_hash_id(i) for i in item_ids]
     tbl = pa.table(
@@ -229,8 +247,7 @@ class TestRunDailyDelta:
         manifest = _make_manifest(["data/inv.parquet"])
         obstore.put(store, "manifest.json", manifest)
 
-        wh_data = _make_hash_index_parquet(["item-1", "item-2"])
-        obstore.put(store, "warehouse_id_hashes.parquet", wh_data)
+        _make_unified_index(store, "warehouse_index.parquet", ["item-1", "item-2"])
 
         delta_store = MemoryStore()
         obstore.put(delta_store, "pending/.keep", b"")
@@ -245,7 +262,7 @@ class TestRunDailyDelta:
         ):
             result = run_daily_delta(
                 manifest_uri="s3://log-bucket/manifest.json",
-                warehouse_hash_uri="s3://log-bucket/warehouse_id_hashes.parquet",
+                warehouse_hash_uri="s3://log-bucket/warehouse_index.parquet",
                 delta_prefix="s3://delta-bucket/delta",
                 date_str="2026-04-28",
             )
@@ -275,11 +292,11 @@ class TestRunDailyDelta:
         inv_path = pending / "inventory_2026-04-28.parquet"
         _write_inventory_cache_local(inv_rows, str(inv_path))
 
-        wh_path = tmp_path / "warehouse_id_hashes.parquet"
-        tbl = pa.table(
-            {"id_hash": pa.array([_hash_id("item-1"), _hash_id("item-2")], type=pa.binary(16))}
-        )
-        pq.write_table(tbl, str(wh_path))
+        # Unified Index with item-1 and item-2 already ingested.
+        wh_store = MemoryStore()
+        _make_unified_index(wh_store, "warehouse_index.parquet", ["item-1", "item-2"])
+        wh_path = tmp_path / "warehouse_index.parquet"
+        wh_path.write_bytes(wh_store.get("warehouse_index.parquet").bytes())
 
         result = run_daily_delta(
             manifest_uri="s3://log-bucket/manifest.json",
@@ -305,8 +322,7 @@ class TestRunDailyDelta:
         obstore.put(store, "data/inv.parquet", _make_inventory_parquet(inv_pairs))
         obstore.put(store, "manifest.json", _make_manifest(["data/inv.parquet"]))
 
-        wh_data = _make_hash_index_parquet(["item-1"])
-        obstore.put(store, "warehouse_id_hashes.parquet", wh_data)
+        _make_unified_index(store, "warehouse_index.parquet", ["item-1"])
 
         delta_store = MemoryStore()
 
@@ -320,7 +336,7 @@ class TestRunDailyDelta:
         ):
             result = run_daily_delta(
                 manifest_uri="s3://log-bucket/manifest.json",
-                warehouse_hash_uri="s3://log-bucket/warehouse_id_hashes.parquet",
+                warehouse_hash_uri="s3://log-bucket/warehouse_index.parquet",
                 delta_prefix="s3://delta-bucket/delta",
                 date_str="2026-04-28",
             )
@@ -475,14 +491,13 @@ class TestRunDailyDeltaSkip:
         obstore.put(store, "data/inv.parquet", _make_inventory_parquet(inv_pairs))
         obstore.put(store, "manifest.json", _make_manifest(["data/inv.parquet"]))
 
-        wh_data = _make_hash_index_parquet(["item-1"])
-        obstore.put(store, "warehouse_id_hashes.parquet", wh_data)
-
         delta_dir = tmp_path / "delta"
 
-        wh_path = tmp_path / "warehouse_id_hashes.parquet"
-        tbl = pa.table({"id_hash": pa.array([_hash_id("item-1")], type=pa.binary(16))})
-        pq.write_table(tbl, str(wh_path))
+        # Unified Index with item-1 already ingested -> no new items.
+        wh_store = MemoryStore()
+        _make_unified_index(wh_store, "warehouse_index.parquet", ["item-1"])
+        wh_path = tmp_path / "warehouse_index.parquet"
+        wh_path.write_bytes(wh_store.get("warehouse_index.parquet").bytes())
 
         from unittest.mock import patch
 

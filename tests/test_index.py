@@ -137,3 +137,15 @@ class TestHashSet:
             xxhash.xxh3_128("a", seed=42).digest(),
             xxhash.xxh3_128("b", seed=42).digest(),
         }
+
+    def test_hash_set_excludes_deleted(self):
+        """hash_set() must reflect only *active* (non-deleted) rows so a
+        re-added item can be re-ingested after GC removes it."""
+        import xxhash
+
+        store = MemoryStore()
+        idx = Index(store, "index.parquet")
+        idx.append([_row("s3://b/a.stac.json", "a"), _row("s3://b/b.stac.json", "b")])
+        idx.mark_deleted({"a"})
+        hs = idx.hash_set()
+        assert hs == {xxhash.xxh3_128("b", seed=42).digest()}

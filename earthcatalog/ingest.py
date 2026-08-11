@@ -54,6 +54,7 @@ class Ingester:
         partitioner=None,
         stage: str = "direct",
         warehouse_prefix: str = "",
+        warehouse_root: str | None = None,
         batch_size: int = 10_000,
         compact_rows: int = 100_000,
     ) -> None:
@@ -64,9 +65,21 @@ class Ingester:
         self._partitioner = partitioner
         self._stage = stage
         self._warehouse_prefix = warehouse_prefix.rstrip("/")
+        self._warehouse_root = warehouse_root
         self._batch_size = batch_size
         self._compact_rows = compact_rows
         self._ndjson_prefix = f"{self._warehouse_prefix}/staging/ndjson" if self._warehouse_prefix else "staging/ndjson"
+
+    def _full_path(self, rel_key: str) -> str:
+        """Map a store-relative key to the full URI Iceberg ``add_files`` needs."""
+        if not self._warehouse_root:
+            return rel_key
+        # rel_key already includes warehouse_prefix; strip it so we join the
+        # root exactly once.
+        rel = rel_key
+        if self._warehouse_prefix and rel.startswith(self._warehouse_prefix + "/"):
+            rel = rel[len(self._warehouse_prefix) + 1 :]
+        return f"{self._warehouse_root.rstrip('/')}/{rel}"
 
     # -- public ---------------------------------------------------------------
 
@@ -108,7 +121,7 @@ class Ingester:
     def _flush_direct(self, items: list[dict]) -> int:
         new_paths, index_rows, rows = self._write_direct(items)
         if new_paths:
-            self._table.add_files([f"{key}" for key in new_paths])
+            self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
         return rows
@@ -170,7 +183,7 @@ class Ingester:
             total += n
 
         if new_paths:
-            self._table.add_files([f"{k}" for k in new_paths])
+            self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
         return total
@@ -277,7 +290,7 @@ class DaskIngester(Ingester):
             total += rows
 
         if new_paths:
-            self._table.add_files([f"{k}" for k in new_paths])
+            self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
 
@@ -314,7 +327,7 @@ class DaskIngester(Ingester):
             total += n
 
         if new_paths:
-            self._table.add_files([f"{k}" for k in new_paths])
+            self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
 

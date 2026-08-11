@@ -1178,6 +1178,11 @@ class EarthCatalog:
             self._table = get_or_create(self._catalog, grid_config=grid_cfg)
 
         warehouse_prefix = warehouse_root.rstrip("/") + "/"
+        if warehouse_prefix.startswith("s3://"):
+            # Store-relative key prefix (obstore keys are relative to the
+            # bucket); the full s3:// URI is passed as warehouse_root so
+            # Iceberg add_files resolves real paths.
+            warehouse_prefix = warehouse_prefix.removeprefix("s3://").split("/", 1)[1]
         index_key = f"{warehouse_root.rstrip('/')}_index.parquet"
         if index_key.startswith("s3://"):
             index_key = index_key.removeprefix("s3://").split("/", 1)[1]
@@ -1189,6 +1194,7 @@ class EarthCatalog:
             table=self._table,
             partitioner=partitioner,
             warehouse_prefix=warehouse_prefix,
+            warehouse_root=warehouse_root,
             batch_size=cfg.chunk_size,
             compact_rows=cfg.compact_rows,
         )

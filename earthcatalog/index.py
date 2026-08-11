@@ -189,12 +189,17 @@ class Index:
         return active.num_rows
 
     def hash_set(self) -> set[bytes]:
-        """All ``id_hash`` values — for in-memory dedup against new items."""
+        """``id_hash`` values for active (non-deleted) rows — for dedup.
+
+        Deleted rows are excluded so that a re-added item can be re-ingested
+        after GC marks it deleted.
+        """
         tbl = self._read()
         if tbl is None:
             return set()
+        active = tbl.filter(pc.invert(tbl.column("deleted")))
         hashes: set[bytes] = set()
-        for batch in tbl.column("id_hash").chunks:
+        for batch in active.column("id_hash").chunks:
             for h in batch.to_pylist():
                 if h is not None:
                     hashes.add(bytes(h))

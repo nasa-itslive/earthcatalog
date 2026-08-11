@@ -229,6 +229,24 @@ def _build_hash_set(hashes: list[bytes]) -> set[bytes]:
     return set(hashes)
 
 
+def _load_index_hashes(uri: str) -> set[bytes]:
+    """Load the active (non-deleted) ``id_hash`` set from the unified Index.
+
+    Handles both ``s3://`` and local paths.  Uses ``Index.hash_set()`` which
+    excludes rows GC has marked deleted, so a re-added item is correctly
+    treated as new.
+    """
+    from obstore.store import LocalStore
+
+    from earthcatalog.index import Index
+
+    if uri.startswith("s3://"):
+        bucket, key = _parse_s3_uri(uri)
+        return Index(_get_store(bucket), key).hash_set()
+    path = Path(uri)
+    return Index(LocalStore(str(path.parent)), path.name).hash_set()
+
+
 def _write_inventory_cache(rows: list[tuple[str, str, bytes]], store: S3Store, key: str) -> None:
     buckets = pa.array([r[0] for r in rows], type=pa.string())
     keys = pa.array([r[1] for r in rows], type=pa.string())
@@ -285,7 +303,6 @@ def run_daily_delta(
         date_str = datetime.now(UTC).strftime("%Y-%m-%d")
 
     local_delta = _is_local(delta_prefix)
-    local_wh = _is_local(warehouse_hash_uri)
     delta_output = f"{delta_prefix}/pending/delta_{date_str}.parquet"
     inventory_cache = f"{delta_prefix}/pending/inventory_{date_str}.parquet"
 
@@ -341,16 +358,9 @@ def run_daily_delta(
             _write_inventory_cache(inv_rows, delta_store, inv_key)
             print(f"Wrote inventory cache: {delta_prefix.rstrip('/')}/{inv_key}")
 
-    # Anti-join against warehouse hash index
-    if local_wh:
-        print(f"Reading local warehouse hash index: {warehouse_hash_uri}")
-        wh_hashes = _download_hash_index_local(warehouse_hash_uri)
-    else:
-        wh_bucket, wh_key = _parse_s3_uri(warehouse_hash_uri)
-        print(f"Downloading warehouse hash index: {warehouse_hash_uri}")
-        wh_hashes = _download_hash_index(_get_store(wh_bucket), wh_key)
-    wh_set = _build_hash_set(wh_hashes)
-    print(f"Warehouse hash index: {len(wh_set):,} unique hashes")
+    # Anti-join against warehouse (unified Index — excludes deleted rows)
+    wh_set = _load_index_hashes(warehouse_hash_uri)
+    print(f"Warehouse index: {len(wh_set):,} active hashes")
 
     print("Computing anti-join ...")
     new_pairs: list[tuple[str, str, bytes]] = []

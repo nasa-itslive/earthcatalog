@@ -41,9 +41,8 @@ permissions:
 
 env:
   AWS_REGION: us-west-2
-  WAREHOUSE_HASH: s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
-  DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
   WAREHOUSE: s3://its-live-data/test-space/stac/catalog/warehouse
+  DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
   STAGING: s3://its-live-data/test-space/stac/catalog/ingest
 
 jobs:
@@ -125,11 +124,8 @@ jobs:
             --warehouse ${{ env.WAREHOUSE }} \
             --staging "${{ steps.delta.outputs.staging_path }}" \
             --delta \
-            --update-hash-index \
-            --update-source-index \
             --scheduler "$SCHEDULER" \
             --chunk-size "${{ github.event.inputs.chunk_size || '10000' }}" \
-            --hash-index ${{ env.WAREHOUSE_HASH }} \
             $EXTRA_ARGS
 
       - name: Move delta to ingested
@@ -152,5 +148,4 @@ jobs:
           echo "Date: ${{ steps.delta.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Delta: \`${{ steps.delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Staging: \`${{ steps.delta.outputs.staging_path }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Hash index: updated via --update-hash-index" >> "$GITHUB_STEP_SUMMARY"
-          echo "Source index: updated via --update-source-index" >> "$GITHUB_STEP_SUMMARY"
+          echo "Unified index: updated" >> "$GITHUB_STEP_SUMMARY"
