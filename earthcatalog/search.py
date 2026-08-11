@@ -534,3 +534,30 @@ def _cql2_format_literal(val) -> str:
         escaped = val.replace("'", "''")
         return f"'{escaped}'"
     raise TypeError(f"Unsupported CQL2 literal type: {type(val).__name__}")
+
+
+def build_query(
+    paths: list[str],
+    geom=None,
+    start_dt=None,
+    end_dt=None,
+    raw_filter=None,
+    select: str = "*",
+) -> str:
+    """Build a DuckDB read_parquet SQL query for *paths* with the given filters.
+
+    Shared by ``duck_search`` and ``search_uris`` so the WHERE-building logic
+    lives in exactly one place.
+    """
+    path_list = ", ".join(repr(p) for p in paths)
+    conditions: list[str] = []
+    if geom is not None:
+        conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
+    if start_dt is not None:
+        conditions.append(f"datetime >= '{start_dt}'")
+    if end_dt is not None:
+        conditions.append(f"datetime <= '{end_dt}'")
+    if raw_filter is not None:
+        conditions.append(_cql2_to_sql(raw_filter))
+    where = " AND ".join(conditions) if conditions else "TRUE"
+    return f"SELECT {select} FROM read_parquet([{path_list}]) WHERE {where}"

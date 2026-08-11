@@ -15,14 +15,14 @@ import pathlib
 
 LIB_ROOT = pathlib.Path(__file__).resolve().parent.parent / "earthcatalog"
 
-# catalog.py: 1484 on branch start.  Target: <600 after Phase 4.
-CATALOG_PY_MAX_LINES = 1484
+# catalog.py: 1455 after Phase 4/6 (was 1484 on branch start).  Target: <600.
+CATALOG_PY_MAX_LINES = 1455
 
 # Per-module budget.  Tighten as modules are split.
 MODULE_LINE_BUDGETS: dict[str, int] = {
-    # Phase 4 target (slimmed)
+    # Phase 4/6 target (slimmed, SQL deduped)
     "catalog.py": CATALOG_PY_MAX_LINES,
-    "search.py": 540,
+    "search.py": 565,
     # Phase 3 target
     "ingest.py": 500,
     # Everything else

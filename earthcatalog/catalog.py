@@ -674,7 +674,7 @@ class EarthCatalog:
         import duckdb
         from shapely.geometry import shape
 
-        from .search import _extract_datetime_range
+        from .search import _extract_datetime_range, build_query
 
         # --- geometry ---
         geom = None
@@ -700,23 +700,8 @@ class EarthCatalog:
             return pd.DataFrame({"id": [], "uri": []})
 
         # --- build SQL (read only id + assets) ---
-        path_list = ", ".join(repr(p) for p in paths)
-        conditions: list[str] = []
-        if geom is not None:
-            conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
-        if start_dt is not None:
-            conditions.append(f"datetime >= '{start_dt}'")
-        if end_dt is not None:
-            conditions.append(f"datetime <= '{end_dt}'")
-        raw_filter = kwargs.get("filter")
-        if raw_filter is not None:
-            from .search import _cql2_to_sql
-
-            conditions.append(_cql2_to_sql(raw_filter))
-        where = " AND ".join(conditions) if conditions else "TRUE"
         max_items = kwargs.get("max_items")
-
-        sql = f"""SELECT id, assets FROM read_parquet([{path_list}]) WHERE {where}"""
+        sql = build_query(paths, geom, start_dt, end_dt, kwargs.get("filter"), select="id, assets")
 
         # --- execute (Arrow → list is faster than pandas iterrows) ---
         con = duckdb.connect()
@@ -770,7 +755,7 @@ class EarthCatalog:
         import duckdb
         from shapely.geometry import shape
 
-        from .search import _cql2_to_sql, _extract_datetime_range
+        from .search import _extract_datetime_range, build_query
 
         geom = None
         if "intersects" in kwargs:
@@ -790,22 +775,9 @@ class EarthCatalog:
 
             return pd.DataFrame()
 
-        path_list = ", ".join(repr(p) for p in paths)
-        conditions: list[str] = []
-        if geom is not None:
-            conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
-        if start_dt is not None:
-            conditions.append(f"datetime >= '{start_dt}'")
-        if end_dt is not None:
-            conditions.append(f"datetime <= '{end_dt}'")
-        raw_filter = kwargs.get("filter")
-        if raw_filter is not None:
-            conditions.append(_cql2_to_sql(raw_filter))
-
-        where = " AND ".join(conditions) if conditions else "TRUE"
         max_items = kwargs.get("max_items")
         # LIMIT omitted — triggers 7× slower plan for multi-file reads
-        sql = f"SELECT * FROM read_parquet([{path_list}]) WHERE {where}"
+        sql = build_query(paths, geom, start_dt, end_dt, kwargs.get("filter"))
 
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
