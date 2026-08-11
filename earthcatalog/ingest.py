@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import defaultdict
+from collections.abc import Iterator
 
 import obstore
 
@@ -226,11 +227,8 @@ class Ingester:
             batch.clear()
 
         for key in sorted(jsonl_keys):
-            raw = bytes(obstore.get(self._store, key).bytes())
-            for line in raw.decode("utf-8").splitlines():
-                if not line.strip():
-                    continue
-                item = json.loads(line)
+            result = obstore.get(self._store, key)
+            for item in iter_ndjson_lines(result.stream()):
                 item_id = item.get("id")
                 if not item_id or item_id in seen:
                     continue
@@ -365,3 +363,21 @@ def _to_index_row(item: dict) -> dict:
         "grid_partition": props.get("grid_partition", "__none__"),
         "year": _year_from_item(item) or 0,
     }
+
+
+def iter_ndjson_lines(stream) -> Iterator[dict]:
+    """Yield parsed dicts from a byte-stream of newline-delimited JSON.
+
+    Streams chunk-by-chunk, keeping only the partial trailing line across
+    chunk boundaries — never materializing the whole file.  Handles lines
+    split at arbitrary chunk boundaries.
+    """
+    pending = b""
+    for chunk in stream:
+        pending += bytes(chunk)
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if line.strip():
+                yield json.loads(line)
+    if pending.strip():
+        yield json.loads(pending)

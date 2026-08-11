@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from unittest.mock import patch
 
 import pyarrow.parquet as pq
 from obstore.store import MemoryStore
@@ -449,3 +450,83 @@ class TestMemoryBoundedCompact:
         for f in np:
             all_ids.extend(_read_ids(store, f))
         assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json"]
+
+    def test_compaction_streams_ndjson(self):
+        """Compaction reads NDJSON via stream(), never loading the whole file
+        into RAM (raw.decode().splitlines() would spike to ~file size)."""
+        import obstore as _obstore_mod
+
+        from earthcatalog.ingest import Ingester as _Ing
+        from earthcatalog.ingest import iter_ndjson_lines
+
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        ing = _Ing(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            compact_rows=10,
+        )
+        ing.run(_inventory(["a.stac.json", "b.stac.json"]))
+
+        # Compact must use .stream() (a full-object .bytes() read is the
+        # anti-pattern that spikes RAM). We wrap get() and assert stream()
+        # was invoked on the result for the NDJSON read.
+        real_get = _obstore_mod.get
+        stream_used = {"yes": False}
+
+        class _SpyResult:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def stream(self):
+                stream_used["yes"] = True
+                return self._inner.stream()
+
+            def bytes(self):
+                return self._inner.bytes()
+
+        def _fake_get(store_obj, key):
+            return _SpyResult(real_get(store_obj, key))
+
+        with patch.object(_obstore_mod, "get", side_effect=_fake_get):
+            ing._compact_ndjson_bucket("cellA", "2020")
+
+        assert stream_used["yes"], "compaction did not read NDJSON via stream()"
+
+        # The streaming helper yields items without materializing the file.
+        ndjson = [k for k in _list_files(store, "warehouse/") if k.endswith(".jsonl")]
+        st = real_get(store, ndjson[0]).stream()
+        lines = list(iter_ndjson_lines(st))
+        assert [line["id"] for line in lines] == ["item-a.stac.json", "item-b.stac.json"]
+
+    def test_iter_ndjson_lines_splits_across_chunks(self):
+        """Lines split across stream chunks are reassembled correctly."""
+        from earthcatalog.ingest import iter_ndjson_lines
+
+        class _FakeStream:
+            def __init__(self, chunks):
+                self._chunks = iter(chunks)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._chunks)
+
+        # 'a' split so the newline lands at a chunk boundary.
+        chunks = [b'{"id": "item-a", "props":', b' {"x": 1}}\n{"id": "item-b"', b'}\n']
+        items = list(iter_ndjson_lines(_FakeStream(chunks)))
+        assert [i["id"] for i in items] == ["item-a", "item-b"]
