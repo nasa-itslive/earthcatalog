@@ -1121,7 +1121,6 @@ class EarthCatalog:
         from earthcatalog.backfill_config import BackfillConfig
         from earthcatalog.config import GridConfig
         from earthcatalog.grids import build_partitioner
-        from earthcatalog.pipelines.backfill import run_backfill
 
         if not os.environ.get("AWS_ACCESS_KEY_ID"):
             raise RuntimeError(
@@ -1161,41 +1160,55 @@ class EarthCatalog:
         if self._store and self._catalog_key:
             self.download_catalog(local_db)
 
-        from . import store_config
+        from .index import Index
+        from .ingest import DaskIngester, Ingester
+        from .inventory import iter_inventory
 
-        old_store = store_config.get_store()
-        old_key = store_config.get_catalog_key()
-        try:
-            store_config.set_store(self._store)
-            if self._catalog_key:
-                store_config.set_catalog_key(self._catalog_key)
+        if not delta:
+            from pyiceberg.exceptions import NoSuchTableError
 
-            run_backfill(
-                inventory_path=inventory_path,
-                catalog_path=local_db,
-                staging_store=self._store,
-                staging_prefix=cfg.staging_prefix,
-                warehouse_store=self._store,
-                warehouse_root=warehouse_root,
-                partitioner=partitioner,
-                chunk_size=cfg.chunk_size,
-                compact_rows=cfg.compact_rows,
-                fetch_concurrency=cfg.fetch_concurrency,
-                limit=cfg.limit,
-                since=cfg.since,
-                use_lock=False,
-                upload=True,
-                skip_inventory=cfg.skip_inventory,
-                skip_ingest=cfg.skip_ingest,
-                retry_pending=cfg.retry_pending,
-                delta=delta,
-                create_client=cfg.create_client,
-                update_hash_index=cfg.update_hash_index,
-                hash_index_path=cfg.hash_index_path or self._table.properties.get("earthcatalog.hash_index_path"),
-            )
-        finally:
-            store_config.set_store(old_store)
-            store_config.set_catalog_key(old_key)
+            try:
+                self._catalog.drop_table(FULL_NAME)
+            except NoSuchTableError:
+                pass
+            try:
+                self._catalog.create_namespace(NAMESPACE)
+            except Exception:
+                pass
+            self._table = get_or_create(self._catalog, grid_config=grid_cfg)
+
+        warehouse_prefix = warehouse_root.rstrip("/") + "/"
+        index_key = f"{warehouse_root.rstrip('/')}_index.parquet"
+        if index_key.startswith("s3://"):
+            index_key = index_key.removeprefix("s3://").split("/", 1)[1]
+        index = Index(self._store, index_key)
+
+        kwargs = dict(
+            store=self._store,
+            index=index,
+            table=self._table,
+            partitioner=partitioner,
+            warehouse_prefix=warehouse_prefix,
+            batch_size=cfg.chunk_size,
+        )
+
+        if cfg.create_client is not None:
+            # Distributed: materialise (bucket, key) pairs, chunk into shards.
+            pairs = [
+                (b, k)
+                for b, k in iter_inventory(inventory_path, since=cfg.since)
+                if k.endswith(".stac.json")
+            ]
+            if cfg.limit:
+                pairs = pairs[: cfg.limit]
+            shards = [pairs[i : i + cfg.chunk_size] for i in range(0, len(pairs), cfg.chunk_size)]
+            client = cfg.create_client()
+            DaskIngester(**kwargs).run(shards, client=client)
+        else:
+            Ingester(**kwargs).run(iter_inventory(inventory_path, since=cfg.since))
+
+        if self._store and self._catalog_key:
+            self.upload_catalog(local_db)
 
     def download_catalog(self, local_path: str) -> None:
         """Download catalog.db from the backing store to *local_path*."""

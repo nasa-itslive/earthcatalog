@@ -351,7 +351,7 @@ class TestBulkIngest:
     """Minimal tests for EarthCatalog.bulk_ingest()."""
 
     def test_bulk_ingest_derives_params(self, tmp_path, monkeypatch):
-        """bulk_ingest correctly resolves mode and passes params to run_backfill."""
+        """bulk_ingest builds an Index and runs a single-node Ingester."""
         from earthcatalog import EarthCatalog
         from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
         from earthcatalog.config import GridConfig
@@ -372,22 +372,38 @@ class TestBulkIngest:
         # Mock credentials — bulk_ingest() requires AWS_ACCESS_KEY_ID
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
 
-        # Patch run_backfill to capture params instead of executing
+        # Patch the Ingester to capture construction instead of executing.
         captured = {}
 
-        def fake_run_backfill(**kwargs):
-            captured.update(kwargs)
-            return None
+        def fake_ingester_init(self, store, index, table, **kwargs):
+            captured["store"] = store
+            captured["index"] = index
+            captured["table"] = table
+            captured["kwargs"] = kwargs
+            self._store = store
 
-        import earthcatalog.pipelines.backfill as _bfmod
+        def fake_run(self, inventory):
+            captured["inventory"] = inventory
+            return {"items": 0, "rows": 0}
 
-        monkeypatch.setattr(_bfmod, "run_backfill", fake_run_backfill)
+        import earthcatalog.ingest as _ingmod
+
+        class _FakeIngester:
+            def __init__(self, store, index, table, **kwargs):
+                captured["store"] = store
+                captured["index"] = index
+                captured["table"] = table
+                captured["kwargs"] = kwargs
+
+            def run(self, inventory):
+                captured["inventory"] = inventory
+                return {"items": 0, "rows": 0}
+
+        monkeypatch.setattr(_ingmod, "Ingester", _FakeIngester)
+        monkeypatch.setattr(_ingmod, "DaskIngester", _FakeIngester)
 
         # Call bulk_ingest in full mode
         ec.bulk_ingest("inventory.parquet", mode="full")
 
-        assert captured.get("delta") is False
-        assert captured.get("inventory_path") == "inventory.parquet"
-        assert captured.get("catalog_path") == db
-        assert captured.get("warehouse_root") == wh
-        assert captured.get("use_lock") is False
+        assert captured.get("kwargs", {}).get("partitioner") is not None
+        assert captured.get("store") == store
