@@ -29,3 +29,36 @@ def test_info_requires_catalog_or_s3():
     result = runner.invoke(app, ["info"])
     assert result.exit_code == 1
     assert "specify --catalog or --catalog-s3" in result.output
+
+
+def test_backfill_delegates_to_run(monkeypatch):
+    """earthcatalog backfill forwards the essential knobs to run_backfill.run."""
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+
+    import scripts.run_backfill as _mod
+
+    monkeypatch.setattr(_mod, "run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--inventory",
+            "s3://b/inv/manifest.json",
+            "--warehouse",
+            "s3://b/wh",
+            "--mode",
+            "full",
+            "--limit",
+            "100",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("inventory") == "s3://b/inv/manifest.json"
+    assert captured.get("warehouse") == "s3://b/wh"
+    assert captured.get("mode") == "full"
+    assert captured.get("limit") == 100
+    assert captured.get("use_lock") is True

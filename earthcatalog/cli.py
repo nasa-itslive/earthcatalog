@@ -108,6 +108,93 @@ def incremental(
 
 
 # ---------------------------------------------------------------------------
+# `backfill` sub-command — full / delta ingest from an S3 inventory
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def backfill(
+    inventory: str = typer.Option(
+        ...,
+        "--inventory",
+        "-i",
+        help="Path or s3:// URI to the S3 Inventory (CSV, Parquet, or manifest.json).",
+    ),
+    catalog: str = typer.Option(
+        "/tmp/earthcatalog.db",
+        "--catalog",
+        help="Local SQLite Iceberg catalog path.",
+    ),
+    warehouse: str = typer.Option(
+        "s3://its-live-data/test-space/stac/catalog/warehouse",
+        "--warehouse",
+        help="Warehouse root (s3:// URI or local path).",
+    ),
+    staging: str = typer.Option(
+        "s3://its-live-data/test-space/stac/catalog/ingest",
+        "--staging",
+        help="Staging root for NDJSON/chunk files (s3:// URI or local path).",
+    ),
+    mode: str = typer.Option(
+        "auto",
+        "--mode",
+        help="'full' (rebuild from scratch), 'delta' (append), or 'auto'.",
+    ),
+    h3_resolution: int | None = typer.Option(
+        None,
+        "--h3-resolution",
+        help="H3 resolution (auto-detected from the catalog for delta runs).",
+    ),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        help="Stop after processing this many items (for testing).",
+    ),
+    chunk_size: int = typer.Option(
+        100_000,
+        "--chunk-size",
+        help="Items per fetch chunk.",
+    ),
+    scheduler: str = typer.Option(
+        "synchronous",
+        "--scheduler",
+        help="'synchronous' | 'local' | 'coiled'.",
+    ),
+    workers: int = typer.Option(
+        4,
+        "--workers",
+        help="Dask local workers (when --scheduler local).",
+    ),
+    no_lock: bool = typer.Option(
+        False,
+        "--no-lock",
+        help="Skip the distributed lock.",
+    ),
+) -> None:
+    """Run a full or delta ingest from an S3 inventory into the warehouse.
+
+    Equivalent to the old ``scripts/run_backfill.py`` but with the legacy
+    staging/hash-index knobs removed — it routes through the resumable
+    ``bulk_ingest`` / ``Ingester`` pipeline and the unified index.
+    """
+    from scripts.run_backfill import run as run_backfill
+
+    run_backfill(
+        inventory=inventory,
+        catalog=catalog,
+        warehouse=warehouse,
+        staging=staging,
+        chunk_size=chunk_size,
+        h3_resolution=h3_resolution,
+        limit=limit,
+        use_lock=not no_lock,
+        mode=mode,
+        scheduler=scheduler,
+        workers=workers,
+    )
+
+
+# ---------------------------------------------------------------------------
 # `info` sub-command — catalog summary (grid, stats, hash index)
 # ---------------------------------------------------------------------------
 

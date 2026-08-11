@@ -72,6 +72,7 @@ def run(
     skip_ingest: bool = False,
     retry_pending: bool = False,
     delta: bool = False,
+    mode: str | None = None,  # "full" | "delta" | "auto" — overrides delta
     # Scheduler — mutually exclusive with create_client
     scheduler: str = "synchronous",   # "synchronous" | "local" | "coiled"
     workers: int = 4,
@@ -238,7 +239,7 @@ def run(
 
     ec.bulk_ingest(
         inventory_path=inventory,
-        mode="delta" if delta else "auto",
+        mode=mode or ("delta" if delta else "auto"),
         config=cfg,
     )
 
