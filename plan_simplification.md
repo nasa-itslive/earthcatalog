@@ -16,15 +16,18 @@ Branch: `feature/garbage-collection`
 | 6a — `earthcatalog info` CLI subcommand | ✅ done |
 | 6b — Search SQL dedup (`build_query`) | ✅ done |
 | 7 — `migrate_indices()` + dead-code cleanup | ✅ done |
-| 8 — `run_backfill` kwargs simplification | ⏸ deferred (user: do at end) |
+| 8 — `run_backfill` kwargs simplification | ✅ done — **callers migrated to Ingester** |
 
 Also done while implementing: added `pyrightconfig.json` (fixes "could not be
 resolved" type errors), installed dev extra `coiled`, fixed pre-existing ruff
 errors in `tests/test_gc_bugs.py`, simplified `Ingester` kwargs.
 
 **Deferred (explicitly, to avoid breaking things):**
-- `run_backfill` kwargs (23 params) — internal, ~10 call sites incl. tests;
-  simplifying risks the distributed path. Left intact.
+- `run_backfill` is **deprecated** (docstring) and no longer used by any
+  production caller: `EarthCatalog.bulk_ingest` and
+  `scripts/run_backfill.py` now route through the resumable
+  `Ingester`/`DaskIngester`.  The function itself remains for
+  backward compatibility and its tests.
 - CLI `incremental` options — deferred; `info` subcommand shipped as the
   pattern to follow.
 - `migrate_indices()` shipped; the one-shot run in production (GC workflow)
