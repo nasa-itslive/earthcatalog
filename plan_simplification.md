@@ -12,9 +12,11 @@ Branch: `feature/garbage-collection`
 | 2 — Unified `index.py` (merges hash + source index) | ✅ done |
 | 3 — Resumable `ingest.py` (`Ingester`, direct + ndjson) | ✅ done |
 | 4 — Rewire `EarthCatalog.ingest_resumable()` → `Ingester` | ✅ done |
+| 5 — Unified-Index GC (`earthcatalog.gc`) | ✅ done |
 | 6a — `earthcatalog info` CLI subcommand | ✅ done |
-| 6b — Search SQL dedup (`build_query`) | ⏸ deferred |
-| 7 — Cleanup dead code + `migrate_indices()` | ⏸ deferred |
+| 6b — Search SQL dedup (`build_query`) | ✅ done |
+| 7 — `migrate_indices()` + dead-code cleanup | ✅ done |
+| 8 — `run_backfill` kwargs simplification | ⏸ deferred (user: do at end) |
 
 Also done while implementing: added `pyrightconfig.json` (fixes "could not be
 resolved" type errors), installed dev extra `coiled`, fixed pre-existing ruff
@@ -25,8 +27,9 @@ errors in `tests/test_gc_bugs.py`, simplified `Ingester` kwargs.
   simplifying risks the distributed path. Left intact.
 - CLI `incremental` options — deferred; `info` subcommand shipped as the
   pattern to follow.
-- `migrate_indices()` — old `*_id_hashes.parquet` / `*_source_index.parquet`
-  files still produced by legacy paths; migration not yet run.
+- `migrate_indices()` shipped; the one-shot run in production (GC workflow)
+  to fold old `*_id_hashes.parquet` / `*_source_index.parquet` files into
+  the unified index still needs to be scheduled.
 
 Goal: simplify an over-architected library into something rock-solid and
 resumable, where ingest never loses progress, GC/consolidation/search keep
