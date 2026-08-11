@@ -202,3 +202,111 @@ class TestDaskIngester:
             if f.endswith(".parquet") and "index" not in f:
                 all_ids.extend(_read_ids(store, f))
         assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json", "item-c.stac.json"]
+
+
+class TestNdjsonMode:
+    def test_single_node_stages_ndjson_then_compacts(self):
+        """stage=ndjson: Stage A writes NDJSON, Stage B compacts to GeoParquet."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json"]
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+        )
+        ing.run(_inventory(keys))
+
+        ndjson = _list_files(store, "warehouse/")
+        assert any(k.endswith(".jsonl") for k in ndjson), ndjson
+
+        assert len(table.files) >= 1
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
+
+    def test_dask_stages_ndjson_then_compacts(self):
+        """DaskIngester with stage=ndjson: workers write NDJSON, head compacts."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json", "c.stac.json"]
+        ing = DaskIngester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+        )
+
+        class _FakeClient:
+            def map(self, fn, args):
+                return [fn(a) for a in args]
+
+        shards = [_inventory(keys[:2]), _inventory(keys[2:])]
+        ing.run(shards, client=_FakeClient())
+
+        assert any(k.endswith(".jsonl") for k in _list_files(store, "warehouse/"))
+        assert len(table.files) >= 1
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
+
+        all_ids = []
+        for f in _list_files(store, "warehouse/"):
+            if f.endswith(".parquet") and "index" not in f:
+                all_ids.extend(_read_ids(store, f))
+        assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json", "item-c.stac.json"]
+
+    def test_ndjson_rerun_is_noop(self):
+        """Re-running ndjson mode skips already-indexed keys (no duplicates)."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json"]
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+        )
+        ing.run(_inventory(keys))
+        files_after_first = len(table.files)
+
+        ing.run(_inventory(keys))  # second run: nothing new
+
+        assert len(table.files) == files_after_first
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
+
+        all_ids = []
+        for f in _list_files(store, "warehouse/"):
+            if f.endswith(".parquet") and "index" not in f:
+                all_ids.extend(_read_ids(store, f))
+        assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json"]
