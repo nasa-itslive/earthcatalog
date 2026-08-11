@@ -104,5 +104,23 @@ df = con.execute(f"""
 
 ## CLI reference
 
-The old `python -m earthcatalog.pipelines.backfill` CLI is still available for
-backward compatibility but new deployments should use the Python API above.
+The preferred entry point is the `earthcatalog backfill` CLI — it routes
+through the resumable `bulk_ingest` / `Ingester` pipeline and the unified
+index (no hash/source-index knobs to manage):
+
+```bash
+# Fresh full build with an S2 grid
+earthcatalog backfill --inventory s3://bucket/inventory/full.parquet \
+    --mode full --grid s2 --resolution 2
+
+# Daily delta ingest (diff produced by scripts/daily_delta.py)
+earthcatalog backfill --inventory s3://…/delta/pending/delta_2026-04-28.parquet \
+    --mode delta --scheduler local --workers 4
+
+# Resume a failed run — already-ingested source keys are skipped automatically.
+# Stage-only (compact later) or compact staged NDJSON:
+earthcatalog backfill --inventory … --mode delta --skip-compact
+earthcatalog backfill --inventory … --mode delta --skip-fetch
+```
+
+Use `earthcatalog backfill --help` for the full option list.

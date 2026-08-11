@@ -168,11 +168,15 @@ For the **public ITS_LIVE bucket** no credentials are needed
 --inventory       S3 Inventory file path
 --catalog         catalog.db path
 --warehouse       Warehouse root path
+--mode            full | delta | auto (default: auto)
 --scheduler       dask scheduler: synchronous | local | coiled (default: synchronous)
 --workers         Dask local-cluster worker count (default: 4)
 --limit           Cap on STAC items to ingest
---chunk-size      Items per Dask task (default: 500)
---coiled-n-workers    Coiled cluster size
---coiled-software     Coiled software environment name
---coiled-region       AWS region for Coiled cluster
+--chunk-size      Items per fetch chunk (default: 100000)
+--skip-fetch      Resume: skip fetch + NDJSON staging, only compact staged NDJSON
+--skip-compact    Only fetch + stage NDJSON; compact later
+--grid            h3 | s2 | utm | geojson (for fresh full builds; default: h3)
+--resolution      Grid resolution (h3/s2; default: h3=1, s2=2)
+--boundaries      GeoJSON boundaries path (required for --grid geojson)
+--id-field        GeoJSON feature property used as the partition key
 ```

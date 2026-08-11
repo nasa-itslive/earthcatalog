@@ -6,11 +6,11 @@ name: Daily Catalog Update
 # Job 2 (ingest): consumes that delta Parquet, fetches the STAC JSONs,
 #   and appends rows to the warehouse + unified index.
 #
-# Uncomment the schedule block and set the AWS_ROLE_ARN secret to enable.
+# Set the AWS_ROLE_ARN secret to enable.
 
 on:
-  # schedule:
-  #   - cron: "0 2 * * *"   # 02:00 UTC daily
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC daily
   workflow_dispatch:
     inputs:
       date:
@@ -51,7 +51,6 @@ env:
   WAREHOUSE:       s3://its-live-data/test-space/stac/catalog/warehouse
   WAREHOUSE_INDEX: s3://its-live-data/test-space/stac/catalog/warehouse_index.parquet
   DELTA_PREFIX:    s3://its-live-data/test-space/stac/catalog/delta
-  STAGING:         s3://its-live-data/test-space/stac/catalog/ingest
   CATALOG_KEY:     test-space/stac/catalog/earthcatalog.db
   INVENTORY_BASE:  s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
 
@@ -169,24 +168,21 @@ jobs:
       - name: Run delta ingest
         run: |
           SCHEDULER="${{ github.event.inputs.scheduler || 'local' }}"
-          STAGING_PATH="${{ env.STAGING }}/delta_${{ needs.produce-delta.outputs.date }}"
+          EXTRA=""
 
           if [ "$SCHEDULER" = "local" ]; then
             EXTRA="--workers ${{ github.event.inputs.workers || '4' }}"
           elif [ "$SCHEDULER" = "coiled" ]; then
             EXTRA="--coiled-n-workers ${{ github.event.inputs.coiled_n_workers || '10' }} --coiled-vm-type ${{ github.event.inputs.coiled_vm_type || 'c6i.xlarge' }}"
-          else
-            EXTRA=""
           fi
 
-          uv run python scripts/run_backfill.py \
-            --inventory          "${{ needs.produce-delta.outputs.delta_path }}" \
-            --catalog            /tmp/earthcatalog.db \
-            --warehouse          ${{ env.WAREHOUSE }} \
-            --staging            "$STAGING_PATH" \
-            --delta \
-            --scheduler          "$SCHEDULER" \
-            --chunk-size         "${{ github.event.inputs.chunk_size || '10000' }}" \
+          uv run earthcatalog backfill \
+            --inventory   "${{ needs.produce-delta.outputs.delta_path }}" \
+            --catalog     /tmp/earthcatalog.db \
+            --warehouse   ${{ env.WAREHOUSE }} \
+            --mode        delta \
+            --scheduler   "$SCHEDULER" \
+            --chunk-size  "${{ github.event.inputs.chunk_size || '10000' }}" \
             $EXTRA
 
       - name: Mark delta as ingested

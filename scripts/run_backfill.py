@@ -8,11 +8,8 @@ Can also be imported and called directly from Python::
     run(
         inventory="s3://.../manifest.json",
         warehouse="s3://its-live-data/my-build/warehouse",
-        staging="s3://its-live-data/my-build/ingest",
         catalog_key="my-build/earthcatalog.db",
         create_client=lambda: my_dask_client,
-        update_hash_index=True,
-        update_source_index=True,
     )
 """
 
@@ -56,21 +53,13 @@ def run(
     inventory: str,
     catalog: str = "/tmp/earthcatalog_v2.db",
     warehouse: str = "s3://its-live-data/test-space/stac/catalog/warehouse",
-    staging: str = "s3://its-live-data/test-space/stac/catalog/ingest",
     # Where to upload earthcatalog.db inside the bucket (key only, no s3://bucket/)
     catalog_key: str = "test-space/stac/catalog/earthcatalog.db",
     lock_key: str = "test-space/stac/catalog/.lock",
     chunk_size: int = 100_000,
     compact_rows: int = 100_000,
-    fetch_concurrency: int = 256,
-    h3_resolution: int | None = None,
     limit: int | None = None,
     since: "datetime | None" = None,
-    use_lock: bool = True,
-    skip_upload: bool = False,
-    skip_inventory: bool = False,
-    skip_ingest: bool = False,
-    retry_pending: bool = False,
     delta: bool = False,
     mode: str | None = None,  # "full" | "delta" | "auto" — overrides delta
     skip_fetch: bool = False,
@@ -85,10 +74,6 @@ def run(
     coiled_scheduler_address: str | None = None,
     # Pass a pre-built Dask client directly (takes precedence over scheduler/coiled_*)
     create_client: Callable[[], object] | None = None,
-    hash_index: str | None = None,
-    update_hash_index: bool = False,
-    source_index: str | None = None,
-    update_source_index: bool = False,
 ) -> None:
     """Run the backfill pipeline from Python without shelling out.
 
@@ -104,8 +89,6 @@ def run(
         Local SQLite path for the Iceberg catalog (created if absent).
     warehouse:
         Warehouse root (``s3://`` URI or local path).
-    staging:
-        Staging root (``s3://`` URI or local path).
     catalog_key:
         Object key *within the warehouse bucket* used to upload the rebuilt
         ``earthcatalog.db`` at the end of the run.
@@ -231,12 +214,9 @@ def run(
     cfg = BackfillConfig(
         chunk_size=chunk_size,
         compact_rows=compact_rows,
-        fetch_concurrency=fetch_concurrency,
         limit=limit,
         since=since,
         create_client=resolved_client,
-        update_hash_index=update_hash_index,
-        hash_index_path=hash_index,
         delta=(delta or None),
         skip_fetch=skip_fetch,
         skip_compact=skip_compact,
@@ -262,53 +242,24 @@ def main() -> None:
         default="s3://its-live-data/test-space/stac/catalog/warehouse",
         help="Warehouse root (s3:// URI or local path)",
     )
+    parser.add_argument("--chunk-size", type=int, default=100_000, help="Items per fetch chunk")
     parser.add_argument(
-        "--staging",
-        default="s3://its-live-data/test-space/stac/catalog/ingest",
-        help="Staging root (s3:// URI, chunks + NDJSON go here)",
-    )
-    parser.add_argument("--chunk-size", type=int, default=100_000, help="Items per chunk (Phase 1)")
-    parser.add_argument(
-        "--compact-rows", type=int, default=100_000, help="Max rows per GeoParquet (Phase 3)"
-    )
-    parser.add_argument(
-        "--fetch-concurrency", type=int, default=256, help="Async fetch concurrency per worker"
-    )
-    parser.add_argument(
-        "--h3-resolution",
-        type=int,
-        default=None,
-        help="H3 resolution (auto-detected from catalog for delta runs)",
+        "--compact-rows", type=int, default=100_000, help="Max rows per GeoParquet"
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--since", default=None, help="Only items modified >= this date (YYYY-MM-DD)"
     )
-    parser.add_argument("--no-lock", action="store_true")
-    parser.add_argument(
-        "--skip-upload",
-        action="store_true",
-        help="Skip uploading catalog.db to S3 (for local testing)",
-    )
-    parser.add_argument(
-        "--skip-inventory",
-        action="store_true",
-        help="Skip Phase 1 inventory scan, use existing chunks in staging",
-    )
-    parser.add_argument(
-        "--skip-ingest",
-        action="store_true",
-        help="Skip Phase 2 ingest, go straight to Phase 3 (Compact)",
-    )
-    parser.add_argument(
-        "--retry-pending",
-        action="store_true",
-        help="Retry chunks that had fetch failures (pending_chunks/)",
-    )
     parser.add_argument(
         "--delta",
         action="store_true",
         help="Delta mode: append new parquets without overwriting existing warehouse files",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["full", "delta", "auto"],
+        default=None,
+        help="Overrides --delta: 'full' (rebuild), 'delta' (append), or 'auto'.",
     )
     parser.add_argument(
         "--scheduler",
@@ -335,32 +286,36 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--hash-index",
-        default=None,
-        help="S3 URI for hash index (default: {warehouse}_id_hashes.parquet)",
-    )
-    parser.add_argument(
-        "--update-hash-index",
+        "--skip-fetch",
         action="store_true",
-        help=(
-            "After delta ingest, update the hash index by reading item IDs from "
-            "the newly written warehouse parquet files (Plan B: exact, no warehouse scan). "
-            "Only effective with --delta."
-        ),
+        help="Resume: skip fetch + NDJSON staging, only compact staged NDJSON.",
     )
     parser.add_argument(
-        "--source-index",
-        default=None,
-        help="S3 URI for source index (default: {warehouse}_source_index.parquet)",
-    )
-    parser.add_argument(
-        "--update-source-index",
+        "--skip-compact",
         action="store_true",
-        help=(
-            "Track source provenance (s3_key, stac_id, grid_partition, year) in the "
-            "source index during ingest, so weekly garbage collection can detect "
-            "deleted S3 objects without re-fetching STAC JSONs."
-        ),
+        help="Only fetch + stage NDJSON; leave compaction for a later run.",
+    )
+    parser.add_argument(
+        "--grid",
+        default="h3",
+        choices=["h3", "s2", "utm", "geojson"],
+        help="Grid system for fresh full builds.",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=None,
+        help="Grid resolution (h3/s2). Default: h3=1, s2=2.",
+    )
+    parser.add_argument(
+        "--boundaries",
+        default=None,
+        help="GeoJSON boundaries path for --grid geojson.",
+    )
+    parser.add_argument(
+        "--id-field",
+        default=None,
+        help="GeoJSON feature property used as the partition key (--grid geojson).",
     )
     args = parser.parse_args()
 
@@ -368,37 +323,38 @@ def main() -> None:
     if args.since:
         since = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
 
+    from earthcatalog.config import GridConfig
+
+    grid_cfg = GridConfig(
+        type=args.grid,
+        resolution=args.resolution,
+        boundaries_path=args.boundaries,
+        id_field=args.id_field,
+    )
+
     run(
         inventory=args.inventory,
         catalog=args.catalog,
         warehouse=args.warehouse,
-        staging=args.staging,
         catalog_key=os.environ.get(
             "EARTHCATALOG_CATALOG_KEY", "test-space/stac/catalog/earthcatalog.db"
         ),
         lock_key=os.environ.get("EARTHCATALOG_LOCK_KEY", "test-space/stac/catalog/.lock"),
         chunk_size=args.chunk_size,
         compact_rows=args.compact_rows,
-        fetch_concurrency=args.fetch_concurrency,
-        h3_resolution=args.h3_resolution,
         limit=args.limit,
         since=since,
-        use_lock=not args.no_lock,
-        skip_upload=args.skip_upload,
-        skip_inventory=args.skip_inventory,
-        skip_ingest=args.skip_ingest,
-        retry_pending=args.retry_pending,
         delta=args.delta,
+        mode=args.mode,
+        skip_fetch=args.skip_fetch,
+        skip_compact=args.skip_compact,
+        grid=grid_cfg,
         scheduler=args.scheduler,
         workers=args.workers,
         threads_per_worker=args.threads_per_worker,
         coiled_n_workers=args.coiled_n_workers,
         coiled_vm_type=args.coiled_vm_type,
         coiled_scheduler_address=args.coiled_scheduler_address,
-        hash_index=args.hash_index,
-        update_hash_index=args.update_hash_index,
-        source_index=args.source_index,
-        update_source_index=args.update_source_index,
     )
 
 

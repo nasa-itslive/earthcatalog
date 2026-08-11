@@ -62,5 +62,4 @@ def test_backfill_delegates_to_run(monkeypatch):
     assert captured.get("warehouse") == "s3://b/wh"
     assert captured.get("mode") == "full"
     assert captured.get("limit") == 100
-    assert captured.get("use_lock") is True
     assert captured.get("skip_compact") is True

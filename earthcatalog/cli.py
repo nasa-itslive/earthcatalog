@@ -130,20 +130,10 @@ def backfill(
         "--warehouse",
         help="Warehouse root (s3:// URI or local path).",
     ),
-    staging: str = typer.Option(
-        "s3://its-live-data/test-space/stac/catalog/ingest",
-        "--staging",
-        help="Staging root for NDJSON/chunk files (s3:// URI or local path).",
-    ),
     mode: str = typer.Option(
         "auto",
         "--mode",
         help="'full' (rebuild from scratch), 'delta' (append), or 'auto'.",
-    ),
-    h3_resolution: int | None = typer.Option(
-        None,
-        "--h3-resolution",
-        help="H3 resolution (auto-detected from the catalog for delta runs).",
     ),
     limit: int | None = typer.Option(
         None,
@@ -164,11 +154,6 @@ def backfill(
         4,
         "--workers",
         help="Dask local workers (when --scheduler local).",
-    ),
-    no_lock: bool = typer.Option(
-        False,
-        "--no-lock",
-        help="Skip the distributed lock.",
     ),
     skip_fetch: bool = typer.Option(
         False,
@@ -228,11 +213,8 @@ def backfill(
         inventory=inventory,
         catalog=catalog,
         warehouse=warehouse,
-        staging=staging,
         chunk_size=chunk_size,
-        h3_resolution=h3_resolution,
         limit=limit,
-        use_lock=not no_lock,
         mode=mode,
         scheduler=scheduler,
         workers=workers,

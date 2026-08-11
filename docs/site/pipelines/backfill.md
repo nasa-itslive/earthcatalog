@@ -1,5 +1,11 @@
 # Backfill Pipeline
 
+!!! note "Deprecated"
+    The `python -m earthcatalog.pipelines.backfill` CLI and `run_backfill()`
+    below are **legacy**.  New deployments should use the resumable
+    `earthcatalog backfill` CLI (→ `bulk_ingest` / `Ingester`) with the
+    unified index — see the [Ingest Guide](../operations/ingest_guide.md).
+
 The backfill pipeline processes the **full historical catalog** (ITS_LIVE
 velocity pairs since 1982) using a three-level Dask DAG.  It is designed to
 run on a Dask cluster (local or [Coiled](https://coiled.io/)) and is

@@ -4,10 +4,12 @@ name: Garbage Collection
 # Runs every Sunday at 08:00 UTC — after the daily delta+ingest pipeline.
 # Detects STAC items whose source S3 objects have been deleted, rewrites the
 # affected GeoParquet partition files, and rebuilds the Iceberg catalog.
+#
+# Set the AWS_ROLE_ARN secret to enable.
 
 on:
-  # schedule:
-  #   - cron: "0 8 * * 0"   # 08:00 UTC every Sunday
+  schedule:
+    - cron: "0 8 * * 0"   # 08:00 UTC every Sunday
   workflow_dispatch:
     inputs:
       inventory_url:

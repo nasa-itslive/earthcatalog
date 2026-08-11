@@ -1,9 +1,15 @@
 # WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
 name: Consolidate
 
+# Runs every Sunday at 09:00 UTC — after the weekly garbage collection.
+# Merges small part files into one deduplicated file per (cell, year) bucket
+# and rebuilds the Iceberg catalog.
+#
+# Set the AWS_ROLE_ARN secret to enable.
+
 on:
-  # schedule:
-  #   - cron: "0 4 1 * *" # 04:00 UTC on the 1st of every month
+  schedule:
+    - cron: "0 9 * * 0" # 09:00 UTC every Sunday
   workflow_dispatch:
     inputs:
       threshold:
@@ -22,6 +28,7 @@ permissions:
 env:
   AWS_REGION: us-west-2
   WAREHOUSE: s3://its-live-data/test-space/stac/catalog/warehouse
+  CATALOG_KEY: test-space/stac/catalog/earthcatalog.db
 
 jobs:
   consolidate:
@@ -56,7 +63,7 @@ jobs:
 
           store = S3Store(bucket='its-live-data', region='us-west-2')
           store_config.set_store(store)
-          store_config.set_catalog_key('test-space/stac/catalog/earthcatalog.db')
+          store_config.set_catalog_key('${{ env.CATALOG_KEY }}')
           download_catalog('/tmp/earthcatalog.db')
           "
 

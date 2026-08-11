@@ -18,17 +18,11 @@ class BackfillConfig:
 
     chunk_size: int = 100_000
     compact_rows: int = 100_000
-    fetch_concurrency: int = 256
     limit: int | None = None
     since: datetime | None = None
     staging_prefix: str | None = None
     create_client: Callable[[], object] | None = None
-    update_hash_index: bool = False
-    skip_inventory: bool = False
-    skip_ingest: bool = False
-    retry_pending: bool = False
     delta: bool | None = None
-    hash_index_path: str | None = None
     skip_fetch: bool = False
     skip_compact: bool = False
 
