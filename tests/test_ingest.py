@@ -310,3 +310,83 @@ class TestNdjsonMode:
             if f.endswith(".parquet") and "index" not in f:
                 all_ids.extend(_read_ids(store, f))
         assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json"]
+
+
+class TestMemoryBoundedCompact:
+    def test_compacts_in_bounded_batches(self):
+        """NDJSON compact holds only compact_rows items at once: one part file
+        per batch, each sorted, without loading the whole bucket into RAM."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        # 5 items -> compact_rows=2 => ceil(5/2)=3 part files.
+        keys = [f"{c}.stac.json" for c in "abcde"]
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            compact_rows=2,
+        )
+        ing.run(_inventory(keys))
+
+        part_files = [
+            k for k in _list_files(store, "warehouse/")
+            if k.endswith(".parquet") and "index" not in k
+        ]
+        assert len(part_files) == 3, part_files
+
+        # Every item present exactly once, no duplicates.
+        all_ids = []
+        for f in part_files:
+            all_ids.extend(_read_ids(store, f))
+        assert sorted(all_ids) == [f"item-{c}.stac.json" for c in "abcde"]
+
+    def test_each_part_sorted_within_batch(self):
+        """Within a batch, items are sorted by (platform, datetime)."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        # Items share a cell; give them distinct platforms to observe sort order.
+        keys = ["p2.stac.json", "p1.stac.json", "p3.stac.json"]
+
+        def _item_with_platform(key):
+            it = _make_item(key)
+            it["properties"]["platform"] = key[:2]
+            return it
+
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _item_with_platform(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            compact_rows=10,  # all in one batch
+        )
+        ing.run(_inventory(keys))
+
+        part_files = [
+            k for k in _list_files(store, "warehouse/")
+            if k.endswith(".parquet") and "index" not in k
+        ]
+        assert len(part_files) == 1
+        assert _read_ids(store, part_files[0]) == ["item-p1.stac.json", "item-p2.stac.json", "item-p3.stac.json"]

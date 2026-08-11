@@ -1190,6 +1190,7 @@ class EarthCatalog:
             partitioner=partitioner,
             warehouse_prefix=warehouse_prefix,
             batch_size=cfg.chunk_size,
+            compact_rows=cfg.compact_rows,
         )
 
         if cfg.create_client is not None:

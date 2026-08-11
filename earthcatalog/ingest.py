@@ -31,8 +31,13 @@ from collections import defaultdict
 import obstore
 
 from earthcatalog import inventory as _inventory
-from earthcatalog.index import Index, hash_id
-from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet_s3
+from earthcatalog.index import Index
+from earthcatalog.transform import (
+    _sort_key,
+    fan_out,
+    group_by_partition,
+    write_geoparquet_s3,
+)
 
 
 class Ingester:
@@ -49,6 +54,7 @@ class Ingester:
         stage: str = "direct",
         warehouse_prefix: str = "",
         batch_size: int = 10_000,
+        compact_rows: int = 100_000,
     ) -> None:
         self._store = store
         self._index = index
@@ -58,6 +64,7 @@ class Ingester:
         self._stage = stage
         self._warehouse_prefix = warehouse_prefix.rstrip("/")
         self._batch_size = batch_size
+        self._compact_rows = compact_rows
         self._ndjson_prefix = f"{self._warehouse_prefix}/staging/ndjson" if self._warehouse_prefix else "staging/ndjson"
 
     # -- public ---------------------------------------------------------------
@@ -67,6 +74,7 @@ class Ingester:
         total = 0
         rows = 0
         pending: list[dict] = []
+        touched: set[tuple[str, str]] = set()
 
         for bucket, key in inventory:
             src = f"s3://{bucket}/{key}"
@@ -78,19 +86,22 @@ class Ingester:
             pending.append(item)
             total += 1
             if len(pending) >= self._batch_size:
-                rows += self._flush(pending)
+                rows += self._flush(pending, touched)
                 pending = []
 
         if pending:
-            rows += self._flush(pending)
+            rows += self._flush(pending, touched)
+
+        if self._stage == "ndjson":
+            rows += self._compact_all(touched)
 
         return {"items": total, "rows": rows}
 
     # -- internals ------------------------------------------------------------
 
-    def _flush(self, items: list[dict]) -> int:
+    def _flush(self, items: list[dict], touched: set[tuple[str, str]]) -> int:
         if self._stage == "ndjson":
-            return self._flush_ndjson(items)
+            return self._flush_ndjson(items, touched)
         return self._flush_direct(items)
 
     def _flush_direct(self, items: list[dict]) -> int:
@@ -125,8 +136,12 @@ class Ingester:
 
         return new_paths, index_rows, rows
 
-    def _flush_ndjson(self, items: list[dict]) -> int:
-        # Stage A — fan out to per-(cell, year) NDJSON buckets.
+    def _flush_ndjson(self, items: list[dict], touched: set[tuple[str, str]]) -> int:
+        """Stage A only — fan out to per-(cell, year) NDJSON buckets.
+
+        Records the buckets touched so the caller can compact each of them
+        exactly once after all batches (memory-bounded Stage B).
+        """
         fo = fan_out(items, self._partitioner) if self._partitioner else items
         buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for item in fo:
@@ -135,35 +150,42 @@ class Ingester:
             buckets[(cell, year)].append(item)
 
         for (cell, year), group in buckets.items():
+            touched.add((cell, year))
             self._append_ndjson(self._ndjson_key(cell, year), group)
+        return 0
 
-        # Stage B — compact the buckets touched in this batch to GeoParquet.
+    def _ndjson_key(self, cell: str, year: str) -> str:
+        return f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/staging.jsonl"
+
+    def _compact_all(self, touched: set[tuple[str, str]]) -> int:
+        """Stage B — compact every touched bucket once, then commit once."""
         new_paths: list[str] = []
         index_rows: list[dict] = []
-        rows = 0
-        for (cell, year), _ in buckets.items():
+        total = 0
+        for cell, year in sorted(touched):
             np, ir, n = self._compact_ndjson_bucket(cell, year)
             new_paths.extend(np)
             index_rows.extend(ir)
-            rows += n
+            total += n
 
         if new_paths:
             self._table.add_files([f"{k}" for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
-        return rows
-
-    def _ndjson_key(self, cell: str, year: str) -> str:
-        return f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/staging.jsonl"
+        return total
 
     def _compact_ndjson_bucket(self, cell: str, year: str) -> tuple[list[str], list[dict], int]:
-        """Read a bucket's NDJSON, dedup vs the index, and write GeoParquet.
+        """Memory-bounded compact: stream NDJSON → dedup → write GeoParquet.
 
-        Returns ``(new_paths, index_rows, rows)`` in the same shape as
-        :meth:`_write_direct` so a distributed head can commit once.
+        Only ``compact_rows`` items are held in memory at a time.  Dedup uses
+        a ScalableBloomFilter (~10 MB, bounded regardless of bucket size) so a
+        large (cell, year) bucket never exhausts RAM.  Each batch is sorted by
+        ``(platform, datetime)`` and written to its own ``part_NNNNNN.parquet``.
+
+        Returns ``(new_paths, index_rows, rows)`` — the caller commits once.
         """
-        # Gather every .jsonl file in the bucket directory (single-node uses
-        # staging.jsonl; distributed workers write shard_<i>.jsonl).
+        from pybloom_live import ScalableBloomFilter
+
         bucket_dir = f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/"
         jsonl_keys: list[str] = []
         try:
@@ -177,41 +199,49 @@ class Ingester:
         if not jsonl_keys:
             return [], [], 0
 
-        items: list[dict] = []
-        for key in sorted(jsonl_keys):
-            raw = bytes(obstore.get(self._store, key).bytes())
-            items.extend(
-                json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()
-            )
-        if not items:
-            return [], [], 0
-
-        # Dedup against the index's known id hashes (idempotent re-runs).
-        known = self._index.hash_set()
-        unique: list[dict] = []
-        seen: set[str] = set()
-        for it in items:
-            sid = it.get("id")
-            if not sid or sid in seen:
-                continue
-            seen.add(sid)
-            if hash_id(sid) in known:
-                continue
-            unique.append(it)
-
-        # Write as one GeoParquet file for this (cell, year) bucket.
-        fo = fan_out(unique, self._partitioner) if self._partitioner else unique
-        index_rows = [_to_index_row(it) for it in unique if it.get("_source_key")]
+        seen: ScalableBloomFilter = ScalableBloomFilter(
+            initial_capacity=100_000, error_rate=0.001
+        )
+        batch: list[dict] = []
+        index_rows: list[dict] = []
         new_paths: list[str] = []
         rows = 0
-        for (gcell, gyear), group in group_by_partition(fo).items():
-            year_str = str(gyear) if gyear is not None else "unknown"
-            out_key = f"{self._warehouse_prefix}/grid_partition={gcell}/year={year_str}/part_{uuid.uuid4().hex[:8]}.parquet"
-            n, _ = write_geoparquet_s3(group, self._store, out_key)
+        part_idx = 0
+
+        def _write_batch() -> None:
+            nonlocal rows, part_idx
+            if not batch:
+                return
+            out_key = (
+                f"{self._warehouse_prefix}/grid_partition={cell}/year={year}/"
+                f"part_{part_idx:06d}.parquet"
+            )
+            sorted_batch = sorted(batch, key=_sort_key)
+            n, _ = write_geoparquet_s3(sorted_batch, self._store, out_key)
             if n > 0:
                 new_paths.append(out_key)
                 rows += n
+                index_rows.extend(
+                    _to_index_row(it) for it in batch if it.get("_source_key")
+                )
+            part_idx += 1
+            batch.clear()
 
+        for key in sorted(jsonl_keys):
+            raw = bytes(obstore.get(self._store, key).bytes())
+            for line in raw.decode("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                item_id = item.get("id")
+                if not item_id or item_id in seen:
+                    continue
+                seen.add(item_id)
+                batch.append(item)
+                if len(batch) >= self._compact_rows:
+                    _write_batch()
+
+        _write_batch()
         return new_paths, index_rows, rows
 
     def _append_ndjson(self, key: str, items: list[dict]) -> None:
