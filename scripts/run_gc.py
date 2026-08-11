@@ -92,6 +92,7 @@ ec._store = store
 ec._catalog_key = args.catalog_key
 # Populate _info via the public helper so grid queries work
 from earthcatalog.catalog import _catalog_info  # noqa: E402
+
 ec._info = _catalog_info(ec._table)
 
 # ---------------------------------------------------------------------------

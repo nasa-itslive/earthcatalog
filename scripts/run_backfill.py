@@ -19,6 +19,7 @@ Can also be imported and called directly from Python::
 import argparse
 import configparser
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -80,7 +81,7 @@ def run(
     coiled_vm_type: str = "c6i.xlarge",
     coiled_scheduler_address: str | None = None,
     # Pass a pre-built Dask client directly (takes precedence over scheduler/coiled_*)
-    create_client: "Callable[[], object] | None" = None,
+    create_client: Callable[[], object] | None = None,
     hash_index: str | None = None,
     update_hash_index: bool = False,
     source_index: str | None = None,

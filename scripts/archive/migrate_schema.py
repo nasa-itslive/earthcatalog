@@ -90,7 +90,6 @@ def _migrate_one(parquet_path: str) -> dict:
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
-
     from earthcatalog.fix_schema import fix_schema
 
     try:

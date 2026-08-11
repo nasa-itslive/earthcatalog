@@ -199,3 +199,99 @@ class Index:
                 if h is not None:
                     hashes.add(bytes(h))
         return hashes
+
+
+def migrate_indices(
+    store: object,
+    *,
+    hash_key: str,
+    source_key: str,
+    out_key: str | None = None,
+) -> Index | None:
+    """Fold the legacy hash + source index files into the unified Index.
+
+    Reads ``*_id_hashes.parquet`` (an ``id_hash`` column) and
+    ``*_source_index.parquet`` (``s3_key, stac_id, grid_partition, year,
+    ingested_at, deleted``) and writes the unified schema.  Hash-only
+    entries (from the hash index) are preserved as rows with an empty
+    ``s3_key``/``stac_id``.  Returns ``None`` if neither file exists.
+
+    The new file is written to *out_key* (defaults to ``source_key`` with
+    the ``_index`` suffix) and the old files are **not** deleted here —
+    the caller deletes them after verifying a green run.
+    """
+    source_tbl = _read_parquet(store, source_key)
+    hash_tbl = _read_parquet(store, hash_key)
+
+    if source_tbl is None and hash_tbl is None:
+        return None
+
+    if out_key is None:
+        base = source_key if source_key else hash_key
+        out_key = base.rsplit(".parquet", 1)[0] + "_index.parquet"
+
+    rows: list[dict] = []
+    seen: set[bytes] = set()
+
+    if source_tbl is not None:
+        cols = source_tbl.to_pydict()
+        for i in range(source_tbl.num_rows):
+            stac_id = cols["stac_id"][i]
+            h = hash_id(stac_id) if stac_id else None
+            if h is not None:
+                seen.add(h)
+            rows.append(
+                {
+                    "id_hash": h,
+                    "s3_key": cols["s3_key"][i] or "",
+                    "stac_id": stac_id or "",
+                    "grid_partition": cols.get("grid_partition", ["__none__"] * source_tbl.num_rows)[i] or "__none__",
+                    "year": int(cols.get("year", [0] * source_tbl.num_rows)[i] or 0),
+                    "ingested_at": cols.get("ingested_at", [""] * source_tbl.num_rows)[i] or "",
+                    "deleted": bool(cols.get("deleted", [False] * source_tbl.num_rows)[i]),
+                }
+            )
+
+    if hash_tbl is not None:
+        for h in hash_tbl.column("id_hash").to_pylist():
+            h = bytes(h)
+            if h in seen:
+                continue
+            seen.add(h)
+            rows.append(
+                {
+                    "id_hash": h,
+                    "s3_key": "",
+                    "stac_id": "",
+                    "grid_partition": "__none__",
+                    "year": 0,
+                    "ingested_at": "",
+                    "deleted": False,
+                }
+            )
+
+    idx = Index(store, out_key)
+    now = datetime.now(UTC).isoformat()
+    tbl = pa.table(
+        {
+            "id_hash": pa.array([r["id_hash"] for r in rows], type=pa.binary(16)),
+            "s3_key": [r["s3_key"] for r in rows],
+            "stac_id": [r["stac_id"] for r in rows],
+            "grid_partition": [r["grid_partition"] for r in rows],
+            "year": pa.array([int(r["year"]) for r in rows], type=pa.int32()),
+            "ingested_at": [r.get("ingested_at") or now for r in rows],
+            "deleted": [bool(r.get("deleted", False)) for r in rows],
+        },
+        schema=_SCHEMA,
+    )
+    idx._write(tbl)
+    return idx
+
+
+def _read_parquet(store: object, key: str) -> pa.Table | None:
+    """Read a Parquet table from *store* at *key*, or ``None`` if absent."""
+    try:
+        raw = bytes(obstore.get(store, key).bytes())
+    except FileNotFoundError:
+        return None
+    return pq.ParquetFile(io.BytesIO(raw)).read()

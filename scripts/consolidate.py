@@ -118,11 +118,6 @@ def _scan_warehouse(store: S3Store) -> dict[tuple[str, str], list[dict]]:
     return dict(partitions)
 
 
-def _count_rows(store: S3Store, path: str) -> int:
-    raw = bytes(obstore.get(store, path).bytes())
-    return pq.ParquetFile(io.BytesIO(raw)).metadata.num_rows
-
-
 def _read_parquet_table(store: S3Store, path: str) -> pa.Table:
     raw = bytes(obstore.get(store, path).bytes())
     return pq.ParquetFile(io.BytesIO(raw)).read()
