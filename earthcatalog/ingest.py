@@ -57,6 +57,8 @@ class Ingester:
         warehouse_root: str | None = None,
         batch_size: int = 10_000,
         compact_rows: int = 100_000,
+        skip_fetch: bool = False,
+        skip_compact: bool = False,
     ) -> None:
         self._store = store
         self._index = index
@@ -68,6 +70,8 @@ class Ingester:
         self._warehouse_root = warehouse_root
         self._batch_size = batch_size
         self._compact_rows = compact_rows
+        self._skip_fetch = skip_fetch
+        self._skip_compact = skip_compact
         self._ndjson_prefix = f"{self._warehouse_prefix}/staging/ndjson" if self._warehouse_prefix else "staging/ndjson"
 
     def _full_path(self, rel_key: str) -> str:
@@ -84,32 +88,60 @@ class Ingester:
     # -- public ---------------------------------------------------------------
 
     def run(self, inventory) -> dict:
-        """Ingest ``(bucket, key)`` pairs from *inventory*; return a summary."""
+        """Ingest ``(bucket, key)`` pairs from *inventory*; return a summary.
+
+        With ``skip_fetch=True`` the fetch loop is skipped entirely and only
+        already-staged NDJSON is compacted (Stage B resume).  With
+        ``skip_compact=True`` only Stage A (fetch + NDJSON staging) runs,
+        leaving GeoParquet compaction for a later resume.
+        """
         total = 0
         rows = 0
         pending: list[dict] = []
         touched: set[tuple[str, str]] = set()
 
-        for bucket, key in inventory:
-            src = f"s3://{bucket}/{key}"
-            if self._index.contains_source_key(src):
-                continue
-            item = self._fetch_fn(bucket, key)
-            if item is None:
-                continue
-            pending.append(item)
-            total += 1
-            if len(pending) >= self._batch_size:
+        if not self._skip_fetch:
+            for bucket, key in inventory:
+                src = f"s3://{bucket}/{key}"
+                if self._index.contains_source_key(src):
+                    continue
+                item = self._fetch_fn(bucket, key)
+                if item is None:
+                    continue
+                pending.append(item)
+                total += 1
+                if len(pending) >= self._batch_size:
+                    rows += self._flush(pending, touched)
+                    pending = []
+
+            if pending:
                 rows += self._flush(pending, touched)
-                pending = []
 
-        if pending:
-            rows += self._flush(pending, touched)
-
-        if self._stage == "ndjson":
+        if self._stage == "ndjson" and not self._skip_compact:
+            # Discover staged buckets even after a skip_fetch resume.
+            if self._skip_fetch:
+                touched = self._discover_staged_buckets()
             rows += self._compact_all(touched)
 
         return {"items": total, "rows": rows}
+
+    def _discover_staged_buckets(self) -> set[tuple[str, str]]:
+        """List every (cell, year) bucket that has staged NDJSON files."""
+        buckets: set[tuple[str, str]] = set()
+        prefix = self._ndjson_prefix + "/"
+        for batch in obstore.list(self._store, prefix=prefix):
+            for obj in batch:
+                k: str = obj["path"]
+                if not k.endswith(".jsonl"):
+                    continue
+                parts = k.split("/")
+                # .../grid_partition=<cell>/year=<year>/<file>.jsonl
+                for i, part in enumerate(parts):
+                    if part.startswith("grid_partition="):
+                        cell = part.split("=", 1)[1]
+                        year = parts[i + 1].split("=", 1)[1] if i + 1 < len(parts) else "unknown"
+                        buckets.add((cell, year))
+        return buckets
 
     # -- internals ------------------------------------------------------------
 

@@ -73,6 +73,9 @@ def run(
     retry_pending: bool = False,
     delta: bool = False,
     mode: str | None = None,  # "full" | "delta" | "auto" — overrides delta
+    skip_fetch: bool = False,
+    skip_compact: bool = False,
+    grid=None,  # Optional GridConfig for fresh (full) builds
     # Scheduler — mutually exclusive with create_client
     scheduler: str = "synchronous",   # "synchronous" | "local" | "coiled"
     workers: int = 4,
@@ -216,7 +219,7 @@ def run(
     )
 
     cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
-    table = get_or_create(cat, grid_config=None)
+    table = get_or_create(cat, grid_config=grid)
     ec = EarthCatalog(
         catalog=cat,
         table=table,
@@ -235,6 +238,8 @@ def run(
         update_hash_index=update_hash_index,
         hash_index_path=hash_index,
         delta=(delta or None),
+        skip_fetch=skip_fetch,
+        skip_compact=skip_compact,
     )
 
     ec.bulk_ingest(

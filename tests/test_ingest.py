@@ -234,6 +234,86 @@ class TestNdjsonMode:
         assert any(k.endswith(".jsonl") for k in ndjson), ndjson
 
         assert len(table.files) >= 1
+
+    def test_skip_compact_only_stages(self):
+        """skip_compact=True: Stage A writes NDJSON but does NOT compact."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json"]
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            skip_compact=True,
+        )
+        ing.run(_inventory(keys))
+
+        # NDJSON staged, no GeoParquet registered.
+        ndjson = [k for k in _list_files(store, "warehouse/") if k.endswith(".jsonl")]
+        assert len(ndjson) >= 1
+        assert table.files == []
+
+    def test_skip_fetch_only_compacts_existing_staging(self):
+        """skip_fetch=True: no fetching; compacts whatever NDJSON is staged."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json"]
+
+        # Stage A only (skip_compact) to create the NDJSON.
+        ing1 = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            skip_compact=True,
+        )
+        ing1.run(_inventory(keys))
+        assert table.files == []
+
+        # Resume: skip_fetch — no fetch calls, just compact the staged NDJSON.
+        fetch_calls = {"n": 0}
+
+        def _counting_fetch(b, k):
+            fetch_calls["n"] += 1
+            return _make_item(k)
+
+        ing2 = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=_counting_fetch,
+            stage="ndjson",
+            warehouse_prefix="warehouse/",
+            skip_fetch=True,
+        )
+        ing2.run(_inventory(keys))
+
+        assert fetch_calls["n"] == 0
+        assert len(table.files) >= 1
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
         assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
 
     def test_dask_stages_ndjson_then_compacts(self):

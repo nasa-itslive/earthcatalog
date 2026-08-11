@@ -29,6 +29,8 @@ class BackfillConfig:
     retry_pending: bool = False
     delta: bool | None = None
     hash_index_path: str | None = None
+    skip_fetch: bool = False
+    skip_compact: bool = False
 
     @classmethod
     def from_kwargs(cls, **kwargs) -> BackfillConfig:

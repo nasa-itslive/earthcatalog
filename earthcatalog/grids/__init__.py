@@ -33,6 +33,13 @@ def build_partitioner(cfg: GridConfig) -> AbstractPartitioner:
         )
 
     if cfg.type == "s2":
-        raise NotImplementedError("S2 partitioner is not yet implemented")
+        from earthcatalog.grids.s2_partitioner import S2Partitioner
+
+        return S2Partitioner(resolution=cfg.resolution or 2)
+
+    if cfg.type == "utm":
+        from earthcatalog.grids.utm_partitioner import UTMPartitioner
+
+        return UTMPartitioner()
 
     raise ValueError(f"Unknown grid type: {cfg.type!r}")

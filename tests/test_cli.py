@@ -54,6 +54,7 @@ def test_backfill_delegates_to_run(monkeypatch):
             "full",
             "--limit",
             "100",
+            "--skip-compact",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -62,3 +63,4 @@ def test_backfill_delegates_to_run(monkeypatch):
     assert captured.get("mode") == "full"
     assert captured.get("limit") == 100
     assert captured.get("use_lock") is True
+    assert captured.get("skip_compact") is True

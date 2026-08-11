@@ -26,6 +26,8 @@ dependencies = [
   "duckdb",
   "pybloom-live",
   "tqdm",
+  "pyproj>=3.7.2",
+  "s2geometry>=0.14.0",
 ]
 
 [project.optional-dependencies]

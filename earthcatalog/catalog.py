@@ -1197,6 +1197,8 @@ class EarthCatalog:
             warehouse_root=warehouse_root,
             batch_size=cfg.chunk_size,
             compact_rows=cfg.compact_rows,
+            skip_fetch=cfg.skip_fetch,
+            skip_compact=cfg.skip_compact,
         )
 
         if cfg.create_client is not None:

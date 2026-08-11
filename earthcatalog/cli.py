@@ -170,14 +170,59 @@ def backfill(
         "--no-lock",
         help="Skip the distributed lock.",
     ),
+    skip_fetch: bool = typer.Option(
+        False,
+        "--skip-fetch",
+        help="Resume: skip Stage A (fetch + NDJSON staging), only compact staged NDJSON.",
+    ),
+    skip_compact: bool = typer.Option(
+        False,
+        "--skip-compact",
+        help="Only run Stage A (fetch + NDJSON staging); leave compaction for later.",
+    ),
+    grid: str = typer.Option(
+        "h3",
+        "--grid",
+        help="Grid system: 'h3' | 's2' | 'utm' | 'geojson' (for fresh full builds).",
+    ),
+    resolution: int | None = typer.Option(
+        None,
+        "--resolution",
+        help="Grid resolution (h3/s2). Default: h3=1, s2=2.",
+    ),
+    boundaries: str | None = typer.Option(
+        None,
+        "--boundaries",
+        help="GeoJSON boundaries path for --grid geojson.",
+    ),
+    id_field: str | None = typer.Option(
+        None,
+        "--id-field",
+        help="GeoJSON feature property used as the partition key (--grid geojson).",
+    ),
 ) -> None:
     """Run a full or delta ingest from an S3 inventory into the warehouse.
 
     Equivalent to the old ``scripts/run_backfill.py`` but with the legacy
     staging/hash-index knobs removed — it routes through the resumable
     ``bulk_ingest`` / ``Ingester`` pipeline and the unified index.
+
+    Resume: a failed run can be resumed safely (already-ingested source keys
+    are skipped).  ``--skip-fetch`` resumes from staged NDJSON; ``--skip-compact``
+    only stages NDJSON for a later compaction.
+
+    Grid: use ``--grid h3|s2|utm|geojson`` for fresh full builds.  ``geojson``
+    requires ``--boundaries`` (path or s3:// URI) and ``--id-field``.
     """
+    from earthcatalog.config import GridConfig
     from scripts.run_backfill import run as run_backfill
+
+    grid_cfg = GridConfig(
+        type=grid,
+        resolution=resolution,
+        boundaries_path=boundaries,
+        id_field=id_field,
+    )
 
     run_backfill(
         inventory=inventory,
@@ -191,6 +236,9 @@ def backfill(
         mode=mode,
         scheduler=scheduler,
         workers=workers,
+        skip_fetch=skip_fetch,
+        skip_compact=skip_compact,
+        grid=grid_cfg,
     )
 
 

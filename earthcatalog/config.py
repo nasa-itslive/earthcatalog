@@ -42,7 +42,7 @@ class CatalogConfig:
 
 @dataclass
 class GridConfig:
-    type: Literal["h3", "s2", "geojson"] = "h3"
+    type: Literal["h3", "s2", "utm", "geojson"] = "h3"
     resolution: int | None = None  # H3 / S2 resolution level
     boundaries_path: str | None = None  # GeoJSON partitioner: path to boundaries file
     id_field: str | None = None  # GeoJSON partitioner: property to use as key
