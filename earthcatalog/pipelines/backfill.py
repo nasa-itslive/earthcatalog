@@ -1214,6 +1214,12 @@ def run_backfill(
     """
     Four-phase staging-based backfill pipeline.
 
+    .. deprecated:: 0.7
+        Prefer the resumable :class:`earthcatalog.ingest.Ingester`
+        (index-as-checkpoint, no NDJSON staging required).  This function
+        is retained for backward compatibility with existing workflows and
+        callers; its signature is unchanged.
+
     Parameters
     ----------
     inventory_path:

@@ -10,7 +10,6 @@ from __future__ import annotations
 import io
 import struct
 from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +21,8 @@ from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table
+
+    from .backfill_config import BackfillConfig
 
 from . import store_config
 from .schema import (
@@ -1100,22 +1101,24 @@ class EarthCatalog:
         inventory_path: str,
         *,
         mode: str = "auto",
-        chunk_size: int = 100_000,
-        compact_rows: int = 100_000,
-        limit: int | None = None,
-        since: datetime | None = None,
-        update_hash_index: bool = False,
-        staging_prefix: str | None = None,
-        create_client: Callable[[], object] | None = None,
-        skip_inventory: bool = False,
-        skip_ingest: bool = False,
-        retry_pending: bool = False,
+        config: BackfillConfig | None = None,
     ) -> None:
-        """Ingest large inventories using a distributed Dask cluster."""
+        """Ingest large inventories using a distributed Dask cluster.
+
+        *config* (a :class:`earthcatalog.backfill_config.BackfillConfig`)
+        holds the tuning knobs (chunk size, compact rows, resume flags,
+        hash-index update, etc.).  *mode* is ``"auto"``, ``"full"``, or
+        ``"delta"`` and selects whether the Iceberg table is rebuilt or
+        appended to.
+
+        This drives the legacy :func:`run_backfill` pipeline (deprecated);
+        new code should use the resumable :meth:`ingest_resumable`.
+        """
         import os
         from datetime import UTC
         from datetime import datetime as _dt
 
+        from earthcatalog.backfill_config import BackfillConfig
         from earthcatalog.config import GridConfig
         from earthcatalog.grids import build_partitioner
         from earthcatalog.pipelines.backfill import run_backfill
@@ -1126,6 +1129,8 @@ class EarthCatalog:
                 "bulk_ingest() requires write access to S3. "
                 "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
             )
+
+        cfg = config or BackfillConfig()
 
         warehouse_root = self._catalog.properties.get("warehouse", "")
         uri = self._catalog.properties.get("uri", "")
@@ -1139,9 +1144,9 @@ class EarthCatalog:
         )
         partitioner = build_partitioner(grid_cfg)
 
-        if staging_prefix is None:
+        if cfg.staging_prefix is None:
             date_str = _dt.now(UTC).strftime("%Y%m%d")
-            staging_prefix = f"bulk_ingest/{date_str}"
+            cfg.staging_prefix = f"bulk_ingest/{date_str}"
 
         delta = True
         if mode == "full":
@@ -1169,23 +1174,24 @@ class EarthCatalog:
                 inventory_path=inventory_path,
                 catalog_path=local_db,
                 staging_store=self._store,
-                staging_prefix=staging_prefix,
+                staging_prefix=cfg.staging_prefix,
                 warehouse_store=self._store,
                 warehouse_root=warehouse_root,
                 partitioner=partitioner,
-                chunk_size=chunk_size,
-                compact_rows=compact_rows,
-                limit=limit,
-                since=since,
+                chunk_size=cfg.chunk_size,
+                compact_rows=cfg.compact_rows,
+                fetch_concurrency=cfg.fetch_concurrency,
+                limit=cfg.limit,
+                since=cfg.since,
                 use_lock=False,
                 upload=True,
-                skip_inventory=skip_inventory,
-                skip_ingest=skip_ingest,
-                retry_pending=retry_pending,
+                skip_inventory=cfg.skip_inventory,
+                skip_ingest=cfg.skip_ingest,
+                retry_pending=cfg.retry_pending,
                 delta=delta,
-                create_client=create_client,
-                update_hash_index=update_hash_index,
-                hash_index_path=self._table.properties.get("earthcatalog.hash_index_path"),
+                create_client=cfg.create_client,
+                update_hash_index=cfg.update_hash_index,
+                hash_index_path=cfg.hash_index_path or self._table.properties.get("earthcatalog.hash_index_path"),
             )
         finally:
             store_config.set_store(old_store)
