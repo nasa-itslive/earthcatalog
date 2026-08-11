@@ -23,7 +23,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-import dask
 from obstore.store import LocalStore, S3Store
 
 
@@ -125,35 +124,10 @@ def run(
         wh_no_scheme = warehouse.removeprefix("s3://")
         wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
         warehouse_store = _make_s3_store(wh_bucket, prefix=wh_prefix)
-        warehouse_root = warehouse
     else:
         Path(warehouse).mkdir(parents=True, exist_ok=True)
         warehouse_store = LocalStore(str(warehouse))
-        warehouse_root = warehouse
         wh_bucket = "its-live-data"  # fallback for store_config
-
-    if staging.startswith("s3://"):
-        st_no_scheme = staging.removeprefix("s3://")
-        st_bucket, st_prefix = st_no_scheme.split("/", 1)
-        staging_store = _make_s3_store(st_bucket, prefix=st_prefix)
-        staging_prefix = ""
-    else:
-        Path(staging).mkdir(parents=True, exist_ok=True)
-        staging_store = LocalStore(str(staging))
-        staging_prefix = ""
-
-    source_index_store = None
-    source_index_key = None
-    if update_source_index:
-        src_path = source_index or f"{warehouse.rstrip('/')}_source_index.parquet"
-        if src_path.startswith("s3://"):
-            no_scheme = src_path.removeprefix("s3://")
-            src_bucket, _, src_key = no_scheme.partition("/")
-            source_index_store = _make_s3_store(src_bucket)
-            source_index_key = src_key
-        else:
-            source_index_store = LocalStore(str(Path(src_path).parent))
-            source_index_key = Path(src_path).name
 
     # ------------------------------------------------------------------
     # Configure store_config (controls catalog upload destination)
@@ -169,72 +143,19 @@ def run(
         download_catalog(catalog)
 
     # ------------------------------------------------------------------
-    # Resolve create_client
+    # Resolve the distributed client (None = single-node Ingester)
     # ------------------------------------------------------------------
-    from earthcatalog.pipelines.backfill import run_backfill
+    resolved_client = None
 
     if create_client is not None:
-        # Caller supplied their own client — use it directly
-        run_backfill(
-            inventory_path=inventory,
-            catalog_path=catalog,
-            staging_store=staging_store,
-            staging_prefix=staging_prefix,
-            warehouse_store=warehouse_store,
-            warehouse_root=warehouse_root,
-            h3_resolution=h3_resolution,
-            chunk_size=chunk_size,
-            compact_rows=compact_rows,
-            fetch_concurrency=fetch_concurrency,
-            limit=limit,
-            since=since,
-            use_lock=use_lock,
-            skip_inventory=skip_inventory,
-            skip_ingest=skip_ingest,
-            retry_pending=retry_pending,
-            delta=delta,
-            create_client=create_client,
-            upload=not skip_upload,
-            hash_index_path=hash_index,
-            update_hash_index=update_hash_index,
-            update_source_index=update_source_index,
-            source_index_store=source_index_store,
-            source_index_key=source_index_key,
-        )
-
+        resolved_client = create_client
     elif coiled_scheduler_address:
         from dask.distributed import Client
 
         print(f"Connecting to existing scheduler: {coiled_scheduler_address} …")
         client = Client(coiled_scheduler_address)
         print(f"Connected. Dashboard: {client.dashboard_link}")
-
-        run_backfill(
-            inventory_path=inventory,
-            catalog_path=catalog,
-            staging_store=staging_store,
-            staging_prefix=staging_prefix,
-            warehouse_store=warehouse_store,
-            warehouse_root=warehouse_root,
-            h3_resolution=h3_resolution,
-            chunk_size=chunk_size,
-            compact_rows=compact_rows,
-            fetch_concurrency=fetch_concurrency,
-            limit=limit,
-            since=since,
-            use_lock=use_lock,
-            skip_inventory=skip_inventory,
-            skip_ingest=skip_ingest,
-            retry_pending=retry_pending,
-            delta=delta,
-            create_client=lambda: client,
-            upload=not skip_upload,
-            hash_index_path=hash_index,
-            update_hash_index=update_hash_index,
-            update_source_index=update_source_index,
-            source_index_store=source_index_store,
-            source_index_key=source_index_key,
-        )
+        resolved_client = lambda: client  # noqa: E731
 
     elif scheduler == "coiled":
         import coiled
@@ -253,9 +174,6 @@ def run(
             client = Client(cluster)
             print(f"Coiled dashboard: {client.dashboard_link}")
 
-            # Forward AWS credentials so workers can read/write S3.
-            # send_private_envs transmits directly to the cluster over an
-            # encrypted connection — values are never stored by Coiled.
             aws_envs = {
                 k: os.environ[k]
                 for k in (
@@ -274,93 +192,55 @@ def run(
 
             return client
 
-        run_backfill(
-            inventory_path=inventory,
-            catalog_path=catalog,
-            staging_store=staging_store,
-            staging_prefix=staging_prefix,
-            warehouse_store=warehouse_store,
-            warehouse_root=warehouse_root,
-            h3_resolution=h3_resolution,
-            chunk_size=chunk_size,
-            compact_rows=compact_rows,
-            fetch_concurrency=fetch_concurrency,
-            limit=limit,
-            since=since,
-            use_lock=use_lock,
-            skip_inventory=skip_inventory,
-            skip_ingest=skip_ingest,
-            retry_pending=retry_pending,
-            delta=delta,
-            create_client=_create_cluster,
-            upload=not skip_upload,
-            hash_index_path=hash_index,
-            update_hash_index=update_hash_index,
-            update_source_index=update_source_index,
-            source_index_store=source_index_store,
-            source_index_key=source_index_key,
-        )
+        resolved_client = _create_cluster
 
     elif scheduler == "local":
         from dask.distributed import Client, LocalCluster
 
-        cluster = LocalCluster(n_workers=workers, threads_per_worker=threads_per_worker)
-        client = Client(cluster)
+        def _make_local():
+            cluster = LocalCluster(n_workers=workers, threads_per_worker=threads_per_worker)
+            return Client(cluster)
 
-        with client:
-            run_backfill(
-                inventory_path=inventory,
-                catalog_path=catalog,
-                staging_store=staging_store,
-                staging_prefix=staging_prefix,
-                warehouse_store=warehouse_store,
-                warehouse_root=warehouse_root,
-                h3_resolution=h3_resolution,
-                chunk_size=chunk_size,
-                compact_rows=compact_rows,
-                fetch_concurrency=fetch_concurrency,
-                limit=limit,
-                since=since,
-                use_lock=use_lock,
-                skip_inventory=skip_inventory,
-                skip_ingest=skip_ingest,
-                retry_pending=retry_pending,
-                delta=delta,
-                upload=not skip_upload,
-                hash_index_path=hash_index,
-                update_hash_index=update_hash_index,
-                update_source_index=update_source_index,
-                source_index_store=source_index_store,
-                source_index_key=source_index_key,
-            )
+        resolved_client = _make_local
 
-    else:
-        with dask.config.set(scheduler="synchronous"):
-            run_backfill(
-                inventory_path=inventory,
-                catalog_path=catalog,
-                staging_store=staging_store,
-                staging_prefix=staging_prefix,
-                warehouse_store=warehouse_store,
-                warehouse_root=warehouse_root,
-                h3_resolution=h3_resolution,
-                chunk_size=chunk_size,
-                compact_rows=compact_rows,
-                fetch_concurrency=fetch_concurrency,
-                limit=limit,
-                since=since,
-                use_lock=use_lock,
-                skip_inventory=skip_inventory,
-                skip_ingest=skip_ingest,
-                retry_pending=retry_pending,
-                delta=delta,
-                upload=not skip_upload,
-                hash_index_path=hash_index,
-                update_hash_index=update_hash_index,
-                update_source_index=update_source_index,
-                source_index_store=source_index_store,
-                source_index_key=source_index_key,
-            )
+    # ------------------------------------------------------------------
+    # Open the catalog and run through EarthCatalog.bulk_ingest
+    # ------------------------------------------------------------------
+    from earthcatalog.backfill_config import BackfillConfig
+    from earthcatalog.catalog import (
+        EarthCatalog,
+        _catalog_info,
+        _open_sqlite,
+        get_or_create,
+    )
+
+    cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
+    table = get_or_create(cat, grid_config=None)
+    ec = EarthCatalog(
+        catalog=cat,
+        table=table,
+        info=_catalog_info(table),
+        store=warehouse_store,
+        catalog_key=catalog_key,
+    )
+
+    cfg = BackfillConfig(
+        chunk_size=chunk_size,
+        compact_rows=compact_rows,
+        fetch_concurrency=fetch_concurrency,
+        limit=limit,
+        since=since,
+        create_client=resolved_client,
+        update_hash_index=update_hash_index,
+        hash_index_path=hash_index,
+        delta=(delta or None),
+    )
+
+    ec.bulk_ingest(
+        inventory_path=inventory,
+        mode="delta" if delta else "auto",
+        config=cfg,
+    )
 
 
 def main() -> None:
