@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 from obstore.store import MemoryStore
 
 from earthcatalog.index import Index
-from earthcatalog.ingest import Ingester
+from earthcatalog.ingest import DaskIngester, Ingester
 
 
 def _inventory(keys: list[str]) -> list[tuple[str, str]]:
@@ -154,6 +154,49 @@ class TestResume:
         ing2.run(_inventory(keys))
 
         # Every item present exactly once across all files
+        all_ids = []
+        for f in _list_files(store, "warehouse/"):
+            if f.endswith(".parquet") and "index" not in f:
+                all_ids.extend(_read_ids(store, f))
+        assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json", "item-c.stac.json"]
+
+
+class TestDaskIngester:
+    def test_distributes_across_shards(self):
+        """Workers write parquet; head registers files + index rows once."""
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        ing = DaskIngester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            warehouse_prefix="warehouse/",
+        )
+
+        # Fake Dask client.map: runs _worker on each shard, returns results.
+        class _FakeClient:
+            def map(self, fn, shards):
+                return [fn(s) for s in shards]
+
+        keys = ["a.stac.json", "b.stac.json", "c.stac.json"]
+        shards = [_inventory(keys[:2]), _inventory(keys[2:])]
+        ing.run(shards, client=_FakeClient())
+
+        assert len(table.files) == 2  # one parquet per (cell,year) group
+        assert index.known_source_keys() == {
+            f"s3://data-bucket/{k}" for k in keys
+        }
+
         all_ids = []
         for f in _list_files(store, "warehouse/"):
             if f.endswith(".parquet") and "index" not in f:

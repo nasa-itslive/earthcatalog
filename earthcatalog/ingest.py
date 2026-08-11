@@ -94,9 +94,22 @@ class Ingester:
         return self._flush_direct(items)
 
     def _flush_direct(self, items: list[dict]) -> int:
+        new_paths, index_rows, rows = self._write_direct(items)
+        if new_paths:
+            self._table.add_files([f"{key}" for key in new_paths])
+            if index_rows:
+                self._index.append(index_rows)
+        return rows
+
+    def _write_direct(self, items: list[dict]) -> tuple[list[str], list[dict], int]:
+        """Write items to GeoParquet without touching the table/index.
+
+        Returns ``(new_paths, index_rows, rows)`` so a distributed caller can
+        gather results from many workers and commit once on the head node.
+        """
         fo = fan_out(items, self._partitioner) if self._partitioner else items
         if not fo:
-            return 0
+            return [], [], 0
 
         rows = 0
         new_paths: list[str] = []
@@ -110,11 +123,7 @@ class Ingester:
                 new_paths.append(key)
                 rows += n
 
-        if new_paths:
-            self._table.add_files([f"{key}" for key in new_paths])
-            if index_rows:
-                self._index.append(index_rows)
-        return rows
+        return new_paths, index_rows, rows
 
     def _flush_ndjson(self, items: list[dict]) -> int:
         # Stage A — fan out to per-(cell, year) NDJSON buckets.
@@ -138,6 +147,43 @@ class Ingester:
             obstore.put(self._store, key, merged.encode("utf-8"))
         except FileNotFoundError:
             obstore.put(self._store, key, lines.encode("utf-8"))
+
+
+class DaskIngester(Ingester):
+    """Distributed variant: shards the inventory and writes via ``client.map``.
+
+    Each worker runs :meth:`Ingester._write_direct` (write-only GeoParquet)
+    and returns ``(new_paths, index_rows, rows)``; the head node then calls
+    ``table.add_files()`` and ``index.append()`` exactly once, so the shared
+    index file is never written concurrently.
+
+    *client* must expose ``map(fn, shards)`` (a Dask ``Client`` works).
+    """
+
+    def run(self, shards, *, client) -> dict:
+        """Ingest each *shard* (a list of ``(bucket, key)`` pairs) in parallel."""
+        results = client.map(self._write_direct_with_fetch, list(shards))
+
+        new_paths: list[str] = []
+        index_rows: list[dict] = []
+        total = 0
+        for new_paths_i, index_rows_i, rows in results:
+            new_paths.extend(new_paths_i)
+            index_rows.extend(index_rows_i)
+            total += rows
+
+        if new_paths:
+            self._table.add_files([f"{k}" for k in new_paths])
+            if index_rows:
+                self._index.append(index_rows)
+
+        return {"items": total, "rows": total}
+
+    def _write_direct_with_fetch(self, shard):
+        """Fetch each (bucket, key) in *shard*, then write-only fan-out."""
+        items = [self._fetch_fn(b, k) for b, k in shard]
+        items = [it for it in items if it is not None]
+        return self._write_direct(items)
 
 
 # ---------------------------------------------------------------------------
