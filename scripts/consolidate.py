@@ -269,7 +269,10 @@ def rebuild_catalog(
     warehouse_uri: str,
     catalog_path: str,
     store: S3Store,
+    catalog_key: str | None = None,
 ) -> None:
+    from pathlib import Path
+
     from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
     from earthcatalog.catalog import (
@@ -290,12 +293,12 @@ def rebuild_catalog(
     except (NamespaceAlreadyExistsError, Exception):
         pass
 
-    saved_props: dict[str, str] = {PROP_GRID_TYPE: "h3"}
+    saved_props: dict[str, str] = {}
     try:
         existing = catalog.load_table(FULL_NAME)
         saved_props.update(existing.properties)
     except NoSuchTableError:
-        pass
+        saved_props = {PROP_GRID_TYPE: "h3"}
 
     try:
         catalog.drop_table(FULL_NAME)
@@ -310,12 +313,11 @@ def rebuild_catalog(
     )
 
     all_paths: list[str] = []
-    bucket, prefix = _parse_s3_uri(warehouse_uri)
     for batch in obstore.list(store, prefix=""):
         for obj in batch:
             k: str = obj["path"]
             if k.endswith(".parquet") and _HIVE_RE.search(k):
-                all_paths.append(f"s3://{bucket}/{k}")
+                all_paths.append(f"{warehouse_uri.rstrip('/')}/{k}")
 
     if all_paths:
         batch_size = 2000
@@ -323,7 +325,12 @@ def rebuild_catalog(
             table.add_files(all_paths[i : i + batch_size])
         print(f"Registered {len(all_paths):,} files in Iceberg catalog.")
 
-    upload_catalog(catalog_path)
+    if catalog_key and warehouse_uri.startswith("s3://"):
+        bucket, _ = _parse_s3_uri(warehouse_uri)
+        obstore.put(_get_store(bucket), catalog_key, Path(catalog_path).read_bytes())
+        print(f"Catalog uploaded: {catalog_path} -> s3://{bucket}/{catalog_key}")
+    else:
+        upload_catalog(catalog_path)
 
 
 def run_consolidate(
@@ -333,6 +340,7 @@ def run_consolidate(
     compact_rows: int = 100_000,
     use_lock: bool = False,
     dry_run: bool = False,
+    catalog_key: str | None = None,
 ) -> dict:
     bucket, prefix = _parse_s3_uri(warehouse_uri)
     store = _get_store(bucket, prefix=prefix)
@@ -356,7 +364,7 @@ def run_consolidate(
     if not dry_run and results:
         print()
         print("Rebuilding Iceberg catalog ...")
-        rebuild_catalog(warehouse_uri, catalog_path, store)
+        rebuild_catalog(warehouse_uri, catalog_path, store, catalog_key=catalog_key)
 
     total_merged = sum(r["merged_files"] for r in results)
     total_rows = sum(r.get("merged_rows", 0) for r in results)
@@ -398,6 +406,11 @@ def main() -> None:
     )
     parser.add_argument("--use-lock", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--catalog-key",
+        default=None,
+        help="Object key within the bucket for the rebuilt catalog (s3:// warehouses).",
+    )
     args = parser.parse_args()
 
     if args.use_lock:
@@ -410,6 +423,7 @@ def main() -> None:
                 threshold=args.threshold,
                 compact_rows=args.compact_rows,
                 dry_run=args.dry_run,
+                catalog_key=args.catalog_key,
             )
     else:
         run_consolidate(
@@ -418,6 +432,7 @@ def main() -> None:
             threshold=args.threshold,
             compact_rows=args.compact_rows,
             dry_run=args.dry_run,
+            catalog_key=args.catalog_key,
         )
 
 

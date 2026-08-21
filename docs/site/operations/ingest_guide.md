@@ -79,7 +79,7 @@ catalog.ingest("s3://bucket/delta.parquet", mode="delta",
 
 ```python
 catalog.stats()              # per-partition row/file counts from Iceberg manifests
-catalog.unique_item_count()  # unique STAC items (hash index footer, no full scan)
+catalog.unique_item_count()  # active STAC items (streamed from the unified index)
 catalog.info()               # grid metadata and catalog info object
 ```
 

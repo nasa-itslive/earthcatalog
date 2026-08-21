@@ -1,9 +1,8 @@
 """
 Garbage collection against the unified warehouse Index.
 
-Simplified port of ``earthcatalog.pipelines.delete`` that reads orphans
-from the unified :class:`earthcatalog.index.Index` and marks them deleted
-there — there is no separate hash-index file to update.
+Reads orphans from the unified :class:`earthcatalog.index.Index` and marks
+them deleted there — no separate hash-index or source-index files to update.
 
 Pipeline
 --------

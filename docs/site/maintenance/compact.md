@@ -96,6 +96,30 @@ print(summary)
 # }
 ```
 
+### S3 warehouses
+
+`warehouse_path` may be an `s3://` URI.  For S3, pass the bucket-level store
+and the catalog object key so the catalog can be downloaded and re-uploaded:
+
+```python
+from obstore.store import S3Store
+from earthcatalog.maintenance.compact import compact_warehouse
+
+store = S3Store(bucket="its-live-data", region="us-west-2")
+
+summary = compact_warehouse(
+    warehouse_path="s3://its-live-data/test-space/stac/catalog/warehouse",
+    catalog_path="/tmp/earthcatalog.db",
+    threshold=2,
+    store=store,
+    catalog_key="test-space/stac/catalog/earthcatalog.db",
+)
+```
+
+> The same S3-capable path is exposed through
+> `EarthCatalog.compact()`, which derives `warehouse_path`, `store`, and
+> `catalog_key` from the open catalog.
+
 ---
 
 ## Return value

@@ -58,7 +58,9 @@ As a CLI::
 from __future__ import annotations
 
 import argparse
+import configparser
 import io
+import os
 import tempfile
 import uuid
 from collections import defaultdict
@@ -68,7 +70,7 @@ import obstore
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from obstore.store import LocalStore
+from obstore.store import LocalStore, S3Store
 
 from earthcatalog.catalog import (
     _HIVE_RE,
@@ -84,6 +86,32 @@ from earthcatalog.transform import FileMetadata
 # grid_partition=<cell>/year=<year>/part_NNNNNN_<uuid>.parquet
 # or
 # grid_partition=<cell>/year=<year>/compacted_<hex>.parquet
+
+
+def _s3_store(bucket: str, prefix: str = "") -> S3Store:
+    """Build an authenticated S3Store, optionally scoped to a key prefix."""
+    key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    token = os.environ.get("AWS_SESSION_TOKEN")
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+    if not (key_id and secret):
+        cfg = configparser.ConfigParser()
+        cfg.read(os.path.expanduser("~/.aws/credentials"))
+        profile = os.environ.get("AWS_PROFILE", "default")
+        if profile in cfg:
+            key_id = cfg[profile].get("aws_access_key_id", key_id)
+            secret = cfg[profile].get("aws_secret_access_key", secret)
+            token = cfg[profile].get("aws_session_token", token) or token
+    kwargs: dict = {"bucket": bucket, "region": region}
+    if prefix:
+        kwargs["prefix"] = prefix
+    if key_id:
+        kwargs["aws_access_key_id"] = key_id
+    if secret:
+        kwargs["aws_secret_access_key"] = secret
+    if token:
+        kwargs["aws_session_token"] = token
+    return S3Store(**kwargs)
 
 
 def _compact_group_impl(
@@ -203,6 +231,8 @@ def compact_warehouse(
     threshold: int = 2,
     use_lock: bool = False,
     dry_run: bool = False,
+    store: object | None = None,
+    catalog_key: str | None = None,
 ) -> dict[str, int]:
     """
     Compact all over-threshold buckets in *warehouse_path* and rebuild the
@@ -211,8 +241,7 @@ def compact_warehouse(
     Parameters
     ----------
     warehouse_path:
-        Local path to the warehouse root (e.g. ``/tmp/earthcatalog_warehouse``).
-        Must be a local directory — S3 warehouse support is planned.
+        Local path or ``s3://`` URI of the warehouse root.
     catalog_path:
         Local path to the SQLite catalog file (e.g. ``/tmp/earthcatalog.db``).
     threshold:
@@ -224,6 +253,12 @@ def compact_warehouse(
         be configured in :mod:`earthcatalog.store_config`.
     dry_run:
         When ``True``, report what *would* be compacted but make no changes.
+    store:
+        Bucket-level obstore store used to download/upload ``catalog_path``
+        (for ``s3://`` warehouses).  Defaults to ``store_config``.
+    catalog_key:
+        Object key within *store* for the catalog file (for ``s3://``
+        warehouses).  Defaults to ``store_config``.
 
     Returns
     -------
@@ -243,6 +278,8 @@ def compact_warehouse(
             catalog_path=catalog_path,
             threshold=threshold,
             dry_run=dry_run,
+            store=store,
+            catalog_key=catalog_key,
         )
 
     if use_lock:
@@ -259,20 +296,26 @@ def _compact_warehouse_impl(
     catalog_path: str,
     threshold: int,
     dry_run: bool,
+    store: object | None = None,
+    catalog_key: str | None = None,
 ) -> dict[str, int]:
     # ------------------------------------------------------------------
-    # 1.  Open the warehouse store (local only for now).
+    # 1.  Open the warehouse store (local dir or s3:// prefix).
     # ------------------------------------------------------------------
-    wh_path = Path(warehouse_path)
-    if not wh_path.is_dir():
-        raise FileNotFoundError(f"Warehouse directory not found: {warehouse_path}")
-
-    store = LocalStore(str(wh_path))
+    if warehouse_path.startswith("s3://"):
+        bucket, _, prefix = warehouse_path.removeprefix("s3://").partition("/")
+        wh_store = _s3_store(bucket, prefix=prefix)
+        wh_path = None
+    else:
+        wh_path = Path(warehouse_path)
+        if not wh_path.is_dir():
+            raise FileNotFoundError(f"Warehouse directory not found: {warehouse_path}")
+        wh_store = LocalStore(str(wh_path))
 
     # ------------------------------------------------------------------
     # 2.  Scan warehouse → group by (cell, year).
     # ------------------------------------------------------------------
-    buckets = _scan_warehouse(store)
+    buckets = _scan_warehouse(wh_store)
     total_files_before = sum(len(v) for v in buckets.values())
 
     print(
@@ -299,7 +342,7 @@ def _compact_warehouse_impl(
 
         print(f"  compacting {n} files in grid_partition={cell}/year={year_str} …")
         try:
-            new_fm = _compact_group_impl(file_metas, out_key, store)
+            new_fm = _compact_group_impl(file_metas, out_key, wh_store)
             # Replace the in-memory bucket entry with the single new file so
             # the catalog rebuild below sees the correct current state.
             buckets[(cell, year_str)] = [new_fm]
@@ -323,7 +366,7 @@ def _compact_warehouse_impl(
     #     one snapshot.  This is equivalent to Hive's MSCK REPAIR TABLE —
     #     simple, correct, and takes < 1 s for typical warehouse sizes.
     # ------------------------------------------------------------------
-    download_catalog(catalog_path)
+    download_catalog(catalog_path, store=store, catalog_key=catalog_key)
     catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path)
 
     # Drop and recreate the table to clear all stale manifest entries.
@@ -338,15 +381,22 @@ def _compact_warehouse_impl(
     table = get_or_create(catalog)
 
     # Collect all surviving part files (after compaction).
-    current_buckets = _scan_warehouse(store)
-    all_paths = [str(wh_path / fm.s3_key) for fms in current_buckets.values() for fm in fms]
+    current_buckets = _scan_warehouse(wh_store)
+    if wh_path is not None:
+        all_paths = [str(wh_path / fm.s3_key) for fms in current_buckets.values() for fm in fms]
+    else:
+        all_paths = [
+            f"{warehouse_path.rstrip('/')}/{fm.s3_key}"
+            for fms in current_buckets.values()
+            for fm in fms
+        ]
     total_files_after = len(all_paths)
 
     if all_paths:
         table.add_files(all_paths)
         print(f"Catalog rebuilt: {total_files_after} files registered in one snapshot.")
 
-    upload_catalog(catalog_path)
+    upload_catalog(catalog_path, store=store, catalog_key=catalog_key)
 
     return {
         "buckets_scanned": len(buckets),

@@ -205,6 +205,24 @@ class Index:
                     hashes.add(bytes(h))
         return hashes
 
+    def count_active(self) -> int:
+        """Number of non-deleted rows (unique ingested items), streamed.
+
+        Streams the ``deleted`` column in batches so it stays memory-bounded
+        regardless of index size, and excludes soft-deleted rows (unlike a raw
+        Parquet footer row count).
+        """
+        try:
+            raw = bytes(obstore.get(self._store, self._key).bytes())
+        except FileNotFoundError:
+            return 0
+        pf = pq.ParquetFile(io.BytesIO(raw))
+        active = 0
+        for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["deleted"]):
+            deleted = batch.column("deleted")
+            active += int(pc.sum(pc.invert(deleted).cast(pa.int32())).as_py())
+        return active
+
 
 def migrate_indices(
     store: object,

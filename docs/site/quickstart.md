@@ -141,6 +141,6 @@ df = con.execute(f"""
 
 ```python
 catalog.stats()              # per-partition row/file counts
-catalog.unique_item_count()  # unique STAC items (from hash index)
+catalog.unique_item_count()  # active STAC items (from the unified index)
 catalog.info()               # grid metadata (type, resolution, boundaries)
 ```

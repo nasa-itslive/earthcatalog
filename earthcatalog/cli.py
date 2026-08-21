@@ -286,9 +286,8 @@ def info(
     typer.echo(f"  Resolution    : {info.grid_resolution}")
     typer.echo(f"  Warehouse     : {warehouse}")
 
-    hash_index_path = table.properties.get(PROP_HASH_INDEX_PATH)
-    if hash_index_path:
-        typer.echo(f"  Hash index    : {hash_index_path}")
+    index_path = table.properties.get(PROP_HASH_INDEX_PATH) or f"{warehouse.rstrip('/')}_index.parquet"
+    typer.echo(f"  Unique index  : {index_path}")
 
     stats = info.stats(table)
     total_rows = sum(s["row_count"] for s in stats)

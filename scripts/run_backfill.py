@@ -110,7 +110,9 @@ def run(
     if warehouse.startswith("s3://"):
         wh_no_scheme = warehouse.removeprefix("s3://")
         wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
-        warehouse_store = _make_s3_store(wh_bucket, prefix=wh_prefix)
+        # Bucket-level store: the pipeline uses full bucket keys
+        # (warehouse_prefix / index_key), so a prefix here would double-prefix.
+        warehouse_store = _make_s3_store(wh_bucket)
     else:
         Path(warehouse).mkdir(parents=True, exist_ok=True)
         warehouse_store = LocalStore(str(warehouse))

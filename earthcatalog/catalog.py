@@ -7,8 +7,6 @@ discovery into a single object.
 
 from __future__ import annotations
 
-import io
-import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -78,34 +76,6 @@ def _parse_dt(value: str | datetime) -> datetime:
         "Supported formats: ISO 8601 (e.g., '2020-01-15', '2020-01-15T10:30:00Z'), "
         "year-month (e.g., '2020-01'), or year only (e.g., '2020')."
     )
-
-
-def _parquet_row_count_from_store(store, obstore_key: str) -> int:
-    """Read row count from a remote Parquet file's footer only — no full download."""
-    import pyarrow.parquet as pq
-
-    head_result = obstore.head(store, obstore_key)
-    file_size = head_result["size"] if isinstance(head_result, dict) else head_result.size
-
-    suffix = obstore.get_range(store, obstore_key, start=file_size - 8, end=file_size)
-    if hasattr(suffix, "to_bytes"):
-        suffix = suffix.to_bytes()
-    elif not isinstance(suffix, bytes):
-        suffix = bytes(suffix)
-    metadata_len = struct.unpack("<i", suffix[:4])[0]
-
-    footer = obstore.get_range(
-        store,
-        obstore_key,
-        start=file_size - 8 - metadata_len,
-        end=file_size,
-    )
-    if hasattr(footer, "to_bytes"):
-        footer = footer.to_bytes()
-    elif not isinstance(footer, bytes):
-        footer = bytes(footer)
-
-    return pq.ParquetFile(io.BytesIO(footer)).metadata.num_rows
 
 
 def _build_stats_cache(table) -> list[dict]:
@@ -227,30 +197,30 @@ class CatalogInfo:
         """Total Parquet file count from Iceberg snapshot manifests."""
         return sum(s["file_count"] for s in self._ensure_stats(table))
 
-    def unique_item_count(self, table, store, default_hash_index_path: str | None = None) -> int:
-        """Row count of the hash-index Parquet file (footer read only)."""
-        import pyarrow.parquet as pq
+    def unique_item_count(self, table, store, default_index_path: str | None = None) -> int:
+        """Number of active (non-deleted) items in the unified index."""
+        from obstore.store import LocalStore
 
-        hash_index_path = table.properties.get("earthcatalog.hash_index_path")
-        if hash_index_path is None:
-            hash_index_path = default_hash_index_path
-        if not hash_index_path:
+        from earthcatalog.index import Index
+
+        index_path = table.properties.get("earthcatalog.hash_index_path") or default_index_path
+        if not index_path:
             return 0
 
         try:
-            if hash_index_path.startswith("s3://"):
+            if index_path.startswith("s3://"):
                 if not store:
                     return 0
-                _, _, rest = hash_index_path.partition("s3://")
+                _, _, rest = index_path.partition("s3://")
                 obstore_key = rest.split("/", 1)[1] if "/" in rest else ""
                 if not obstore_key:
                     return 0
-                return _parquet_row_count_from_store(store, obstore_key)
+                return Index(store, obstore_key).count_active()
 
-            if not Path(hash_index_path).exists():
+            p = Path(index_path)
+            if not p.exists():
                 return 0
-            return pq.ParquetFile(hash_index_path).metadata.num_rows
-
+            return Index(LocalStore(str(p.parent)), p.name).count_active()
         except Exception:
             return 0
 
@@ -426,7 +396,7 @@ def open(
         - ``earthcatalog.db``   (SQLite Iceberg catalog)
         - ``warehouse/``        (GeoParquet files)
         Optionally:
-        - ``warehouse_id_hashes.parquet`` (hash index)
+        - ``warehouse_index.parquet`` (unified index)
     anonymous:
         Force anonymous S3 access when the warehouse path is ``s3://``.
         Auto-detected for stores with ``skip_signature=True``.
@@ -837,14 +807,14 @@ class EarthCatalog:
         return self._info.stats(self._table)
 
     def unique_item_count(self) -> int:
-        """Return the count of unique STAC items from the hash index."""
-        default_hash_index_path = None
+        """Return the count of active (non-deleted) items from the unified index."""
+        default_index_path = None
         if self._catalog is not None:
             warehouse = self._catalog.properties.get("warehouse", "")
             if warehouse:
-                default_hash_index_path = warehouse.rstrip("/") + "_id_hashes.parquet"
+                default_index_path = warehouse.rstrip("/") + "_index.parquet"
 
-        return self._info.unique_item_count(self._table, self._store, default_hash_index_path)
+        return self._info.unique_item_count(self._table, self._store, default_index_path)
 
     def info(self) -> CatalogInfo:
         """Return the grid metadata and catalog statistics object."""
@@ -1260,6 +1230,8 @@ class EarthCatalog:
             catalog_path=local_db,
             threshold=threshold,
             dry_run=dry_run,
+            store=self._store,
+            catalog_key=self._catalog_key,
         )
 
     def garbage_collect(
@@ -1270,8 +1242,8 @@ class EarthCatalog:
     ) -> dict:
         """Remove orphaned STAC items whose source objects left the S3 Inventory.
 
-        Wraps :func:`earthcatalog.pipelines.delete.run_garbage_collection`
-        using this catalog's store, hash index, and warehouse path.
+        Wraps :func:`earthcatalog.gc.run_garbage_collection`
+        using this catalog's store, unified index, and warehouse path.
 
         Detects deletions via a Bloom filter of the current inventory keys,
         then rewrites only the affected GeoParquet files.  See the v2 GC
@@ -1294,7 +1266,8 @@ class EarthCatalog:
         """
         import os
 
-        from earthcatalog.pipelines.delete import run_garbage_collection
+        from earthcatalog.gc import run_garbage_collection
+        from earthcatalog.index import Index
 
         warehouse_root = self._catalog.properties.get("warehouse", "")
 
@@ -1308,20 +1281,16 @@ class EarthCatalog:
         else:
             warehouse_prefix = warehouse_root.rstrip("/") + "/"
 
-        hash_index_path = self._table.properties.get("earthcatalog.hash_index_path", "")
-        if not hash_index_path:
-            hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
-
-        source_index_path = f"{warehouse_root.rstrip('/')}_source_index.parquet"
-
         def _strip(uri: str) -> str:
             return uri.removeprefix("s3://").split("/", 1)[1] if uri.startswith("s3://") else uri
+
+        # Unified index — same path the ingest pipeline writes to.
+        index_key = _strip(f"{warehouse_root.rstrip('/')}_index.parquet")
 
         result = run_garbage_collection(
             inventory_path=inventory_path,
             store=self._store,
-            source_index_key=_strip(source_index_path),
-            hash_index_key=_strip(hash_index_path),
+            index=Index(self._store, index_key),
             warehouse_prefix=warehouse_prefix,
             dry_run=dry_run,
         )
@@ -1404,7 +1373,9 @@ class EarthCatalog:
             rows.append(("Warehouse", warehouse_path))
 
         hash_idx = self._table.properties.get("earthcatalog.hash_index_path")
-        rows.append(("Hash index", "Available" if hash_idx else "Not available"))
+        if not hash_idx and warehouse_path:
+            hash_idx = warehouse_path.rstrip("/") + "_index.parquet"
+        rows.append(("Unique index", "Available" if hash_idx else "Not available"))
 
         table_html = "<table style='border-collapse: collapse; width: 100%; margin: 0;'>"
         for label, value in rows:
@@ -1421,7 +1392,7 @@ class EarthCatalog:
             total_files = self._info.total_files(self._table)
             total_rows = sum(s["row_count"] for s in stats)
             warehouse = self._catalog.properties.get("warehouse", "") if self._catalog else ""
-            default_hi = warehouse.rstrip("/") + "_id_hashes.parquet" if warehouse else None
+            default_hi = warehouse.rstrip("/") + "_index.parquet" if warehouse else None
             unique = self._info.unique_item_count(self._table, self._store, default_hi)
 
             stat_rows = [

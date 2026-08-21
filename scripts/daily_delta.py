@@ -19,13 +19,13 @@ Usage
 
     python scripts/daily_delta.py \
       s3://log-bucket/inventory/.../2026-04-28T01-00Z/manifest.json \
-      --warehouse-hash /tmp/warehouse_id_hashes.parquet \
+      --warehouse-hash /tmp/warehouse_index.parquet \
       --delta-prefix /tmp/delta
 
     # If delta already exists, skips inventory fetch entirely:
     python scripts/daily_delta.py \
       s3://log-bucket/inventory/.../2026-04-28T01-00Z/manifest.json \
-      --warehouse-hash /tmp/warehouse_id_hashes.parquet \
+      --warehouse-hash /tmp/warehouse_index.parquet \
       --delta-prefix /tmp/delta \
       --date 2026-04-27
 """
@@ -433,8 +433,8 @@ def main() -> None:
     parser.add_argument("manifest", help="s3:// URI to today's manifest.json")
     parser.add_argument(
         "--warehouse-hash",
-        default="s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet",
-        help="s3:// URI or local path to warehouse hash index parquet",
+        default="s3://its-live-data/test-space/stac/catalog/warehouse_index.parquet",
+        help="s3:// URI or local path to the unified warehouse index parquet",
     )
     parser.add_argument(
         "--delta-prefix",
