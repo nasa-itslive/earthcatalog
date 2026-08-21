@@ -192,7 +192,7 @@ files — it cannot remove stale references. After compaction the old manifest
 points to deleted files; dropping the table rebuilds it from what physically
 exists on disk.
 
-Run compaction periodically after many incremental runs, or after a backfill
+Run compaction periodically after many incremental runs, or after a large ingest
 that produced a large number of small part files.
 
 ---

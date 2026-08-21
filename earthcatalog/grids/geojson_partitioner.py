@@ -31,7 +31,7 @@ def _load_bytes(path: str) -> bytes:
     if path.startswith("s3://"):
         no_prefix = path.removeprefix("s3://")
         bucket, key = no_prefix.split("/", 1)
-        store = S3Store(bucket=bucket, skip_signature=True)
+        store: S3Store | LocalStore = S3Store(bucket=bucket, skip_signature=True)
         return bytes(obstore.get(store, key).bytes())
     else:
         # Local file — use LocalStore so all I/O stays within obstore

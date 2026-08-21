@@ -155,15 +155,15 @@ class TestEndToEndIncremental:
             warehouse_root=wh,
             stage="direct",
         )
-        summary = ing.run(
-            ("data-bucket", k) for k in keys
-        )
+        summary = ing.run(("data-bucket", k) for k in keys)
         assert summary["items"] == 3
 
         # Index now knows all three source keys.
         assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
         assert _read_warehouse_ids(store, index) == {
-            "item-1", "item-2", "item-3",
+            "item-1",
+            "item-2",
+            "item-3",
         }
 
         # --- Phase 3: GC removes item-1 (dropped from a later inventory) -----

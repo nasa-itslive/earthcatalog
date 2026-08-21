@@ -64,14 +64,23 @@ class TestRunGarbageCollection:
         index = Index(store, "warehouse_index.parquet")
         index.append(
             [
-                {"s3_key": _s3_key("a.stac.json"), "stac_id": "item-A",
-                 "grid_partition": "cellA", "year": 2020},
-                {"s3_key": _s3_key("gone.stac.json"), "stac_id": "item-B",
-                 "grid_partition": "cellA", "year": 2020},
+                {
+                    "s3_key": _s3_key("a.stac.json"),
+                    "stac_id": "item-A",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                },
+                {
+                    "s3_key": _s3_key("gone.stac.json"),
+                    "stac_id": "item-B",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                },
             ]
         )
-        _put_warehouse_file(store, "grid_partition=cellA/year=2020/part_0.parquet",
-                            ["item-A", "item-B"])
+        _put_warehouse_file(
+            store, "grid_partition=cellA/year=2020/part_0.parquet", ["item-A", "item-B"]
+        )
 
         inv = _write_inventory_csv(tmp_path / "inv.csv", ["a.stac.json"])
         head_fn = lambda k: k == _s3_key("a.stac.json")  # noqa: E731
@@ -104,8 +113,12 @@ class TestRunGarbageCollection:
         index = Index(store, "warehouse_index.parquet")
         index.append(
             [
-                {"s3_key": _s3_key("a.stac.json"), "stac_id": "item-A",
-                 "grid_partition": "cellA", "year": 2020},
+                {
+                    "s3_key": _s3_key("a.stac.json"),
+                    "stac_id": "item-A",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                },
             ]
         )
         _put_warehouse_file(store, "grid_partition=cellA/year=2020/part_0.parquet", ["item-A"])
@@ -127,8 +140,12 @@ class TestRunGarbageCollection:
         index = Index(store, "warehouse_index.parquet")
         index.append(
             [
-                {"s3_key": _s3_key("gone.stac.json"), "stac_id": "item-B",
-                 "grid_partition": "cellA", "year": 2020},
+                {
+                    "s3_key": _s3_key("gone.stac.json"),
+                    "stac_id": "item-B",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                },
             ]
         )
         _put_warehouse_file(store, "grid_partition=cellA/year=2020/part_0.parquet", ["item-B"])

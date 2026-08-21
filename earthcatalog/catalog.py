@@ -20,7 +20,7 @@ from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 if TYPE_CHECKING:
     from pyiceberg.table import Table
 
-    from .backfill_config import BackfillConfig
+    from .ingest_config import IngestConfig
 
 from . import store_config
 from .schema import (
@@ -146,11 +146,14 @@ class CatalogInfo:
         if not cells:
             return []
 
-        expr = In("grid_partition", cells)
+        # NB: pyiceberg 0.11's inline stubs describe the *bound* predicate
+        # constructors, not these unbound ones (runtime accepts a plain
+        # string term + python values) — hence the narrow ignores here.
+        expr = In("grid_partition", cells)  # type: ignore[misc,arg-type,call-arg]
         if start_datetime is not None:
-            expr = And(expr, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))
+            expr = And(expr, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))  # type: ignore[misc,arg-type,call-arg,assignment]
         if end_datetime is not None:
-            expr = And(expr, LessThanOrEqual("datetime", _parse_dt(end_datetime)))
+            expr = And(expr, LessThanOrEqual("datetime", _parse_dt(end_datetime)))  # type: ignore[misc,arg-type,call-arg,assignment]
 
         start_year = _parse_dt(start_datetime).year if start_datetime is not None else None
         end_year = _parse_dt(end_datetime).year if end_datetime is not None else None
@@ -765,132 +768,54 @@ class EarthCatalog:
         """Return the grid metadata and catalog statistics object."""
         return self._info
 
+    def ingest_inventory(
+        self,
+        inventory_path: str,
+        *,
+        mode: str = "auto",
+        config: IngestConfig | None = None,
+    ) -> dict:
+        """Ingest an inventory using a (optionally distributed) Dask cluster.
+
+        Delegates to :class:`earthcatalog.pipeline.IngestPipeline`.  *config*
+        (a :class:`earthcatalog.ingest_config.IngestConfig`) holds the tuning
+        knobs (chunk size, compact rows, stage, resume flags, create_client).
+
+        There is one ingest operation: *mode* only controls table handling —
+        ``"full"`` drops and rebuilds the Iceberg table, ``"delta"`` appends,
+        ``"auto"`` appends iff the table has rows.  Input scope (complete
+        inventory vs. newer snapshot vs. precomputed delta parquet) is simply
+        which *inventory_path* you pass; the unified index dedups source
+        keys, so every run is resumable and idempotent.
+
+        With ``stage="ndjson"`` (default) items are staged to per-(cell,
+        year) NDJSON before a memory-bounded compaction to GeoParquet;
+        ``skip_fetch`` resumes from the staged NDJSON.  Distributed runs
+        shard the inventory by part file where possible — workers stream
+        their own files and only the head node commits.
+
+        Returns the run summary dict (``{"items": …, "rows": …}``).
+        """
+        from .pipeline import IngestPipeline
+
+        return IngestPipeline(self, config).run(inventory_path, mode=mode)
+
     def bulk_ingest(
         self,
         inventory_path: str,
         *,
         mode: str = "auto",
-        config: BackfillConfig | None = None,
-    ) -> None:
-        """Ingest an inventory using a (optionally distributed) Dask cluster.
+        config: IngestConfig | None = None,
+    ) -> dict:
+        """Deprecated alias for :meth:`ingest_inventory`."""
+        import warnings
 
-        *config* (a :class:`earthcatalog.backfill_config.BackfillConfig`)
-        holds the tuning knobs (chunk size, compact rows, stage, resume
-        flags, create_client).  *mode* is ``"auto"``, ``"full"``, or
-        ``"delta"`` and selects whether the Iceberg table is rebuilt or
-        appended to.
-
-        The unified index is the source of truth and resume checkpoint:
-        already-ingested source keys are skipped, so a failed run can be
-        re-invoked safely.  With ``stage="ndjson"`` (default) items are
-        staged to per-(cell, year) NDJSON before a memory-bounded compaction
-        to GeoParquet; ``skip_fetch`` resumes from the staged NDJSON.
-        """
-        import os
-        from datetime import UTC
-        from datetime import datetime as _dt
-
-        from earthcatalog.backfill_config import BackfillConfig
-        from earthcatalog.config import GridConfig
-        from earthcatalog.grids import build_partitioner
-
-        if not os.environ.get("AWS_ACCESS_KEY_ID"):
-            raise RuntimeError(
-                "No AWS credentials found in environment. "
-                "bulk_ingest() requires write access to S3. "
-                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
-            )
-
-        cfg = config or BackfillConfig()
-
-        warehouse_root = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///")
-
-        grid_cfg = GridConfig(
-            type=self._info.grid_type,
-            resolution=self._info.grid_resolution,
-            boundaries_path=self._info.boundaries_path,
-            id_field=self._info.id_field,
+        warnings.warn(
+            "EarthCatalog.bulk_ingest() is deprecated; use ingest_inventory()",
+            DeprecationWarning,
+            stacklevel=2,
         )
-        partitioner = build_partitioner(grid_cfg)
-
-        if cfg.staging_prefix is None:
-            date_str = _dt.now(UTC).strftime("%Y%m%d")
-            cfg.staging_prefix = f"bulk_ingest/{date_str}"
-
-        delta = True
-        if mode == "full":
-            delta = False
-        elif mode == "auto":
-            try:
-                n = sum(s["row_count"] for s in self._info.stats(self._table))
-                delta = n > 0
-            except Exception:
-                delta = False
-
-        if self._store and self._catalog_key:
-            self.download_catalog(local_db)
-
-        from .index import Index
-        from .ingest import DaskIngester, Ingester
-        from .inventory import iter_inventory
-
-        if not delta:
-            from pyiceberg.exceptions import NoSuchTableError
-
-            try:
-                self._catalog.drop_table(FULL_NAME)
-            except NoSuchTableError:
-                pass
-            try:
-                self._catalog.create_namespace(NAMESPACE)
-            except Exception:
-                pass
-            self._table = get_or_create(self._catalog, grid_config=grid_cfg)
-
-        warehouse_prefix = warehouse_root.rstrip("/") + "/"
-        if warehouse_prefix.startswith("s3://"):
-            # Store-relative key prefix (obstore keys are relative to the
-            # bucket); the full s3:// URI is passed as warehouse_root so
-            # Iceberg add_files resolves real paths.
-            warehouse_prefix = warehouse_prefix.removeprefix("s3://").split("/", 1)[1]
-        index_key = f"{warehouse_root.rstrip('/')}_index.parquet"
-        if index_key.startswith("s3://"):
-            index_key = index_key.removeprefix("s3://").split("/", 1)[1]
-        index = Index(self._store, index_key)
-
-        kwargs = dict(
-            store=self._store,
-            index=index,
-            table=self._table,
-            partitioner=partitioner,
-            warehouse_prefix=warehouse_prefix,
-            warehouse_root=warehouse_root,
-            batch_size=cfg.chunk_size,
-            compact_rows=cfg.compact_rows,
-            skip_fetch=cfg.skip_fetch,
-            skip_compact=cfg.skip_compact,
-            stage=cfg.stage,
-        )
-
-        if cfg.create_client is not None:
-            # Distributed: materialise (bucket, key) pairs, chunk into shards.
-            pairs = [
-                (b, k)
-                for b, k in iter_inventory(inventory_path, since=cfg.since)
-                if k.endswith(".stac.json")
-            ]
-            if cfg.limit:
-                pairs = pairs[: cfg.limit]
-            shards = [pairs[i : i + cfg.chunk_size] for i in range(0, len(pairs), cfg.chunk_size)]
-            client = cfg.create_client()
-            DaskIngester(**kwargs).run(shards, client=client)
-        else:
-            Ingester(**kwargs).run(iter_inventory(inventory_path, since=cfg.since))
-
-        if self._store and self._catalog_key:
-            self.upload_catalog(local_db)
+        return self.ingest_inventory(inventory_path, mode=mode, config=config)
 
     def download_catalog(self, local_path: str) -> None:
         """Download catalog.db from the backing store to *local_path*."""

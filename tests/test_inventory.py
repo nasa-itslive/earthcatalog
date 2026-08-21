@@ -19,11 +19,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from earthcatalog.inventory import (
+    InventoryShard,
     _coerce_last_modified,
     _iter_inventory,
     _iter_inventory_csv,
     _iter_inventory_manifest,
     _iter_inventory_parquet,
+    iter_inventory_shards,
 )
 
 # ---------------------------------------------------------------------------
@@ -523,9 +525,127 @@ class TestIterInventoryManifest:
         with (
             patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
             patch(
-                "earthcatalog.inventory._get_authenticated_store",
+                "earthcatalog.inventory.get_authenticated_store",
                 return_value="fake-store",
             ),
         ):
             result = list(_iter_inventory("s3://fake-log-bucket/inventory/manifest.json"))
         assert result == ROWS
+
+
+# ---------------------------------------------------------------------------
+# iter_inventory_shards — distributed sharding
+# ---------------------------------------------------------------------------
+
+
+class TestIterInventoryShards:
+    """Sharding: manifest → file-backed shards (workers stream their own
+    files); single-file inventories and exact limits → pair-list shards."""
+
+    def _patch_manifest_s3(self, data_files_bytes):
+        """Patch obstore/auth-store for a 2-part-file manifest inventory."""
+        manifest_key = "inventory/manifest.json"
+        data_keys = [f"inventory/data/part_{i}.parquet" for i in range(len(data_files_bytes))]
+        manifest = _make_manifest_json("fake-log-bucket", data_keys)
+
+        def fake_get(store, key):
+            class _R:
+                def bytes(self_):
+                    if key == manifest_key:
+                        return manifest
+                    idx = int(key.split("part_")[1].split(".")[0])
+                    return data_files_bytes[idx]
+
+            return _R()
+
+        return (
+            patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
+            patch(
+                "earthcatalog.inventory.get_authenticated_store",
+                return_value="fake-store",
+            ),
+        )
+
+    def test_manifest_shards_by_part_file(self):
+        """manifest.json → one file-backed shard per part file; workers
+        stream the part files themselves via iter_pairs()."""
+        data1 = _make_parquet_bytes(ROWS[:2])
+        data2 = _make_parquet_bytes(ROWS[2:])
+        p1, p2 = self._patch_manifest_s3([data1, data2])
+        with p1, p2:
+            shards = iter_inventory_shards(
+                "s3://fake-log-bucket/inventory/manifest.json",
+                suffix=".stac.json",
+            )
+            pairs = [pair for s in shards for pair in s.iter_pairs()]
+
+        assert len(shards) == 2
+        assert all(not s.pairs and s.files for s in shards), "must shard by part file"
+        assert shards[0].files == ("inventory/data/part_0.parquet",)
+        assert shards[0].store == "fake-store"
+        assert pairs == ROWS
+
+    def test_manifest_groups_part_files(self):
+        """files_per_shard groups N part files into fewer, larger shards."""
+        files = [_make_parquet_bytes(ROWS[:1]) for _ in range(4)]
+        p1, p2 = self._patch_manifest_s3(files)
+        with p1, p2:
+            shards = iter_inventory_shards(
+                "s3://fake-log-bucket/inventory/manifest.json",
+                files_per_shard=2,
+            )
+        assert [s.files for s in shards] == [
+            ("inventory/data/part_0.parquet", "inventory/data/part_1.parquet"),
+            ("inventory/data/part_2.parquet", "inventory/data/part_3.parquet"),
+        ]
+
+    def test_file_backed_shard_filters_suffix_and_since_on_worker(self):
+        """suffix and since are applied at iter_pairs() time, wherever the
+        shard is consumed."""
+        rows = [("b", "a.stac.json"), ("b", "notes.txt"), ("b", "c.stac.json")]
+        data = _make_parquet_bytes(rows, lm_dates=[_NEW, _NEW, _OLD])
+        p1, p2 = self._patch_manifest_s3([data])
+        with p1, p2:
+            shards = iter_inventory_shards(
+                "s3://fake-log-bucket/inventory/manifest.json",
+                since=_SINCE,
+                suffix=".stac.json",
+            )
+            pairs = list(shards[0].iter_pairs())
+
+        assert len(shards) == 1
+        # notes.txt dropped by suffix; c.stac.json dropped by since (old).
+        assert pairs == [("b", "a.stac.json")]
+
+    def test_single_file_falls_back_to_pair_shards(self, tmp_path):
+        """A single parquet inventory cannot be split by file → pair-list
+        shards of chunk_size pairs, suffix-filtered up front."""
+        rows = [("b", f"k{i}.stac.json") for i in range(5)] + [("b", "k9.txt")]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        shards = iter_inventory_shards(str(p), chunk_size=2, suffix=".stac.json")
+
+        assert [len(s.pairs) for s in shards] == [2, 2, 1]
+        assert all(s.files == () for s in shards)
+        assert [pair for s in shards for pair in s.iter_pairs()] == rows[:5]
+
+    def test_exact_limit_applied_across_shards(self, tmp_path):
+        """An exact limit needs global knowledge → materialise and slice."""
+        rows = [("b", f"k{i}.stac.json") for i in range(5)]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        shards = iter_inventory_shards(str(p), chunk_size=2, limit=3)
+
+        pairs = [pair for s in shards for pair in s.iter_pairs()]
+        assert pairs == rows[:3]
+
+    def test_shard_limit_caps_pairs_at_iteration_time(self):
+        """A per-shard limit is applied by iter_pairs(), without needing the
+        head to materialise anything."""
+        shard = InventoryShard(
+            pairs=(("b", "a.stac.json"), ("b", "b.stac.json"), ("b", "c.stac.json")),
+            limit=2,
+        )
+        assert list(shard.iter_pairs()) == [("b", "a.stac.json"), ("b", "b.stac.json")]

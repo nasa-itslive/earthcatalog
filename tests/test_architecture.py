@@ -15,8 +15,10 @@ import pathlib
 
 LIB_ROOT = pathlib.Path(__file__).resolve().parent.parent / "earthcatalog"
 
-# catalog.py: 1483 after Phase 4/6/8 (was 1484 on branch start).  Target: <600.
-CATALOG_PY_MAX_LINES = 1483
+# catalog.py: 1042 after extracting the ingest orchestrator into pipeline.py
+# (was 1483 on branch start; includes the temporary bulk_ingest deprecation
+# alias — lower this again once the alias is removed).  Target: <600.
+CATALOG_PY_MAX_LINES = 1050
 
 # Per-module budget.  Tighten as modules are split.
 MODULE_LINE_BUDGETS: dict[str, int] = {
@@ -25,6 +27,8 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     "search.py": 565,
     # Phase 3 target
     "ingest.py": 500,
+    # Extracted from catalog.py — ingest orchestration
+    "pipeline.py": 160,
     # Everything else
     "*": 1600,
 }
@@ -52,9 +56,7 @@ def test_module_line_budgets():
             continue
         budget = MODULE_LINE_BUDGETS.get(py.name, MODULE_LINE_BUDGETS["*"])
         lines = _line_count(py.name)
-        assert lines <= budget, (
-            f"{py.name} is {lines} lines (budget {budget})"
-        )
+        assert lines <= budget, f"{py.name} is {lines} lines (budget {budget})"
 
 
 def test_no_new_store_config_globals():

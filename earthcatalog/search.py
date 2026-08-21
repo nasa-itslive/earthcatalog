@@ -453,11 +453,12 @@ def _norm_date(d: str | None) -> str | None:
 
 def _format_bytes(n: int) -> str:
     """Human-readable byte size."""
+    size = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
-        n /= 1024
-    return f"{n:.1f} PB"
+        if size < 1024:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 def _item_in_datetime_range(item: dict, start: str | None, end: str | None) -> bool:

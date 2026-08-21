@@ -471,8 +471,12 @@ class TestCatalogInfoStatsMethods:
         store = LocalStore(str(tmp_path))
         Index(store, "warehouse_index.parquet").append(
             [
-                {"s3_key": f"s3://b/k{i}.stac.json", "stac_id": f"item-{i}",
-                 "grid_partition": "cellA", "year": 2020}
+                {
+                    "s3_key": f"s3://b/k{i}.stac.json",
+                    "stac_id": f"item-{i}",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                }
                 for i in range(10)
             ]
         )
@@ -510,8 +514,12 @@ class TestCatalogInfoStatsMethods:
         index_path = str(tmp_path / "warehouse_index.parquet")
         Index(LocalStore(str(tmp_path)), "warehouse_index.parquet").append(
             [
-                {"s3_key": f"s3://b/k{i}.stac.json", "stac_id": f"item-{i}",
-                 "grid_partition": "cellA", "year": 2020}
+                {
+                    "s3_key": f"s3://b/k{i}.stac.json",
+                    "stac_id": f"item-{i}",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                }
                 for i in range(42)
             ]
         )
@@ -524,9 +532,7 @@ class TestCatalogInfoStatsMethods:
         assert count_no_default == 0
 
         # With default path, should return the actual count
-        count_with_default = info.unique_item_count(
-            tbl, store=None, default_index_path=index_path
-        )
+        count_with_default = info.unique_item_count(tbl, store=None, default_index_path=index_path)
         assert count_with_default == 42
 
     def test_top_cells_sorted_and_cached(self, tmp_path):

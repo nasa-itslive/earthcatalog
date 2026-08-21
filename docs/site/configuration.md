@@ -1,7 +1,7 @@
 # Configuration
 
 earthcatalog is configured with CLI flags on the `ingest` command (or the
-`BackfillConfig` dataclass when called from Python).  There is no YAML config
+`IngestConfig` dataclass when called from Python).  There is no YAML config
 file; flags are preferred for reproducibility in CI.
 
 ---
@@ -104,8 +104,8 @@ its-live-data,path/to/item.stac.json,2026-04-28T01:00:00.000Z
 ### Delta files
 
 Delta parquets use the **same schema** as the full inventory — only the rows
-differ (new/modified items only). Both `ec.ingest()` and `ec.bulk_ingest()`
-read any supported format.
+differ (new/modified items only). `ec.ingest_inventory()` reads any
+supported format.
 
 ### Manifest (AWS S3 Inventory)
 
@@ -146,7 +146,7 @@ For the **public ITS_LIVE bucket** no credentials are needed
 --resolution   H3 resolution (default: 1)
 ```
 
-### `earthcatalog backfill`
+### `earthcatalog ingest`
 
 ```
 --inventory       S3 Inventory file path

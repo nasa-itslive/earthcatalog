@@ -479,4 +479,3 @@ class TestRunDailyDeltaSkip:
         assert result["skipped"] is False
         assert result["new_items"] == 0
         assert result["accumulated_total"] == 0
-

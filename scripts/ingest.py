@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""CLI entry point for backfill staging pipeline.
+"""CLI entry point for the (re)ingest pipeline.
 
 Can also be imported and called directly from Python::
 
-    from scripts.run_backfill import run
+    from scripts.ingest import run
 
     run(
         inventory="s3://.../manifest.json",
@@ -66,7 +66,7 @@ def run(
     skip_compact: bool = False,
     grid=None,  # Optional GridConfig for fresh (full) builds
     # Scheduler — mutually exclusive with create_client
-    scheduler: str = "synchronous",   # "synchronous" | "local" | "coiled"
+    scheduler: str = "synchronous",  # "synchronous" | "local" | "coiled"
     workers: int = 4,
     threads_per_worker: int = 2,
     coiled_n_workers: int = 10,
@@ -75,7 +75,7 @@ def run(
     # Pass a pre-built Dask client directly (takes precedence over scheduler/coiled_*)
     create_client: Callable[[], object] | None = None,
 ) -> None:
-    """Run the backfill pipeline from Python without shelling out.
+    """Run the ingest pipeline from Python without shelling out.
 
     All path arguments accept ``s3://`` URIs or local filesystem paths.
     Stores are built internally from credentials found in the environment or
@@ -112,7 +112,7 @@ def run(
         wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
         # Bucket-level store: the pipeline uses full bucket keys
         # (warehouse_prefix / index_key), so a prefix here would double-prefix.
-        warehouse_store = _make_s3_store(wh_bucket)
+        warehouse_store: S3Store | LocalStore = _make_s3_store(wh_bucket)
     else:
         Path(warehouse).mkdir(parents=True, exist_ok=True)
         warehouse_store = LocalStore(str(warehouse))
@@ -129,6 +129,7 @@ def run(
 
     if delta and warehouse.startswith("s3://"):
         from earthcatalog.catalog import download_catalog
+
         download_catalog(catalog)
 
     # ------------------------------------------------------------------
@@ -156,7 +157,7 @@ def run(
                 n_workers=coiled_n_workers,
                 worker_vm_types=[coiled_vm_type],
                 region="us-west-2",
-                name="backfill-v3",
+                name="earthcatalog-ingest",
                 worker_options={"nthreads": threads_per_worker},
                 spot_policy="spot_with_fallback",
             )
@@ -193,15 +194,15 @@ def run(
         resolved_client = _make_local
 
     # ------------------------------------------------------------------
-    # Open the catalog and run through EarthCatalog.bulk_ingest
+    # Open the catalog and run through EarthCatalog.ingest_inventory
     # ------------------------------------------------------------------
-    from earthcatalog.backfill_config import BackfillConfig
     from earthcatalog.catalog import (
         EarthCatalog,
         _catalog_info,
         _open_sqlite,
         get_or_create,
     )
+    from earthcatalog.ingest_config import IngestConfig
 
     cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
     table = get_or_create(cat, grid_config=grid)
@@ -213,7 +214,7 @@ def run(
         catalog_key=catalog_key,
     )
 
-    cfg = BackfillConfig(
+    cfg = IngestConfig(
         chunk_size=chunk_size,
         compact_rows=compact_rows,
         limit=limit,
@@ -224,7 +225,7 @@ def run(
         skip_compact=skip_compact,
     )
 
-    ec.bulk_ingest(
+    ec.ingest_inventory(
         inventory_path=inventory,
         mode=mode or ("delta" if delta else "auto"),
         config=cfg,
@@ -232,7 +233,7 @@ def run(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EarthCatalog backfill v2 (staging pipeline)")
+    parser = argparse.ArgumentParser(description="EarthCatalog ingest pipeline")
     parser.add_argument(
         "--inventory", required=True, help="S3 inventory path (CSV, Parquet, or manifest.json)"
     )
@@ -245,9 +246,7 @@ def main() -> None:
         help="Warehouse root (s3:// URI or local path)",
     )
     parser.add_argument("--chunk-size", type=int, default=100_000, help="Items per fetch chunk")
-    parser.add_argument(
-        "--compact-rows", type=int, default=100_000, help="Max rows per GeoParquet"
-    )
+    parser.add_argument("--compact-rows", type=int, default=100_000, help="Max rows per GeoParquet")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--since", default=None, help="Only items modified >= this date (YYYY-MM-DD)"

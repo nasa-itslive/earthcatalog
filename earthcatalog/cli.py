@@ -111,24 +111,25 @@ def ingest(
     lock_key: str | None = typer.Option(
         None,
         "--lock-key",
-        help="Object key for the distributed lock file. "
-        "Defaults to EARTHCATALOG_LOCK_KEY.",
+        help="Object key for the distributed lock file. Defaults to EARTHCATALOG_LOCK_KEY.",
     ),
 ) -> None:
     """Run a full or delta ingest from an S3 inventory into the warehouse.
 
-    Routes through the resumable ``bulk_ingest`` / ``Ingester`` pipeline and
-    the unified index.  A failed run can be re-invoked safely (already-ingested
-    source keys are skipped).  Use ``--mode full`` for a fresh bulk build and
-    ``--mode delta`` for incremental updates (e.g. a daily delta parquet).
+    Routes through the resumable ``ingest_inventory`` / ``Ingester`` pipeline
+    and the unified index.  A failed run can be re-invoked safely
+    (already-ingested source keys are skipped).  Use ``--mode full`` for a
+    fresh build and ``--mode delta`` for incremental updates (e.g. a daily
+    delta parquet).
 
     Grid: use ``--grid h3|s2|utm|geojson`` for fresh full builds.  ``geojson``
     requires ``--boundaries`` (path or s3:// URI) and ``--id-field``.
     """
+
     import os
 
     from earthcatalog.config import GridConfig
-    from scripts.run_backfill import run as run_ingest
+    from scripts.ingest import run as run_ingest
 
     grid_cfg = GridConfig(
         type=grid,
@@ -218,7 +219,9 @@ def info(
     typer.echo(f"  Resolution    : {info.grid_resolution}")
     typer.echo(f"  Warehouse     : {warehouse}")
 
-    index_path = table.properties.get(PROP_HASH_INDEX_PATH) or f"{warehouse.rstrip('/')}_index.parquet"
+    index_path = (
+        table.properties.get(PROP_HASH_INDEX_PATH) or f"{warehouse.rstrip('/')}_index.parquet"
+    )
     typer.echo(f"  Unique index  : {index_path}")
 
     stats = info.stats(table)

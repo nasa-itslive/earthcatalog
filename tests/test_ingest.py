@@ -10,6 +10,7 @@ from obstore.store import MemoryStore
 
 from earthcatalog.index import Index
 from earthcatalog.ingest import DaskIngester, Ingester
+from earthcatalog.inventory import InventoryShard
 
 
 def _inventory(keys: list[str]) -> list[tuple[str, str]]:
@@ -194,15 +195,97 @@ class TestDaskIngester:
         ing.run(shards, client=_FakeClient())
 
         assert len(table.files) == 2  # one parquet per (cell,year) group
-        assert index.known_source_keys() == {
-            f"s3://data-bucket/{k}" for k in keys
-        }
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
 
         all_ids = []
         for f in _list_files(store, "warehouse/"):
             if f.endswith(".parquet") and "index" not in f:
                 all_ids.extend(_read_ids(store, f))
         assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json", "item-c.stac.json"]
+
+
+class TestDaskIngesterShardSpecs:
+    """DaskIngester accepts InventoryShard specs, not just plain pair lists."""
+
+    def _make(self, store, index, table, *, stage="direct"):
+        return DaskIngester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage=stage,
+            warehouse_prefix="warehouse/",
+        )
+
+    class _FakeClient:
+        def map(self, fn, shards):
+            return [fn(s) for s in shards]
+
+    def test_pair_spec_shards(self):
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        ing = self._make(store, index, table)
+        keys = ["a.stac.json", "b.stac.json", "c.stac.json"]
+        shards = [
+            InventoryShard(pairs=tuple(_inventory(keys[:2]))),
+            InventoryShard(pairs=tuple(_inventory(keys[2:]))),
+        ]
+        summary = ing.run(shards, client=self._FakeClient())
+
+        assert summary["items"] == 3
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
+
+    def test_file_backed_shard_streams_pairs_on_worker(self):
+        """A file-backed shard (inventory part file in a store) is read by
+        the worker itself — the head never materialises the pairs."""
+        import pyarrow as pa
+
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        table = _FakeTable()
+        keys = ["a.stac.json", "b.stac.json", "notes.txt"]
+        buf = io.BytesIO()
+        pq.write_table(
+            pa.table(
+                {
+                    "bucket": pa.array(["data-bucket"] * len(keys), type=pa.string()),
+                    "key": pa.array(keys, type=pa.string()),
+                }
+            ),
+            buf,
+        )
+        store.put("inv/part_0.parquet", buf.getvalue())
+
+        ing = self._make(store, index, table)
+        shard = InventoryShard(
+            files=("inv/part_0.parquet",),
+            store=store,
+            suffix=".stac.json",
+        )
+        ing.run([shard], client=self._FakeClient())
+
+        # notes.txt filtered out by the shard's suffix, on the "worker".
+        assert index.known_source_keys() == {
+            "s3://data-bucket/a.stac.json",
+            "s3://data-bucket/b.stac.json",
+        }
 
 
 class TestNdjsonMode:
@@ -424,7 +507,8 @@ class TestMemoryBoundedCompact:
         ing.run(_inventory(keys))
 
         part_files = [
-            k for k in _list_files(store, "warehouse/")
+            k
+            for k in _list_files(store, "warehouse/")
             if k.endswith(".parquet") and "index" not in k
         ]
         assert len(part_files) == 3, part_files
@@ -468,11 +552,16 @@ class TestMemoryBoundedCompact:
         ing.run(_inventory(keys))
 
         part_files = [
-            k for k in _list_files(store, "warehouse/")
+            k
+            for k in _list_files(store, "warehouse/")
             if k.endswith(".parquet") and "index" not in k
         ]
         assert len(part_files) == 1
-        assert _read_ids(store, part_files[0]) == ["item-p1.stac.json", "item-p2.stac.json", "item-p3.stac.json"]
+        assert _read_ids(store, part_files[0]) == [
+            "item-p1.stac.json",
+            "item-p2.stac.json",
+            "item-p3.stac.json",
+        ]
 
     def test_exact_dedup_keeps_every_unique_item(self):
         """Duplicate NDJSON lines are deduped exactly — no legitimate item is
@@ -611,6 +700,6 @@ class TestMemoryBoundedCompact:
                 return next(self._chunks)
 
         # 'a' split so the newline lands at a chunk boundary.
-        chunks = [b'{"id": "item-a", "props":', b' {"x": 1}}\n{"id": "item-b"', b'}\n']
+        chunks = [b'{"id": "item-a", "props":', b' {"x": 1}}\n{"id": "item-b"', b"}\n"]
         items = list(iter_ndjson_lines(_FakeStream(chunks)))
         assert [i["id"] for i in items] == ["item-a", "item-b"]

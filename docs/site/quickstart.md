@@ -7,16 +7,16 @@ no serialization overhead, no infrastructure.
 
 ## Bulk ingest
 
-First-time full backfill from an S3 Inventory file. Drops any existing table and
+First-time full ingest from an S3 Inventory file. Drops any existing table and
 recreates it from scratch.
 
 ```python
-from earthcatalog.backfill_config import BackfillConfig
+from earthcatalog.ingest_config import IngestConfig
 
-catalog.bulk_ingest(
+catalog.ingest_inventory(
     "s3://bucket/inventory/full.parquet",
     mode="full",
-    config=BackfillConfig(create_client=lambda: coiled.Client(n_workers=100)),
+    config=IngestConfig(create_client=lambda: coiled.Client(n_workers=100)),
 )
 ```
 
@@ -25,7 +25,7 @@ For smaller inventories the single-node path works without Dask (the default
 memory):
 
 ```python
-catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full")
+catalog.ingest_inventory("s3://bucket/inventory/full.parquet", mode="full")
 ```
 
 Or from the CLI:
@@ -43,7 +43,7 @@ Daily incremental updates. Appends new files to the existing table without
 overwriting, and updates the unified index for duplicate detection.
 
 ```python
-catalog.bulk_ingest("s3://bucket/delta/2026-04-28.parquet", mode="delta")
+catalog.ingest_inventory("s3://bucket/delta/2026-04-28.parquet", mode="delta")
 ```
 
 Or from the CLI:

@@ -76,9 +76,7 @@ class TestIcebergRebuildAfterGC:
         tbl.add_files(part_paths)
 
         # Verify Iceberg currently points at part_000000.parquet.
-        registered_before = [
-            task.file.file_path for task in tbl.scan().plan_files()
-        ]
+        registered_before = [task.file.file_path for task in tbl.scan().plan_files()]
         assert any("part_000000.parquet" in p for p in registered_before)
 
         # Simulate GC: rewrite part_000000 → gc_*.parquet (drop "deleted"),
@@ -109,12 +107,10 @@ class TestIcebergRebuildAfterGC:
         tbl2 = cat2.load_table(FULL_NAME)
         registered_after = [task.file.file_path for task in tbl2.scan().plan_files()]
 
-        assert not any(
-            "part_000000.parquet" in p for p in registered_after
-        ), "deleted part_000000 still registered"
-        assert any(
-            "gc_" in p for p in registered_after
-        ), "gc_* file not registered after rebuild"
+        assert not any("part_000000.parquet" in p for p in registered_after), (
+            "deleted part_000000 still registered"
+        )
+        assert any("gc_" in p for p in registered_after), "gc_* file not registered after rebuild"
 
     def test_gc_dry_run_does_not_rebuild(self, tmp_path, monkeypatch):
         """dry_run=True must skip the Iceberg rebuild entirely."""

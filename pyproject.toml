@@ -81,6 +81,28 @@ ignore = ["E501"]                   # line length enforced by formatter
 quote-style = "double"
 indent-style = "space"
 
+[tool.mypy]
+python_version = "3.12"
+
+# Third-party libs without py.typed markers — runtime-verified, stub-less.
+[[tool.mypy.overrides]]
+module = [
+  "pyarrow.*",
+  "obstore.*",
+  "h3.*",
+  "s2geometry.*",
+  "pybloom_live.*",
+  "coiled.*",
+]
+ignore_missing_imports = true
+
 [tool.setuptools_scm]
 version_scheme = "no-guess-dev"
 local_scheme = "node-and-date"
+
+[dependency-groups]
+dev = [
+    "pandas-stubs>=3.0.5.260730",
+    "types-pyyaml",
+    "types-shapely>=2.1.0.20260728",
+]

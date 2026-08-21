@@ -44,7 +44,9 @@ _DEFAULT_ERROR_RATE = 0.0001
 _DEFAULT_CONCURRENCY = 64
 
 
-def build_inventory_bloom(inventory_path: str, error_rate: float = _DEFAULT_ERROR_RATE) -> ScalableBloomFilter:
+def build_inventory_bloom(
+    inventory_path: str, error_rate: float = _DEFAULT_ERROR_RATE
+) -> ScalableBloomFilter:
     """Stream the S3 Inventory into a Bloom filter of current keys."""
     bloom = ScalableBloomFilter(
         initial_capacity=100_000,
@@ -106,7 +108,9 @@ def confirm_deletions(
     return confirmed
 
 
-def _list_partition_files(store: object, warehouse_prefix: str, cell: str, year: int | None) -> list[str]:
+def _list_partition_files(
+    store: object, warehouse_prefix: str, cell: str, year: int | None
+) -> list[str]:
     """List GeoParquet keys in one (cell, year) partition, newest first."""
     year_str = str(year) if year is not None else "unknown"
     prefix = f"{warehouse_prefix}grid_partition={cell}/year={year_str}/"
@@ -120,7 +124,9 @@ def _list_partition_files(store: object, warehouse_prefix: str, cell: str, year:
     return keys
 
 
-def rewrite_file_without_orphans(file_key: str, orphaned_ids: set[str], store: object) -> tuple[str, int]:
+def rewrite_file_without_orphans(
+    file_key: str, orphaned_ids: set[str], store: object
+) -> tuple[str, int]:
     """Rewrite the GeoParquet at *file_key*, dropping *orphaned_ids*, to ``gc_*``."""
     raw = bytes(obstore.get(store, file_key).bytes())
     tbl = pq.ParquetFile(io.BytesIO(raw)).read()

@@ -17,7 +17,9 @@ import io
 import json
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain, islice
 
 import obstore
 import pyarrow.parquet as pq
@@ -135,7 +137,7 @@ def iter_inventory_parquet(
     since: datetime | None = None,
 ) -> Iterator[tuple[str, str]]:
     if isinstance(inventory_path, io.BytesIO):
-        source = inventory_path
+        source: str | io.BytesIO = inventory_path
     elif inventory_path.startswith("s3://"):
         source = io.BytesIO(_fetch_inventory_bytes(inventory_path))
     else:
@@ -221,6 +223,89 @@ def iter_inventory(
         )
     else:
         yield from iter_inventory_csv(inventory_path, since=since)
+
+
+# ---------------------------------------------------------------------------
+# Distributed sharding
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InventoryShard:
+    """One unit of distributed ingest work.
+
+    Prefer the file-backed form: *files* are inventory part-file keys (with
+    *store* pointing at the bucket that holds them) that each worker reads
+    itself, so only the key list — never the (bucket, key) pairs — crosses
+    the wire to workers.  The *pairs* form carries materialised pairs for
+    inventories that cannot be split by file (single CSV / Parquet) or when
+    an exact global ``limit`` was requested.  *since* / *suffix* / *limit*
+    are applied by :meth:`iter_pairs` at iteration time, on whichever node
+    consumes the shard.
+    """
+
+    files: tuple[str, ...] = ()
+    pairs: tuple[tuple[str, str], ...] = ()
+    store: object = None
+    since: datetime | None = None
+    suffix: str | None = None
+    limit: int | None = None
+
+    def iter_pairs(self) -> Iterator[tuple[str, str]]:
+        """Yield this shard's (bucket, key) pairs, applying since/suffix/limit."""
+        it = self._iter_raw()
+        if self.suffix:
+            it = (pair for pair in it if pair[1].endswith(self.suffix))
+        if self.limit is not None:
+            it = islice(it, self.limit)
+        return it
+
+    def _iter_raw(self) -> Iterator[tuple[str, str]]:
+        if self.pairs:
+            return iter(self.pairs)
+        return chain.from_iterable(
+            iter_inventory_file_from_store(self.store, key, since=self.since) for key in self.files
+        )
+
+
+def iter_inventory_shards(
+    inventory_path: str,
+    *,
+    chunk_size: int = 100_000,
+    since: datetime | None = None,
+    suffix: str | None = None,
+    limit: int | None = None,
+    files_per_shard: int = 1,
+) -> list[InventoryShard]:
+    """Split *inventory_path* into :class:`InventoryShard` work units.
+
+    A ``manifest.json`` inventory shards naturally by part file: each shard
+    references one (or ``files_per_shard``) part files that workers stream
+    themselves, so the head node never materialises the full pair list.
+    Single-file inventories (CSV / Parquet) — or an exact global *limit*,
+    which needs full knowledge of the pair stream — fall back to pair-list
+    shards of *chunk_size* pairs each, with *suffix* filtering applied up
+    front so the limit counts only matching keys.
+    """
+    if limit is not None or not inventory_path.endswith("manifest.json"):
+        pairs = [
+            (b, k)
+            for b, k in iter_inventory(inventory_path, since=since)
+            if suffix is None or k.endswith(suffix)
+        ]
+        if limit is not None:
+            pairs = pairs[:limit]
+        return [
+            InventoryShard(pairs=tuple(pairs[i : i + chunk_size]))
+            for i in range(0, len(pairs), chunk_size)
+        ]
+
+    _source_bucket, dest_store, data_keys = _parse_manifest(inventory_path)
+    files_per_shard = max(1, files_per_shard)
+    groups = [data_keys[i : i + files_per_shard] for i in range(0, len(data_keys), files_per_shard)]
+    return [
+        InventoryShard(files=tuple(g), store=dest_store, since=since, suffix=suffix) for g in groups
+    ]
 
 
 # ---------------------------------------------------------------------------

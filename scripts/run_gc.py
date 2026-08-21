@@ -130,7 +130,4 @@ else:
     if confirmed == 0:
         print("No orphans found — warehouse is clean.")
     else:
-        print(
-            f"GC complete: {removed:,} rows removed across "
-            f"{rewritten:,} rewritten files."
-        )
+        print(f"GC complete: {removed:,} rows removed across {rewritten:,} rewritten files.")

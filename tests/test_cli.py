@@ -32,13 +32,13 @@ def test_info_requires_catalog_or_s3():
 
 
 def test_ingest_delegates_to_run(monkeypatch):
-    """earthcatalog ingest forwards the essential knobs to run_backfill.run."""
+    """earthcatalog ingest forwards the essential knobs to scripts.ingest.run."""
     captured = {}
 
     def fake_run(**kwargs):
         captured.update(kwargs)
 
-    import scripts.run_backfill as _mod
+    import scripts.ingest as _mod
 
     monkeypatch.setattr(_mod, "run", fake_run)
 

@@ -72,7 +72,11 @@ class Ingester:
         self._compact_rows = compact_rows
         self._skip_fetch = skip_fetch
         self._skip_compact = skip_compact
-        self._ndjson_prefix = f"{self._warehouse_prefix}/staging/ndjson" if self._warehouse_prefix else "staging/ndjson"
+        self._ndjson_prefix = (
+            f"{self._warehouse_prefix}/staging/ndjson"
+            if self._warehouse_prefix
+            else "staging/ndjson"
+        )
 
     def _full_path(self, rel_key: str) -> str:
         """Map a store-relative key to the full URI Iceberg ``add_files`` needs."""
@@ -252,8 +256,8 @@ class Ingester:
         bucket_dir = f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/"
         jsonl_keys: list[str] = []
         try:
-            for batch in obstore.list(self._store, prefix=bucket_dir):
-                for obj in batch:
+            for listing in obstore.list(self._store, prefix=bucket_dir):
+                for obj in listing:
                     k: str = obj["path"]
                     if k.endswith(".jsonl"):
                         jsonl_keys.append(k)
@@ -281,9 +285,7 @@ class Ingester:
             if n > 0:
                 new_paths.append(out_key)
                 rows += n
-                index_rows.extend(
-                    _to_index_row(it) for it in batch if it.get("_source_key")
-                )
+                index_rows.extend(_to_index_row(it) for it in batch if it.get("_source_key"))
             batch.clear()
 
         for key in sorted(jsonl_keys):
@@ -313,8 +315,11 @@ class Ingester:
 class DaskIngester(Ingester):
     """Distributed variant: shards the inventory and writes via ``client.map``.
 
-    In ``"ndjson"`` stage, workers write per-shard NDJSON and the head
-    compacts + commits once.  In ``"direct"`` stage, each worker runs
+    Each *shard* is an :class:`earthcatalog.inventory.InventoryShard` spec
+    (preferred — the worker streams its own inventory part files, so only
+    file keys cross the wire) or a plain sequence of ``(bucket, key)``
+    pairs.  In ``"ndjson"`` stage, workers write per-shard NDJSON and the
+    head compacts + commits once.  In ``"direct"`` stage, each worker runs
     :meth:`Ingester._write_direct` (write-only GeoParquet) and returns
     ``(new_paths, index_rows, rows)``; the head node then calls
     ``table.add_files()`` and ``index.append()`` exactly once, so the shared
@@ -323,12 +328,14 @@ class DaskIngester(Ingester):
     *client* must expose ``map(fn, shards)`` (a Dask ``Client`` works).
     """
 
-    def run(self, shards, *, client) -> dict:
-        """Ingest each *shard* (a list of ``(bucket, key)`` pairs) in parallel."""
+    def run(self, inventory, *, client=None) -> dict:  # type: ignore[override]
+        """Ingest each shard in *inventory* in parallel; workers stream their own pairs."""
+        if client is None:
+            raise ValueError("DaskIngester.run requires a client exposing map(fn, shards)")
         if self._stage == "ndjson":
-            return self._run_ndjson(shards, client=client)
+            return self._run_ndjson(inventory, client=client)
 
-        results = client.map(self._write_direct_with_fetch, list(shards))
+        results = client.map(self._write_direct_with_fetch, list(inventory))
 
         new_paths: list[str] = []
         index_rows: list[dict] = []
@@ -346,8 +353,8 @@ class DaskIngester(Ingester):
         return {"items": total, "rows": total}
 
     def _write_direct_with_fetch(self, shard):
-        """Fetch each (bucket, key) in *shard*, then write-only fan-out."""
-        items = [self._fetch_fn(b, k) for b, k in shard]
+        """Fetch each pair in *shard*, then write-only fan-out."""
+        items = [self._fetch_fn(b, k) for b, k in _shard_iter_pairs(shard)]
         items = [it for it in items if it is not None]
         return self._write_direct(items)
 
@@ -393,7 +400,7 @@ class DaskIngester(Ingester):
     def _write_ndjson_with_fetch(self, shard_with_index):
         """Fetch a shard, fan out to NDJSON; return the (cell, year) buckets touched."""
         shard_index, shard = shard_with_index
-        items = [self._fetch_fn(b, k) for b, k in shard]
+        items = [self._fetch_fn(b, k) for b, k in _shard_iter_pairs(shard)]
         items = [it for it in items if it is not None]
 
         fo = fan_out(items, self._partitioner) if self._partitioner else items
@@ -404,7 +411,9 @@ class DaskIngester(Ingester):
             buckets[(cell, year)].append(item)
 
         for (cell, year), group in buckets.items():
-            key = f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/shard_{shard_index}.jsonl"
+            key = (
+                f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/shard_{shard_index}.jsonl"
+            )
             self._append_ndjson(key, group)
 
         return list(buckets.keys())
@@ -413,6 +422,13 @@ class DaskIngester(Ingester):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _shard_iter_pairs(shard) -> Iterator[tuple[str, str]]:
+    """Iterate a shard: an :class:`InventoryShard` spec or a plain pair list."""
+    if isinstance(shard, _inventory.InventoryShard):
+        return shard.iter_pairs()
+    return iter(shard)
 
 
 def _year_from_item(item: dict) -> int | None:
