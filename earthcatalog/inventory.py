@@ -4,9 +4,8 @@ Pure I/O functions for streaming ``(bucket, key)`` pairs from AWS S3
 Inventory files (CSV, Parquet, manifest.json) and fetching individual
 STAC JSON objects.  No Iceberg, no fan-out, no write — just read.
 
-Extracted from ``earthcatalog.pipelines.incremental`` so the ingest
-pipeline, garbage-collection pipeline, and daily-delta script can all
-share the same readers.
+Shared by the ingest pipeline, garbage-collection pipeline, and the
+daily-delta script.
 """
 
 from __future__ import annotations
@@ -242,7 +241,7 @@ def fetch_item(bucket: str, key: str) -> dict | None:
 
 
 # Backward-compatible aliases (modules that imported the private names
-# from pipelines.incremental can import from here instead).
+# from the deleted pipelines.incremental module can import from here).
 _iter_inventory_csv = iter_inventory_csv
 _iter_inventory_parquet = iter_inventory_parquet
 _iter_inventory_file_from_store = iter_inventory_file_from_store

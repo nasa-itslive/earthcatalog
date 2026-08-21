@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Daily delta producer for earthcatalog backfill.
+Daily delta producer for earthcatalog ingest.
 
 Reads today's AWS S3 Inventory manifest, hashes all .stac.json item IDs,
-compares against the warehouse hash index, and writes a delta parquet
+compares against the warehouse unified index, and writes a delta parquet
 containing (bucket, key) pairs for items not yet in the warehouse.
 
 Accumulates unconsumed previous deltas so no items are lost if the ingest
@@ -136,15 +136,6 @@ def _stream_inventory_hashes(
 # ---------------------------------------------------------------------------
 
 
-def _download_hash_index(store: S3Store, key: str) -> list[bytes]:
-    raw = bytes(obstore.get(store, key).bytes())
-    pf = pq.ParquetFile(io.BytesIO(raw))
-    hashes: list[bytes] = []
-    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash"]):
-        hashes.extend(batch.column("id_hash").to_pylist())
-    return hashes
-
-
 def _list_pending_deltas(store: S3Store, prefix: str) -> list[str]:
     list_prefix = f"{prefix}/pending/" if prefix else "pending/"
     keys: list[str] = []
@@ -187,14 +178,6 @@ def _write_delta_parquet(rows: list[tuple[str, str, bytes]], store: S3Store, key
 # ---------------------------------------------------------------------------
 
 
-def _download_hash_index_local(path: str) -> list[bytes]:
-    pf = pq.ParquetFile(path)
-    hashes: list[bytes] = []
-    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash"]):
-        hashes.extend(batch.column("id_hash").to_pylist())
-    return hashes
-
-
 def _list_pending_deltas_local(prefix: str) -> list[str]:
     pending_dir = Path(prefix) / "pending"
     if not pending_dir.exists():
@@ -223,10 +206,6 @@ def _write_delta_parquet_local(rows: list[tuple[str, str, bytes]], path: str) ->
     tbl = pa.table({"bucket": buckets, "key": keys, "id_hash": id_hashes})
     pq.write_table(tbl, path, compression="zstd")
     return len(rows)
-
-
-def _build_hash_set(hashes: list[bytes]) -> set[bytes]:
-    return set(hashes)
 
 
 def _load_index_hashes(uri: str) -> set[bytes]:

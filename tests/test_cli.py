@@ -31,8 +31,8 @@ def test_info_requires_catalog_or_s3():
     assert "specify --catalog or --catalog-s3" in result.output
 
 
-def test_backfill_delegates_to_run(monkeypatch):
-    """earthcatalog backfill forwards the essential knobs to run_backfill.run."""
+def test_ingest_delegates_to_run(monkeypatch):
+    """earthcatalog ingest forwards the essential knobs to run_backfill.run."""
     captured = {}
 
     def fake_run(**kwargs):
@@ -45,7 +45,7 @@ def test_backfill_delegates_to_run(monkeypatch):
     result = runner.invoke(
         app,
         [
-            "backfill",
+            "ingest",
             "--inventory",
             "s3://b/inv/manifest.json",
             "--warehouse",

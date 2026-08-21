@@ -1,14 +1,16 @@
 """
-EarthCatalog CLI — wires YAML config to ingest pipelines.
+EarthCatalog CLI.
 
 Usage
 -----
-    # Single-node incremental ingest (GitHub Actions / laptop)
-    earthcatalog incremental --config config/h3_r3.yaml --inventory /tmp/delta.csv
+    # Full (bulk) ingest from an S3 inventory
+    earthcatalog ingest --inventory s3://.../manifest.json --mode full
 
-    # Or pass individual flags without a config file
-    earthcatalog incremental --inventory /tmp/delta.csv \\
-        --catalog /tmp/earthcatalog.db --warehouse /tmp/wh --limit 100
+    # Incremental (delta) ingest
+    earthcatalog ingest --inventory s3://.../delta/pending/delta_2026-04-28.parquet --mode delta
+
+    # Catalog summary
+    earthcatalog info --catalog /tmp/earthcatalog.db --warehouse s3://.../warehouse
 """
 
 from __future__ import annotations
@@ -23,97 +25,12 @@ app = typer.Typer(
 
 
 # ---------------------------------------------------------------------------
-# `incremental` sub-command
+# `ingest` sub-command — full (bulk) / delta ingest from an S3 inventory
 # ---------------------------------------------------------------------------
 
 
 @app.command()
-def incremental(
-    inventory: str = typer.Option(
-        ...,
-        "--inventory",
-        "-i",
-        help="Path or s3:// URI to the S3 Inventory CSV / CSV.gz.",
-    ),
-    config: str | None = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Path to a YAML config file.  When provided, all other options default "
-        "to the values in the file.",
-    ),
-    catalog: str | None = typer.Option(
-        None,
-        "--catalog",
-        help="Path to the SQLite catalog file (overrides config).",
-    ),
-    warehouse: str | None = typer.Option(
-        None,
-        "--warehouse",
-        help="Path to the Iceberg warehouse directory (overrides config).",
-    ),
-    chunk_size: int | None = typer.Option(
-        None,
-        "--chunk-size",
-        help="STAC items per fetch chunk (overrides config).",
-    ),
-    workers: int | None = typer.Option(
-        None,
-        "--workers",
-        help="Thread-pool size for parallel S3 fetches (overrides config).",
-    ),
-    h3_resolution: int | None = typer.Option(
-        None,
-        "--h3-resolution",
-        help="H3 resolution (overrides config grid.resolution).",
-    ),
-    limit: int | None = typer.Option(
-        None,
-        "--limit",
-        help="Stop after processing this many STAC items (for testing).",
-    ),
-) -> None:
-    """Run single-node incremental ingest (for GitHub Actions / laptops)."""
-    from earthcatalog.config import AppConfig, load_config
-    from earthcatalog.pipelines.incremental import run, run_from_config
-
-    if config:
-        cfg = load_config(config)
-        # Apply any CLI overrides on top of the config
-        if catalog:
-            cfg.catalog.db_path = catalog
-        if warehouse:
-            cfg.catalog.warehouse = warehouse
-        if chunk_size is not None:
-            cfg.ingest.chunk_size = chunk_size
-        if workers is not None:
-            cfg.ingest.max_workers = workers
-        if h3_resolution is not None:
-            cfg.grid.resolution = h3_resolution
-
-        run_from_config(inventory, cfg, limit=limit)
-
-    else:
-        # No config file: build defaults and apply CLI flags directly
-        cfg = AppConfig()
-        run(
-            inventory_path=inventory,
-            catalog_path=catalog or cfg.catalog.db_path,
-            warehouse_path=warehouse or cfg.catalog.warehouse,
-            chunk_size=chunk_size or cfg.ingest.chunk_size,
-            max_workers=workers or cfg.ingest.max_workers,
-            limit=limit,
-            h3_resolution=h3_resolution or (cfg.grid.resolution or 3),
-        )
-
-
-# ---------------------------------------------------------------------------
-# `backfill` sub-command — full / delta ingest from an S3 inventory
-# ---------------------------------------------------------------------------
-
-
-@app.command()
-def backfill(
+def ingest(
     inventory: str = typer.Option(
         ...,
         "--inventory",
@@ -133,7 +50,7 @@ def backfill(
     mode: str = typer.Option(
         "auto",
         "--mode",
-        help="'full' (rebuild from scratch), 'delta' (append), or 'auto'.",
+        help="'full' (rebuild from scratch), 'delta' (incremental append), or 'auto'.",
     ),
     limit: int | None = typer.Option(
         None,
@@ -158,12 +75,12 @@ def backfill(
     skip_fetch: bool = typer.Option(
         False,
         "--skip-fetch",
-        help="Resume: skip Stage A (fetch + NDJSON staging), only compact staged NDJSON.",
+        help="Resume: skip fetch + staging, only compact staged data.",
     ),
     skip_compact: bool = typer.Option(
         False,
         "--skip-compact",
-        help="Only run Stage A (fetch + NDJSON staging); leave compaction for later.",
+        help="Only fetch + stage; leave compaction for a later run.",
     ),
     grid: str = typer.Option(
         "h3",
@@ -185,22 +102,33 @@ def backfill(
         "--id-field",
         help="GeoJSON feature property used as the partition key (--grid geojson).",
     ),
+    catalog_key: str | None = typer.Option(
+        None,
+        "--catalog-key",
+        help="Object key within the bucket for the uploaded catalog.db. "
+        "Defaults to EARTHCATALOG_CATALOG_KEY.",
+    ),
+    lock_key: str | None = typer.Option(
+        None,
+        "--lock-key",
+        help="Object key for the distributed lock file. "
+        "Defaults to EARTHCATALOG_LOCK_KEY.",
+    ),
 ) -> None:
     """Run a full or delta ingest from an S3 inventory into the warehouse.
 
-    Equivalent to the old ``scripts/run_backfill.py`` but with the legacy
-    staging/hash-index knobs removed — it routes through the resumable
-    ``bulk_ingest`` / ``Ingester`` pipeline and the unified index.
-
-    Resume: a failed run can be resumed safely (already-ingested source keys
-    are skipped).  ``--skip-fetch`` resumes from staged NDJSON; ``--skip-compact``
-    only stages NDJSON for a later compaction.
+    Routes through the resumable ``bulk_ingest`` / ``Ingester`` pipeline and
+    the unified index.  A failed run can be re-invoked safely (already-ingested
+    source keys are skipped).  Use ``--mode full`` for a fresh bulk build and
+    ``--mode delta`` for incremental updates (e.g. a daily delta parquet).
 
     Grid: use ``--grid h3|s2|utm|geojson`` for fresh full builds.  ``geojson``
     requires ``--boundaries`` (path or s3:// URI) and ``--id-field``.
     """
+    import os
+
     from earthcatalog.config import GridConfig
-    from scripts.run_backfill import run as run_backfill
+    from scripts.run_backfill import run as run_ingest
 
     grid_cfg = GridConfig(
         type=grid,
@@ -209,10 +137,14 @@ def backfill(
         id_field=id_field,
     )
 
-    run_backfill(
+    run_ingest(
         inventory=inventory,
         catalog=catalog,
         warehouse=warehouse,
+        catalog_key=catalog_key
+        or os.environ.get("EARTHCATALOG_CATALOG_KEY", "test-space/stac/catalog/earthcatalog.db"),
+        lock_key=lock_key
+        or os.environ.get("EARTHCATALOG_LOCK_KEY", "test-space/stac/catalog/.lock"),
         chunk_size=chunk_size,
         limit=limit,
         mode=mode,
@@ -225,7 +157,7 @@ def backfill(
 
 
 # ---------------------------------------------------------------------------
-# `info` sub-command — catalog summary (grid, stats, hash index)
+# `info` sub-command — catalog summary
 # ---------------------------------------------------------------------------
 
 

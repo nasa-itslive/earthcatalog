@@ -1,15 +1,12 @@
-# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
+# WARNING: Disabled until the AWS credentials secrets are injected.
+# Use workflow_dispatch to test manually.  No schedule yet.
 name: Garbage Collection
 
-# Runs every Sunday at 08:00 UTC — after the daily delta+ingest pipeline.
-# Detects STAC items whose source S3 objects have been deleted, rewrites the
-# affected GeoParquet partition files, and rebuilds the Iceberg catalog.
-#
-# Set the AWS_ROLE_ARN secret to enable.
+# Weekly (Sunday before consolidation): detects STAC items whose source S3
+# objects have been deleted from the inventory, rewrites the affected
+# GeoParquet partition files, and rebuilds the Iceberg catalog + unified index.
 
 on:
-  schedule:
-    - cron: "0 8 * * 0"   # 08:00 UTC every Sunday
   workflow_dispatch:
     inputs:
       inventory_url:
@@ -23,10 +20,11 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   AWS_REGION: us-west-2
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   WAREHOUSE:    s3://its-live-data/test-space/stac/catalog/warehouse
   CATALOG_KEY:  test-space/stac/catalog/earthcatalog.db
   INVENTORY_BASE: s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
@@ -48,12 +46,6 @@ jobs:
 
       - name: Install earthcatalog
         run: uv sync
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve inventory URL
         id: inventory

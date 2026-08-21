@@ -80,11 +80,15 @@ table = catalog.search_to_arrow(bbox=[-60, 60, -20, 85])
 ### 3. Ingest
 
 ```python
-# Daily delta (single-node)
-catalog.ingest("s3://bucket/delta.parquet", mode="delta", update_hash_index=True)
+# Daily delta (single-node) — resumable, NDJSON-staged
+catalog.bulk_ingest("s3://bucket/delta.parquet", mode="delta")
 
 # Large backfill (Dask/Coiled)
-catalog.bulk_ingest("s3://bucket/full.parquet", create_client=coiled.Client)
+from earthcatalog.backfill_config import BackfillConfig
+catalog.bulk_ingest(
+    "s3://bucket/full.parquet",
+    config=BackfillConfig(create_client=coiled.Client),
+)
 ```
 
 ---

@@ -15,43 +15,33 @@ explains every layer from S3 inventory to Iceberg catalog.
                                │ (bucket, key) pairs
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Fetch                                                           │
-│  ThreadPoolExecutor + obstore.get()                              │
+│  Fetch  (Ingester / DaskIngester workers)                        │
+│  obstore.get() — serial on one node, parallel on Dask workers    │
 │  • anonymous for public ITS_LIVE bucket                          │
 │  • --since filter: skip keys unchanged since last run            │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ STAC item dicts
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  fan_out(items, partitioner)                                     │
-│  • map each item to every intersecting H3 cell (boundary-incl.) │
-│  • sanitise property names  (proj:code → proj_code)             │
-│  • round float fields to int32                                   │
-│  • inject grid_partition into each synthetic item                │
+│  NDJSON staging  (stage="ndjson", the default)                   │
+│  • fan_out each item to intersecting cells                       │
+│  • append to per-(cell, year) NDJSON files (resumable)           │
+│  • --skip-fetch resumes from staged NDJSON                       │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ list[synthetic items]
+                               │ staged NDJSON
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  group_by_partition(rows)                                        │
-│  • group by (grid_partition, year)                               │
-│  • sort within each group by (platform, datetime)                │
-│  • each group → exactly one Parquet file                         │
-│  ↳ required for Iceberg add_files() single-value constraint      │
+│  Compact  (memory-bounded)                                       │
+│  • stream NDJSON → dedup by id → sort (platform, datetime)       │
+│  • write part_<uuid>.parquet per compact_rows batch              │
+│  • delete staged NDJSON after the Iceberg/index commit           │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ dict[(cell, year) → [items]]
+                               │ .parquet files on S3
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  write_geoparquet(group, path)                                   │
-│  • rustac.GeoparquetWriter                                       │
-│  • full GeoParquet compliance (geo key, geoarrow.wkb extension) │
-│  • hive path: grid_partition=<cell>/year=<year>/part_N.parquet   │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ .parquet files on disk / S3
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  table.add_files(paths)                                          │
+│  table.add_files(paths) + index.append()                         │
 │  • PyIceberg SQLite catalog  (catalog.db)                        │
-│  • one Iceberg snapshot per run                                  │
+│  • one Iceberg snapshot per run; unified index updated once      │
 │  • catalog.db uploaded to S3 with S3Lock (If-None-Match: *)      │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -181,7 +171,7 @@ earthcatalog uses a **SQLite-backed PyIceberg catalog** (`catalog.db`).
 
 ## Compaction
 
-Over many incremental runs each `(grid_partition, year)` bucket accumulates many small part files. `maintenance/compact.py` merges them.
+Over many incremental runs each `(grid_partition, year)` bucket accumulates many small part files. `scripts/consolidate.py` merges them.
 
 ```
 compact_warehouse(warehouse_path, catalog_path, threshold=2)

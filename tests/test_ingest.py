@@ -230,9 +230,10 @@ class TestNdjsonMode:
         )
         ing.run(_inventory(keys))
 
-        ndjson = _list_files(store, "warehouse/")
-        assert any(k.endswith(".jsonl") for k in ndjson), ndjson
-
+        files = _list_files(store, "warehouse/")
+        # NDJSON is staged, compacted, then deleted after the commit — a full
+        # ndjson run must leave only GeoParquet behind (resumable/idempotent).
+        assert not any(k.endswith(".jsonl") for k in files), files
         assert len(table.files) >= 1
 
     def test_skip_compact_only_stages(self):
@@ -346,7 +347,8 @@ class TestNdjsonMode:
         shards = [_inventory(keys[:2]), _inventory(keys[2:])]
         ing.run(shards, client=_FakeClient())
 
-        assert any(k.endswith(".jsonl") for k in _list_files(store, "warehouse/"))
+        # NDJSON is consumed (deleted) after the head commits; only parquet remains.
+        assert not any(k.endswith(".jsonl") for k in _list_files(store, "warehouse/"))
         assert len(table.files) >= 1
         assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
 
@@ -497,6 +499,7 @@ class TestMemoryBoundedCompact:
             stage="ndjson",
             warehouse_prefix="warehouse/",
             compact_rows=2,
+            skip_compact=True,  # keep the NDJSON staged for the dedup step
         )
         # Run once to build the NDJSON, then append duplicate lines manually to
         # simulate a crash-resume that re-wrote the same items.
@@ -522,7 +525,7 @@ class TestMemoryBoundedCompact:
         # Feed nothing new; Stage A writes nothing, but we compact the stale
         # bucket manually to prove dedup drops duplicates exactly.
         cell, year = "cellA", "2020"
-        np, _, rows = ing2._compact_ndjson_bucket(cell, year)
+        np, _, rows, _ = ing2._compact_ndjson_bucket(cell, year)
 
         # 2 unique items -> exactly 2 rows, never 4, and both ids survive.
         assert rows == 2, rows
@@ -558,6 +561,7 @@ class TestMemoryBoundedCompact:
             stage="ndjson",
             warehouse_prefix="warehouse/",
             compact_rows=10,
+            skip_compact=True,  # keep the NDJSON staged for the stream() assertion
         )
         ing.run(_inventory(["a.stac.json", "b.stac.json"]))
 

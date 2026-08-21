@@ -11,41 +11,52 @@ First-time full backfill from an S3 Inventory file. Drops any existing table and
 recreates it from scratch.
 
 ```python
-import earthcatalog as ec
-from obstore.store import S3Store
+from earthcatalog.backfill_config import BackfillConfig
 
-store = S3Store(bucket="its-live-data", region="us-west-2")
-catalog = ec.open(store=store, base="s3://my-bucket/catalog")
-
-catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
-                     create_client=lambda: coiled.Client(n_workers=100))
+catalog.bulk_ingest(
+    "s3://bucket/inventory/full.parquet",
+    mode="full",
+    config=BackfillConfig(create_client=lambda: coiled.Client(n_workers=100)),
+)
 ```
 
-For smaller inventories the single-node path works without Dask:
+For smaller inventories the single-node path works without Dask (the default
+``stage="ndjson"`` writes resumable NDJSON first, then compacts in bounded
+memory):
 
 ```python
-catalog.ingest("s3://bucket/inventory/full.parquet", mode="full")
+catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full")
+```
+
+Or from the CLI:
+
+```bash
+uv run earthcatalog ingest \
+  --inventory s3://bucket/inventory/full.parquet \
+  --warehouse s3://my-bucket/catalog/warehouse \
+  --mode full
 ```
 
 ## Delta ingest
 
 Daily incremental updates. Appends new files to the existing table without
-overwriting, and updates the hash index for duplicate detection.
+overwriting, and updates the unified index for duplicate detection.
 
 ```python
-catalog.ingest("s3://bucket/delta/2026-04-28.parquet",
-          mode="delta",
-          update_hash_index=True)
+catalog.bulk_ingest("s3://bucket/delta/2026-04-28.parquet", mode="delta")
 ```
 
-Optionally filter by modification date:
+Or from the CLI:
 
-```python
-from datetime import UTC, datetime, timedelta
-
-catalog.ingest("delta.parquet", mode="delta",
-          since=datetime.now(UTC) - timedelta(days=2))
+```bash
+uv run earthcatalog ingest \
+  --inventory s3://bucket/delta/2026-04-28.parquet \
+  --warehouse s3://my-bucket/catalog/warehouse \
+  --mode delta
 ```
+
+Ingest is resumable: `--skip-fetch` resumes compaction of already-staged
+NDJSON, and `--skip-compact` only stages NDJSON for a later run.
 
 ## Search
 

@@ -1,16 +1,14 @@
 name: Daily Catalog Update
 
-# Runs every day at 02:00 UTC.
 # Job 1 (produce-delta): scans the latest S3 Inventory against the unified
 #   index and writes a delta Parquet of new item keys to the pending prefix.
 # Job 2 (ingest): consumes that delta Parquet, fetches the STAC JSONs,
 #   and appends rows to the warehouse + unified index.
 #
-# Set the AWS_ROLE_ARN secret to enable.
+# DISABLED (workflow_dispatch only) until the AWS credentials secrets
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) are injected.  No schedule yet.
 
 on:
-  schedule:
-    - cron: "0 2 * * *"   # 02:00 UTC daily
   workflow_dispatch:
     inputs:
       date:
@@ -44,10 +42,11 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   AWS_REGION: us-west-2
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   WAREHOUSE:       s3://its-live-data/test-space/stac/catalog/warehouse
   WAREHOUSE_INDEX: s3://its-live-data/test-space/stac/catalog/warehouse_index.parquet
   DELTA_PREFIX:    s3://its-live-data/test-space/stac/catalog/delta
@@ -78,12 +77,6 @@ jobs:
 
       - name: Install earthcatalog
         run: uv sync
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve date and paths
         id: manifest
@@ -134,12 +127,6 @@ jobs:
       - name: Install earthcatalog
         run: uv sync
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
       - name: Verify delta file exists
         run: |
           aws s3 ls "${{ needs.produce-delta.outputs.delta_path }}" || {
@@ -176,7 +163,7 @@ jobs:
             EXTRA="--coiled-n-workers ${{ github.event.inputs.coiled_n_workers || '10' }} --coiled-vm-type ${{ github.event.inputs.coiled_vm_type || 'c6i.xlarge' }}"
           fi
 
-          uv run earthcatalog backfill \
+          uv run earthcatalog ingest \
             --inventory   "${{ needs.produce-delta.outputs.delta_path }}" \
             --catalog     /tmp/earthcatalog.db \
             --warehouse   ${{ env.WAREHOUSE }} \

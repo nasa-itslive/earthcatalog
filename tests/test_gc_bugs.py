@@ -47,7 +47,7 @@ class TestIcebergRebuildAfterGC:
         from earthcatalog.catalog import _open_sqlite, get_or_create
         from earthcatalog.config import GridConfig
         from earthcatalog.grids.h3_partitioner import H3Partitioner
-        from earthcatalog.pipelines.backfill import rebuild_iceberg_from_warehouse
+        from earthcatalog.rebuild import rebuild_iceberg_from_warehouse
         from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
         # Build a small catalog with two items in the same partition.
@@ -143,15 +143,15 @@ class TestIcebergRebuildAfterGC:
 
         # Track whether rebuild_iceberg_from_warehouse is called.
         rebuild_called = []
-        import earthcatalog.pipelines.backfill as _bfmod
+        import earthcatalog.rebuild as _rmod
 
-        orig = _bfmod.rebuild_iceberg_from_warehouse
+        orig = _rmod.rebuild_iceberg_from_warehouse
 
         def _spy(*args, **kwargs):
             rebuild_called.append(True)
             return orig(*args, **kwargs)
 
-        monkeypatch.setattr(_bfmod, "rebuild_iceberg_from_warehouse", _spy)
+        monkeypatch.setattr(_rmod, "rebuild_iceberg_from_warehouse", _spy)
 
         from obstore.store import LocalStore as _LS
 
@@ -186,7 +186,7 @@ class TestIcebergRebuildAfterGC:
         )
         from earthcatalog.config import GridConfig
         from earthcatalog.grids.h3_partitioner import H3Partitioner
-        from earthcatalog.pipelines.backfill import rebuild_iceberg_from_warehouse
+        from earthcatalog.rebuild import rebuild_iceberg_from_warehouse
         from earthcatalog.transform import fan_out, group_by_partition, write_geoparquet
 
         item = self._make_item("prop-item", lon=-50.0, lat=70.0)

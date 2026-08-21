@@ -1,6 +1,6 @@
 from earthcatalog._version import __commit__, __version__, __version_full__
 
-from .catalog import CatalogInfo, EarthCatalog, ingest, open
+from .catalog import CatalogInfo, EarthCatalog, open
 from .lock import CatalogLocked, S3Lock
 
 __all__ = [
@@ -11,6 +11,5 @@ __all__ = [
     "__commit__",
     "__version__",
     "__version_full__",
-    "ingest",
     "open",
 ]

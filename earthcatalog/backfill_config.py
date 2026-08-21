@@ -9,11 +9,10 @@ from datetime import datetime
 
 @dataclass
 class BackfillConfig:
-    """Tuning knobs for the (legacy) distributed backfill pipeline.
+    """Tuning knobs for the distributed ingest pipeline.
 
     Pass a single instance to :meth:`EarthCatalog.bulk_ingest` instead of
-    a dozen keyword arguments.  New code should prefer the resumable
-    :class:`earthcatalog.ingest.Ingester`.
+    a dozen keyword arguments.
     """
 
     chunk_size: int = 100_000
@@ -25,6 +24,9 @@ class BackfillConfig:
     delta: bool | None = None
     skip_fetch: bool = False
     skip_compact: bool = False
+    # "ndjson" stages items to per-(cell, year) NDJSON first (resumable,
+    # memory-bounded compaction); "direct" writes GeoParquet immediately.
+    stage: str = "ndjson"
 
     @classmethod
     def from_kwargs(cls, **kwargs) -> BackfillConfig:

@@ -1,5 +1,5 @@
 """
-Tests for scripts/daily_delta.py and scripts/update_hash_index.py.
+Tests for scripts/daily_delta.py.
 
 Uses MemoryStore — no real S3 traffic.
 """
@@ -43,14 +43,6 @@ def _make_manifest(data_keys: list[str]) -> bytes:
         "files": [{"key": k, "MD5checksum": "abc123"} for k in data_keys],
     }
     return json.dumps(manifest).encode()
-
-
-def _make_hash_index_parquet(item_ids: list[str]) -> bytes:
-    hashes = sorted(_hash_id(i) for i in item_ids)
-    tbl = pa.table({"id_hash": pa.array(hashes, type=pa.binary(16))})
-    buf = io.BytesIO()
-    pq.write_table(tbl, buf, compression="zstd")
-    return buf.getvalue()
 
 
 def _make_unified_index(store, key: str, item_ids: list[str]) -> None:
@@ -152,20 +144,6 @@ class TestStreamInventoryHashes:
 
         assert result_hashes[0] == _hash_id("item-abc")
         assert result_hashes[1] == _hash_id("item-def")
-
-
-# ---------------------------------------------------------------------------
-# daily_delta._build_hash_set
-# ---------------------------------------------------------------------------
-
-
-class TestBuildHashSet:
-    def test_dedup(self):
-        from scripts.daily_delta import _build_hash_set
-
-        hashes = [_hash_id("a"), _hash_id("b"), _hash_id("a")]
-        result = _build_hash_set(hashes)
-        assert len(result) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -367,19 +345,6 @@ class TestIsLocal:
 
 
 class TestLocalIO:
-    def test_hash_index_local_roundtrip(self, tmp_path):
-        from scripts.daily_delta import (
-            _download_hash_index_local,
-        )
-
-        hashes = sorted([_hash_id("item-1"), _hash_id("item-2")])
-        tbl = pa.table({"id_hash": pa.array(hashes, type=pa.binary(16))})
-        pq.write_table(tbl, str(tmp_path / "hashes.parquet"))
-
-        result = _download_hash_index_local(str(tmp_path / "hashes.parquet"))
-        assert len(result) == 2
-        assert set(result) == set(hashes)
-
     def test_list_pending_deltas_local(self, tmp_path):
         from scripts.daily_delta import _list_pending_deltas_local
 

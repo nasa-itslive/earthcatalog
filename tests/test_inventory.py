@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from earthcatalog.pipelines.incremental import (
+from earthcatalog.inventory import (
     _coerce_last_modified,
     _iter_inventory,
     _iter_inventory_csv,
@@ -473,9 +473,9 @@ class TestIterInventoryManifest:
             return _FakeResult()
 
         with (
-            patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get),
+            patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
             patch(
-                "earthcatalog.pipelines.incremental._get_authenticated_store",
+                "earthcatalog.inventory._get_authenticated_store",
                 return_value="fake-store",
             ),
         ):
@@ -521,9 +521,9 @@ class TestIterInventoryManifest:
             return _R()
 
         with (
-            patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get),
+            patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
             patch(
-                "earthcatalog.pipelines.incremental._get_authenticated_store",
+                "earthcatalog.inventory._get_authenticated_store",
                 return_value="fake-store",
             ),
         ):

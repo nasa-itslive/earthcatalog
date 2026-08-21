@@ -11,9 +11,12 @@ from obstore.store import S3Store
 store = S3Store(bucket="its-live-data", region="us-west-2")
 catalog = ec.open(store=store, base="s3://bucket/catalog")
 
-# Ingest
-catalog.ingest("delta.parquet", mode="delta", update_hash_index=True)
-catalog.bulk_ingest("full_inventory.parquet", create_client=coiled.Client)
+# Ingest (delta appends to the unified index; resumable by default)
+catalog.bulk_ingest("delta.parquet", mode="delta")
+
+# Full ingest (Dask/Coiled)
+from earthcatalog.backfill_config import BackfillConfig
+catalog.bulk_ingest("full_inventory.parquet", config=BackfillConfig(create_client=coiled.Client))
 
 # Search — returns pystac Items with Iceberg pruning + CQL2 filters
 results = catalog.search(

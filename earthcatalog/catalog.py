@@ -454,61 +454,6 @@ def open(
     )
 
 
-def ingest(
-    inventory_path: str,
-    *,
-    store: object | None = None,
-    base: str | None = None,
-    mode: str = "auto",
-    chunk_size: int = 10000,
-    limit: int | None = None,
-    since: datetime | None = None,
-    update_hash_index: bool = False,
-    update_source_index: bool = False,
-) -> dict:
-    """Open an EarthCatalog and ingest STAC items from an inventory.
-
-    Convenience wrapper around ``EarthCatalog.ingest()`` for callers that
-    only have a store and base path.
-
-    Parameters
-    ----------
-    inventory_path:
-        Path or ``s3://`` URI to an S3 Inventory file.
-    store:
-        An obstore-compatible store (``S3Store``, ``LocalStore``, etc.).
-    base:
-        Base path containing ``earthcatalog.db`` and ``warehouse/``.
-    mode:
-        ``"auto"``, ``"full"``, or ``"delta"``.  See ``EarthCatalog.ingest``.
-    chunk_size:
-        Items per fetch batch.
-    limit:
-        Max items to process.
-    since:
-        Only process items modified after this datetime.
-    update_hash_index:
-        Update the warehouse hash index after ingest.
-    update_source_index:
-        Append source provenance rows (s3_key, stac_id, grid_partition, year)
-        to the source index during ingest.
-
-    Returns
-    -------
-    dict with keys ``items_processed``, ``rows_written``, ``files_registered``.
-    """
-    ec = open(store=store, base=base)
-    return ec.ingest(
-        inventory_path=inventory_path,
-        mode=mode,
-        chunk_size=chunk_size,
-        limit=limit,
-        since=since,
-        update_hash_index=update_hash_index,
-        update_source_index=update_source_index,
-    )
-
-
 # ---------------------------------------------------------------------------
 # EarthCatalog — main facade
 # ---------------------------------------------------------------------------
@@ -820,252 +765,6 @@ class EarthCatalog:
         """Return the grid metadata and catalog statistics object."""
         return self._info
 
-    def ingest(
-        self,
-        inventory_path: str,
-        *,
-        mode: str = "auto",
-        chunk_size: int = 10000,
-        limit: int | None = None,
-        since: datetime | None = None,
-        update_hash_index: bool = False,
-        update_source_index: bool = False,
-    ) -> dict:
-        """Ingest STAC items from an S3 Inventory into the catalog.
-
-        Unified entry point replacing both ``backfill.run_backfill`` and
-        ``incremental.run``.  Handles full backfill (drop+recreate table)
-        and delta append (add files to existing table).
-
-        ``update_source_index`` records provenance rows
-        ``(s3_key, stac_id, grid_partition, year)`` so the weekly garbage
-        collection pipeline can detect deleted S3 objects without
-        re-fetching STAC JSONs.
-
-        The caller is responsible for holding an S3Lock around this call
-        when running against a shared store (use ``self.lock()``).
-        """
-        import os
-        import uuid
-        from concurrent.futures import ThreadPoolExecutor
-
-        from earthcatalog.grids import build_partitioner
-        from earthcatalog.inventory import _fetch_item, _iter_inventory
-
-        from .hash_index import (
-            merge_hashes_from_parquets,
-            read_hashes,
-            write_hashes,
-        )
-        from .source_index import append_source_index
-        from .transform import (
-            fan_out,
-            group_by_partition,
-            write_geoparquet_s3,
-        )
-
-        if not os.environ.get("AWS_ACCESS_KEY_ID"):
-            raise RuntimeError(
-                "No AWS credentials found in environment. "
-                "ingest() requires write access to S3. "
-                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
-            )
-
-        if mode == "auto":
-            try:
-                n = sum(s["row_count"] for s in self._info.stats(self._table))
-                mode = "delta" if n > 0 else "full"
-            except Exception:
-                mode = "full"
-
-        is_delta = mode == "delta"
-
-        from earthcatalog.config import GridConfig
-
-        grid_cfg = GridConfig(
-            type=self._info.grid_type,
-            resolution=self._info.grid_resolution,
-            boundaries_path=self._info.boundaries_path,
-            id_field=self._info.id_field,
-        )
-        partitioner = build_partitioner(grid_cfg)
-
-        warehouse_root = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///") if uri else "/tmp/earthcatalog.db"
-
-        source_index_key = f"{warehouse_root.rstrip('/')}_source_index.parquet"
-        if source_index_key.startswith("s3://"):
-            source_index_key = source_index_key.removeprefix("s3://").split("/", 1)[1]
-
-        if self._store and self._catalog_key:
-            self.download_catalog(local_db)
-
-        if not is_delta:
-            from pyiceberg.exceptions import NoSuchTableError
-
-            try:
-                self._catalog.drop_table(FULL_NAME)
-            except NoSuchTableError:
-                pass
-            try:
-                self._catalog.create_namespace(NAMESPACE)
-            except Exception:
-                pass
-            self._table = get_or_create(self._catalog, grid_config=grid_cfg)
-
-        total_items = 0
-        total_rows = 0
-        written_keys: list[str] = []
-        batch: list[tuple[str, str]] = []
-
-        def _flush(chunk: list[tuple[str, str]]) -> None:
-            nonlocal total_rows
-
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                items = list(filter(None, pool.map(lambda bc: _fetch_item(*bc), chunk)))
-
-            if not items:
-                return
-
-            fo = fan_out(items, partitioner)
-            if not fo:
-                return
-
-            for (cell, year), group_items in group_by_partition(fo).items():
-                year_str = str(year) if year is not None else "unknown"
-                part_tag = uuid.uuid4().hex[:8]
-                s3_key = f"grid_partition={cell}/year={year_str}/part_{part_tag}.parquet"
-                n, _ = write_geoparquet_s3(group_items, self._store, s3_key)
-                if n > 0:
-                    written_keys.append(s3_key)
-                    total_rows += n
-                    if update_source_index:
-                        source_rows = [
-                            (
-                                f"s3://{it['_source_bucket']}/{it['_source_key']}",
-                                it["id"],
-                                cell,
-                                int(year or 0),
-                            )
-                            for it in group_items
-                            if "_source_key" in it
-                        ]
-                        if source_rows:
-                            append_source_index(source_rows, self._store, source_index_key)
-
-        print(f"Ingesting from: {inventory_path}")
-        for bucket, key in _iter_inventory(inventory_path, since=since):
-            if not key.endswith(".stac.json"):
-                continue
-            batch.append((bucket, key))
-            total_items += 1
-            if len(batch) >= chunk_size:
-                _flush(batch)
-                batch.clear()
-            if limit and total_items >= limit:
-                break
-
-        if batch:
-            _flush(batch)
-
-        if written_keys:
-            full_paths = [f"{warehouse_root.rstrip('/')}/{k}" for k in written_keys]
-            batch_sz = 2000
-            for i in range(0, len(full_paths), batch_sz):
-                self._table.add_files(full_paths[i : i + batch_sz])
-            print(f"Registered {len(full_paths)} files in Iceberg catalog.")
-
-        if update_hash_index and written_keys:
-            hash_index_path = self._table.properties.get("earthcatalog.hash_index_path")
-            if not hash_index_path:
-                hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
-                with self._table.transaction() as tx:
-                    tx.set_properties(**{"earthcatalog.hash_index_path": hash_index_path})
-
-            if hash_index_path.startswith("s3://"):
-                import re as _re
-
-                m = _re.match(r"s3://([^/]+)/(.+)", hash_index_path)
-                if m:
-                    hash_key = m.group(2)
-                    existing = read_hashes(self._store, hash_key)
-                    print(f"  Existing hashes: {len(existing):,}")
-                    updated, n_new = merge_hashes_from_parquets(
-                        full_paths, existing, store=self._store
-                    )
-                    print(f"  New hashes: {n_new:,} from {len(full_paths)} files")
-                    write_hashes(updated, self._store, hash_key)
-            else:
-                print("WARN: hash index update skipped — only s3:// paths supported")
-
-        if self._store and self._catalog_key:
-            self.upload_catalog(local_db)
-
-        result = {
-            "items_processed": total_items,
-            "rows_written": total_rows,
-            "files_registered": len(written_keys),
-        }
-        print(f"Done. {total_items} items -> {total_rows} rows in {len(written_keys)} files")
-        return result
-
-    def ingest_resumable(
-        self,
-        inventory_path: str,
-        *,
-        stage: str = "direct",
-        index_key: str | None = None,
-        since: datetime | None = None,
-    ) -> dict:
-        """Ingest via the resumable pipeline (index-as-checkpoint).
-
-        Unlike :meth:`ingest`, this path skips source keys already recorded
-        in the unified index, so a failed run can be re-invoked safely and
-        only unfinished work is reprocessed.  *stage* selects the write path:
-        ``"direct"`` (GeoParquet straight away) or ``"ndjson"`` (fan out to
-        NDJSON first, for PGSTAC interchange).
-        """
-        from earthcatalog.config import GridConfig
-        from earthcatalog.grids import build_partitioner
-        from earthcatalog.index import Index
-        from earthcatalog.ingest import Ingester
-        from earthcatalog.inventory import iter_inventory
-
-        warehouse_root = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///") if uri else "/tmp/earthcatalog.db"
-
-        if index_key is None:
-            index_key = f"{warehouse_root.rstrip('/')}_index.parquet"
-            if index_key.startswith("s3://"):
-                index_key = index_key.removeprefix("s3://").split("/", 1)[1]
-
-        if self._store and self._catalog_key:
-            self.download_catalog(local_db)
-
-        partitioner = build_partitioner(
-            GridConfig(
-                type=self._info.grid_type,
-                resolution=self._info.grid_resolution,
-                boundaries_path=self._info.boundaries_path,
-                id_field=self._info.id_field,
-            )
-        )
-
-        ing = Ingester(
-            store=self._store,
-            index=Index(self._store, index_key),
-            table=self._table,
-            partitioner=partitioner,
-            stage=stage,
-        )
-        summary = ing.run(iter_inventory(inventory_path, since=since))
-
-        if self._store and self._catalog_key:
-            self.upload_catalog(local_db)
-        return summary
-
     def bulk_ingest(
         self,
         inventory_path: str,
@@ -1073,16 +772,19 @@ class EarthCatalog:
         mode: str = "auto",
         config: BackfillConfig | None = None,
     ) -> None:
-        """Ingest large inventories using a distributed Dask cluster.
+        """Ingest an inventory using a (optionally distributed) Dask cluster.
 
         *config* (a :class:`earthcatalog.backfill_config.BackfillConfig`)
-        holds the tuning knobs (chunk size, compact rows, resume flags,
-        hash-index update, etc.).  *mode* is ``"auto"``, ``"full"``, or
+        holds the tuning knobs (chunk size, compact rows, stage, resume
+        flags, create_client).  *mode* is ``"auto"``, ``"full"``, or
         ``"delta"`` and selects whether the Iceberg table is rebuilt or
         appended to.
 
-        This drives the legacy :func:`run_backfill` pipeline (deprecated);
-        new code should use the resumable :meth:`ingest_resumable`.
+        The unified index is the source of truth and resume checkpoint:
+        already-ingested source keys are skipped, so a failed run can be
+        re-invoked safely.  With ``stage="ndjson"`` (default) items are
+        staged to per-(cell, year) NDJSON before a memory-bounded compaction
+        to GeoParquet; ``skip_fetch`` resumes from the staged NDJSON.
         """
         import os
         from datetime import UTC
@@ -1169,6 +871,7 @@ class EarthCatalog:
             compact_rows=cfg.compact_rows,
             skip_fetch=cfg.skip_fetch,
             skip_compact=cfg.skip_compact,
+            stage=cfg.stage,
         )
 
         if cfg.create_client is not None:
@@ -1196,43 +899,6 @@ class EarthCatalog:
     def upload_catalog(self, local_path: str) -> None:
         """Upload catalog.db from *local_path* to the backing store."""
         upload_catalog(local_path, store=self._store)
-
-    def compact(
-        self,
-        threshold: int = 2,
-        dry_run: bool = False,
-    ) -> dict[str, int]:
-        """Compact over-threshold partition buckets and rebuild the Iceberg catalog.
-
-        Wraps :func:`earthcatalog.maintenance.compact.compact_warehouse` using this
-        catalog's warehouse path and local catalog database.
-
-        Parameters
-        ----------
-        threshold:
-            Minimum number of part files in a bucket before it is compacted.
-            Default: 2 (compact any bucket with more than one part file).
-        dry_run:
-            When ``True``, report what *would* be compacted but make no changes.
-
-        Returns
-        -------
-        Summary dict with keys ``buckets_scanned``, ``buckets_compacted``,
-        ``files_before``, ``files_after``.
-        """
-        from earthcatalog.maintenance.compact import compact_warehouse
-
-        warehouse_path = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///")
-        return compact_warehouse(
-            warehouse_path=warehouse_path,
-            catalog_path=local_db,
-            threshold=threshold,
-            dry_run=dry_run,
-            store=self._store,
-            catalog_key=self._catalog_key,
-        )
 
     def garbage_collect(
         self,
@@ -1299,7 +965,7 @@ class EarthCatalog:
         # points to the now-deleted part_*.parquet paths and has no knowledge
         # of the new gc_*.parquet files.  Rebuild the table so searches work.
         if not dry_run and result.get("files_rewritten", 0) > 0:
-            from earthcatalog.pipelines.backfill import rebuild_iceberg_from_warehouse
+            from earthcatalog.rebuild import rebuild_iceberg_from_warehouse
 
             uri = self._catalog.properties.get("uri", "")
             local_db = uri.removeprefix("sqlite:///") if uri else None

@@ -204,23 +204,38 @@ class Ingester:
         return f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/staging.jsonl"
 
     def _compact_all(self, touched: set[tuple[str, str]]) -> int:
-        """Stage B — compact every touched bucket once, then commit once."""
+        """Stage B — compact every touched bucket once, then commit once.
+
+        The staged NDJSON is only deleted *after* the Iceberg/index commit,
+        so ``skip_fetch`` resumes (or a crash) re-compact without duplicating
+        index rows; any GeoParquet written before a crash is simply garbage
+        collected (it is never registered in Iceberg).
+        """
         new_paths: list[str] = []
         index_rows: list[dict] = []
+        consumed: list[str] = []
         total = 0
         for cell, year in sorted(touched):
-            np, ir, n = self._compact_ndjson_bucket(cell, year)
+            np, ir, n, ndjson_keys = self._compact_ndjson_bucket(cell, year)
             new_paths.extend(np)
             index_rows.extend(ir)
+            consumed.extend(ndjson_keys)
             total += n
 
         if new_paths:
             self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
+        for key in consumed:
+            try:
+                obstore.delete(self._store, key)
+            except Exception:
+                pass
         return total
 
-    def _compact_ndjson_bucket(self, cell: str, year: str) -> tuple[list[str], list[dict], int]:
+    def _compact_ndjson_bucket(
+        self, cell: str, year: str
+    ) -> tuple[list[str], list[dict], int, list[str]]:
         """Memory-bounded compact: stream NDJSON → dedup → write GeoParquet.
 
         Only ``compact_rows`` items are held in memory at a time.  Dedup uses
@@ -228,9 +243,11 @@ class Ingester:
         cell/year) this is ~25–50 MB, and unlike a Bloom filter it never
         drops a legitimate item (a Bloom filter's ~0.1% false-positive rate
         would lose ~500 real items per hot cell).  Each batch is sorted by
-        ``(platform, datetime)`` and written to its own ``part_NNNNNN.parquet``.
+        ``(platform, datetime)`` and written to its own ``part_<uuid>.parquet``
+        (uuid names keep incremental runs from clobbering prior files).
 
-        Returns ``(new_paths, index_rows, rows)`` — the caller commits once.
+        Returns ``(new_paths, index_rows, rows, ndjson_keys)`` — the caller
+        commits once, then deletes the consumed NDJSON.
         """
         bucket_dir = f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/"
         jsonl_keys: list[str] = []
@@ -241,24 +258,23 @@ class Ingester:
                     if k.endswith(".jsonl"):
                         jsonl_keys.append(k)
         except Exception:
-            return [], [], 0
+            return [], [], 0, []
         if not jsonl_keys:
-            return [], [], 0
+            return [], [], 0, []
 
         seen: set[str] = set()
         batch: list[dict] = []
         index_rows: list[dict] = []
         new_paths: list[str] = []
         rows = 0
-        part_idx = 0
 
         def _write_batch() -> None:
-            nonlocal rows, part_idx
+            nonlocal rows
             if not batch:
                 return
             out_key = (
                 f"{self._warehouse_prefix}/grid_partition={cell}/year={year}/"
-                f"part_{part_idx:06d}.parquet"
+                f"part_{uuid.uuid4().hex[:8]}.parquet"
             )
             sorted_batch = sorted(batch, key=_sort_key)
             n, _ = write_geoparquet_s3(sorted_batch, self._store, out_key)
@@ -268,7 +284,6 @@ class Ingester:
                 index_rows.extend(
                     _to_index_row(it) for it in batch if it.get("_source_key")
                 )
-            part_idx += 1
             batch.clear()
 
         for key in sorted(jsonl_keys):
@@ -283,7 +298,7 @@ class Ingester:
                     _write_batch()
 
         _write_batch()
-        return new_paths, index_rows, rows
+        return new_paths, index_rows, rows, jsonl_keys
 
     def _append_ndjson(self, key: str, items: list[dict]) -> None:
         lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
@@ -298,8 +313,10 @@ class Ingester:
 class DaskIngester(Ingester):
     """Distributed variant: shards the inventory and writes via ``client.map``.
 
-    Each worker runs :meth:`Ingester._write_direct` (write-only GeoParquet)
-    and returns ``(new_paths, index_rows, rows)``; the head node then calls
+    In ``"ndjson"`` stage, workers write per-shard NDJSON and the head
+    compacts + commits once.  In ``"direct"`` stage, each worker runs
+    :meth:`Ingester._write_direct` (write-only GeoParquet) and returns
+    ``(new_paths, index_rows, rows)``; the head node then calls
     ``table.add_files()`` and ``index.append()`` exactly once, so the shared
     index file is never written concurrently.
 
@@ -339,8 +356,9 @@ class DaskIngester(Ingester):
 
         Each worker fans out its shard into per-(cell, year) NDJSON buckets,
         writing to a shard-unique key so concurrent workers never clobber.
-        The head then reads every bucket, dedups against the index, and
-        writes GeoParquet + commits ``add_files``/``index.append`` once.
+        The head then reads every bucket, dedups by item ID, and writes
+        GeoParquet + commits ``add_files``/``index.append`` once, then
+        deletes the staged NDJSON so the run is resumable and idempotent.
         """
         results = client.map(self._write_ndjson_with_fetch, enumerate(list(shards)))
 
@@ -351,17 +369,24 @@ class DaskIngester(Ingester):
 
         new_paths: list[str] = []
         index_rows: list[dict] = []
+        consumed: list[str] = []
         total = 0
         for cell, year in sorted(buckets):
-            np, ir, n = self._compact_ndjson_bucket(cell, year)
+            np, ir, n, ndjson_keys = self._compact_ndjson_bucket(cell, year)
             new_paths.extend(np)
             index_rows.extend(ir)
+            consumed.extend(ndjson_keys)
             total += n
 
         if new_paths:
             self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
+        for key in consumed:
+            try:
+                obstore.delete(self._store, key)
+            except Exception:
+                pass
 
         return {"items": total, "rows": total}
 
