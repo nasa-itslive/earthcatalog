@@ -35,6 +35,7 @@ import obstore
 
 from earthcatalog import inventory as _inventory
 from earthcatalog.index import Index
+from earthcatalog.keydiff import iter_new_keys
 from earthcatalog.transform import (
     _sort_key,
     fan_out,
@@ -109,10 +110,11 @@ class Ingester:
         touched: set[tuple[str, str]] = set()
 
         if not self._skip_fetch:
-            for bucket, key in inventory:
-                src = f"s3://{bucket}/{key}"
-                if self._index.contains_source_key(src):
-                    continue
+            # The index is the resume checkpoint: one read per run, never
+            # per item (keydiff.iter_new_keys streams the inventory against
+            # the sorted hash array in bounded batches).
+            known = self._index.known_key_hashes()
+            for bucket, key in iter_new_keys(inventory, known):
                 item = self._fetch_fn(bucket, key)
                 if item is None:
                     continue
