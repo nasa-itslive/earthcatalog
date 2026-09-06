@@ -10,20 +10,27 @@ daily-delta script.
 
 from __future__ import annotations
 
+import asyncio
 import configparser
 import csv
 import gzip
+import hashlib
 import io
 import json
 import os
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import chain, islice
+from pathlib import Path
 
 import obstore
+import orjson
+import pyarrow as pa
 import pyarrow.parquet as pq
 from obstore.store import S3Store
+from tqdm import tqdm
 
 _STORES: dict[str, S3Store] = {}
 
@@ -234,14 +241,15 @@ def iter_inventory(
 class InventoryShard:
     """One unit of distributed ingest work.
 
-    Prefer the file-backed form: *files* are inventory part-file keys (with
-    *store* pointing at the bucket that holds them) that each worker reads
-    itself, so only the key list — never the (bucket, key) pairs — crosses
-    the wire to workers.  The *pairs* form carries materialised pairs for
-    inventories that cannot be split by file (single CSV / Parquet) or when
-    an exact global ``limit`` was requested.  *since* / *suffix* / *limit*
-    are applied by :meth:`iter_pairs` at iteration time, on whichever node
-    consumes the shard.
+    *files* are parquet shard files (with *store* pointing at the bucket
+    that holds them) that each worker reads itself, so only the file key —
+    never the (bucket, key) pairs — crosses the wire to workers.  Shards
+    are written by :func:`write_inventory_shards` with a fixed number of
+    rows each, so every worker gets the same amount of work regardless of
+    how skewed the source inventory part files are.  The *pairs* form
+    carries materialised pairs for tests and serial use.  *since* /
+    *suffix* / *limit* are applied by :meth:`iter_pairs` at iteration
+    time, on whichever node consumes the shard.
     """
 
     files: tuple[str, ...] = ()
@@ -268,61 +276,271 @@ class InventoryShard:
         )
 
 
-def iter_inventory_shards(
+SCATTER_MANIFEST_NAME = "scatter.json"
+
+
+def scatter_manifest_path(staging_prefix: str) -> str:
+    """Object key of the scatter manifest written under *staging_prefix*."""
+    return f"{staging_prefix.rstrip('/')}/{SCATTER_MANIFEST_NAME}"
+
+
+def is_scatter_manifest(path: str) -> bool:
+    """True when *path* points at a scatter manifest."""
+    return Path(path.rstrip("/")).name == SCATTER_MANIFEST_NAME
+
+
+def scatter_staging_prefix(
+    warehouse_prefix: str,
     inventory_path: str,
     *,
+    chunk_size: int,
+    since: datetime | None = None,
+    suffix: str | None = None,
+    limit: int | None = None,
+) -> str:
+    """Deterministic scatter staging prefix for an inventory + parameters.
+
+    Re-running the scatter step with the same inventory and parameters
+    resolves to the same prefix, so an already-scattered inventory is
+    detected and reused instead of re-read (the manifest path — and hence
+    the snapshot date — is part of the key, so a *new* snapshot still
+    scatters fresh).
+    """
+    key = json.dumps(
+        {
+            "inventory": inventory_path,
+            "chunk_size": chunk_size,
+            "since": since.isoformat() if since else None,
+            "suffix": suffix,
+            "limit": limit,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return f"{warehouse_prefix.rstrip('/')}/staging/shards/{digest}"
+
+
+def scatter_manifest_exists(store: object, staging_prefix: str) -> bool:
+    """True if a scatter manifest already exists under *staging_prefix*."""
+    try:
+        obstore.get(store, scatter_manifest_path(staging_prefix)).bytes()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def write_inventory_shards(
+    inventory_path: str,
+    store: object,
+    *,
+    staging_prefix: str,
     chunk_size: int = 100_000,
     since: datetime | None = None,
     suffix: str | None = None,
     limit: int | None = None,
-    files_per_shard: int = 1,
 ) -> list[InventoryShard]:
-    """Split *inventory_path* into :class:`InventoryShard` work units.
+    """Scatter: stream *inventory_path* into fixed-row shard files in *store*.
 
-    A ``manifest.json`` inventory shards naturally by part file: each shard
-    references one (or ``files_per_shard``) part files that workers stream
-    themselves, so the head node never materialises the full pair list.
-    Single-file inventories (CSV / Parquet) — or an exact global *limit*,
-    which needs full knowledge of the pair stream — fall back to pair-list
-    shards of *chunk_size* pairs each, with *suffix* filtering applied up
-    front so the limit counts only matching keys.
+    Reads the inventory (any supported format) sequentially on the head
+    node, applies *since* / *suffix* / *limit*, and writes one parquet
+    shard file per *chunk_size* matching pairs under *staging_prefix*
+    (``<prefix>/shard_<NNNN>.parquet``), plus a ``scatter.json`` manifest
+    recording the shard keys and scatter parameters.  Head memory stays
+    bounded at ~*chunk_size* pairs.  Every shard holds exactly *chunk_size*
+    rows (the last one may be partial), so worker load is uniform even when
+    the source inventory part files are unbalanced.
+
+    The scatter is a standalone step: run it once (no cluster needed), then
+    ingest with ``inventory_path`` pointing at the scatter manifest —
+    workers start immediately instead of idling behind the head's read.
+    Resume a failed run the same way; the unified index dedups.
+
+    Returns one file-backed :class:`InventoryShard` per written file;
+    each worker then reads its own shard URL via :meth:`InventoryShard.iter_pairs`.
     """
-    if limit is not None or not inventory_path.endswith("manifest.json"):
-        pairs = [
-            (b, k)
-            for b, k in iter_inventory(inventory_path, since=since)
-            if suffix is None or k.endswith(suffix)
-        ]
-        if limit is not None:
-            pairs = pairs[:limit]
-        return [
-            InventoryShard(pairs=tuple(pairs[i : i + chunk_size]))
-            for i in range(0, len(pairs), chunk_size)
-        ]
+    prefix = staging_prefix.rstrip("/")
+    buf: list[tuple[str, str]] = []
+    shards: list[InventoryShard] = []
 
-    _source_bucket, dest_store, data_keys = _parse_manifest(inventory_path)
-    files_per_shard = max(1, files_per_shard)
-    groups = [data_keys[i : i + files_per_shard] for i in range(0, len(data_keys), files_per_shard)]
-    return [
-        InventoryShard(files=tuple(g), store=dest_store, since=since, suffix=suffix) for g in groups
-    ]
+    def _flush() -> None:
+        if not buf:
+            return
+        key = f"{prefix}/shard_{len(shards):05d}.parquet"
+        table = pa.table(
+            {
+                "bucket": pa.array([b for b, _ in buf], type=pa.string()),
+                "key": pa.array([k for _, k in buf], type=pa.string()),
+            }
+        )
+        out = io.BytesIO()
+        pq.write_table(table, out)
+        obstore.put(store, key, out.getvalue())
+        shards.append(InventoryShard(files=(key,), store=store))
+        buf.clear()
+
+    n = 0
+    pbar = tqdm(desc="Scatter", unit=" rows")
+    for bucket, key in iter_inventory(inventory_path, since=since):
+        pbar.update(1)
+        if suffix is not None and not key.endswith(suffix):
+            continue
+        buf.append((bucket, key))
+        n += 1
+        if len(buf) >= chunk_size:
+            _flush()
+            pbar.set_postfix(matched=n, shards=len(shards))
+        if limit is not None and n >= limit:
+            break
+    _flush()
+    pbar.set_postfix(matched=n, shards=len(shards))
+    pbar.close()
+
+    manifest = {
+        "version": 1,
+        "created": datetime.now(UTC).isoformat(),
+        "inventory": inventory_path,
+        "chunk_size": chunk_size,
+        "since": since.isoformat() if since else None,
+        "suffix": suffix,
+        "items": n,
+        "shards": [s.files[0] for s in shards],
+    }
+    obstore.put(store, scatter_manifest_path(prefix), json.dumps(manifest).encode())
+    return shards
+
+
+def load_inventory_shards(scatter_path: str, store: object) -> list[InventoryShard]:
+    """Load shards scattered by :func:`write_inventory_shards`.
+
+    *scatter_path* may be the ``scatter.json`` manifest key or the staging
+    prefix that contains it.  The returned shards already carry the
+    scattered pairs — do not re-apply since/suffix/limit.
+    """
+    key = scatter_path.rstrip("/")
+    if not key.endswith(SCATTER_MANIFEST_NAME):
+        key = scatter_manifest_path(key)
+    manifest = json.loads(bytes(obstore.get(store, key).bytes()))
+    return [InventoryShard(files=(k,), store=store) for k in manifest["shards"]]
+
+
+def delete_shard_files(store: object, shards: list[InventoryShard]) -> int:
+    """Best-effort delete of shard files written by :func:`write_inventory_shards`."""
+    deleted = 0
+    for shard in shards:
+        for key in shard.files:
+            try:
+                obstore.delete(store, key)
+                deleted += 1
+            except Exception:
+                pass
+    return deleted
+
+
+def delete_scatter(store: object, staging_prefix: str, shards: list[InventoryShard]) -> int:
+    """Best-effort delete of shard files *and* their scatter manifest."""
+    deleted = delete_shard_files(store, shards)
+    try:
+        obstore.delete(store, scatter_manifest_path(staging_prefix))
+        deleted += 1
+    except Exception:
+        pass
+    return deleted
 
 
 # ---------------------------------------------------------------------------
 # STAC item fetching
 # ---------------------------------------------------------------------------
 
+_FETCH_RETRIES = 3
+_FETCH_BACKOFF_BASE = 0.5
+_FETCH_CONCURRENCY = 256
+
 
 def fetch_item(bucket: str, key: str) -> dict | None:
     try:
         raw = obstore.get(get_store(bucket), key).bytes()
-        item = json.loads(bytes(raw))
+        item = orjson.loads(bytes(raw))
         item["_source_bucket"] = bucket
         item["_source_key"] = key
         return item
     except Exception as exc:
         print(f"WARN: failed to fetch s3://{bucket}/{key}: {exc}")
         return None
+
+
+async def _fetch_item_async(store: object, bucket: str, key: str) -> dict | None:
+    """Fetch one STAC JSON via ``obstore.get_async`` with retry/backoff.
+
+    404 → None (skip); S3 error XML (SlowDown/Error) → retry; unexpected
+    non-JSON content → None with a warning.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_FETCH_RETRIES + 1):
+        try:
+            result = await obstore.get_async(store, key)
+            raw = bytes(await result.bytes_async())
+            if not raw or raw[0:1] != b"{":
+                preview = raw[:200].decode("utf-8", errors="replace")
+                if b"SlowDown" in raw or b"<Error>" in raw:
+                    raise OSError(f"S3 error response: {preview}")
+                print(
+                    f"WARN: unexpected content for s3://{bucket}/{key}: {preview}", file=sys.stderr
+                )
+                return None
+            item = orjson.loads(raw)
+            item["_source_bucket"] = bucket
+            item["_source_key"] = key
+            return item
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _FETCH_RETRIES:
+                await asyncio.sleep(_FETCH_BACKOFF_BASE * (2**attempt))
+    print(f"WARN: failed to fetch s3://{bucket}/{key} after retries: {last_exc}", file=sys.stderr)
+    return None
+
+
+async def _fetch_all_async(
+    pairs: list[tuple[str, str]],
+    concurrency: int,
+) -> list[dict]:
+    """Fetch many STAC items concurrently via ``obstore.get_async``.
+
+    Returns the successfully-fetched items (in no guaranteed order); failures
+    are dropped (logged) — matching :func:`fetch_item`'s None-on-error contract.
+    """
+    from asyncio import Semaphore, TaskGroup
+
+    sem = Semaphore(concurrency)
+    stores: dict[str, S3Store] = {}
+    results: dict[int, dict | None] = {}
+
+    async def _one(i: int, bucket: str, key: str) -> None:
+        async with sem:
+            store = stores.get(bucket)
+            if store is None:
+                store = get_store(bucket)
+                stores[bucket] = store
+            results[i] = await _fetch_item_async(store, bucket, key)
+
+    async with TaskGroup() as tg:
+        for i, (bucket, key) in enumerate(pairs):
+            tg.create_task(_one(i, bucket, key))
+
+    items: list[dict] = []
+    for i in range(len(pairs)):
+        item = results.get(i)
+        if item is not None:
+            items.append(item)
+    return items
+
+
+def fetch_items_async(
+    pairs: list[tuple[str, str]], *, concurrency: int = _FETCH_CONCURRENCY
+) -> list[dict]:
+    """Synchronous wrapper: fetch *pairs* concurrently via the async path."""
+    return asyncio.run(_fetch_all_async(pairs, concurrency))
 
 
 # Backward-compatible aliases (modules that imported the private names

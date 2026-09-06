@@ -72,6 +72,12 @@ def ingest(
         "--workers",
         help="Dask local workers (when --scheduler local).",
     ),
+    memory_limit: str = typer.Option(
+        "auto",
+        "--memory-limit",
+        help="Worker memory limit (e.g. '14GiB', or 0 to disable). "
+        "Default 'auto' = 60% of worker RAM.",
+    ),
     skip_fetch: bool = typer.Option(
         False,
         "--skip-fetch",
@@ -81,6 +87,18 @@ def ingest(
         False,
         "--skip-compact",
         help="Only fetch + stage; leave compaction for a later run.",
+    ),
+    scatter_only: bool = typer.Option(
+        False,
+        "--scatter-only",
+        help="Only scatter the inventory into fixed-row shard files (no cluster "
+        "needed); print the scatter.json path. Re-run with --inventory <that path> "
+        "to ingest without re-reading the inventory.",
+    ),
+    fetch_concurrency: int = typer.Option(
+        256,
+        "--fetch-concurrency",
+        help="Concurrent in-flight S3 GETs per worker during the STAC fetch.",
     ),
     grid: str = typer.Option(
         "h3",
@@ -151,8 +169,11 @@ def ingest(
         mode=mode,
         scheduler=scheduler,
         workers=workers,
+        memory_limit=memory_limit,
         skip_fetch=skip_fetch,
         skip_compact=skip_compact,
+        scatter_only=scatter_only,
+        fetch_concurrency=fetch_concurrency,
         grid=grid_cfg,
     )
 

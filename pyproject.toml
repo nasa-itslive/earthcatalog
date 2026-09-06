@@ -33,6 +33,7 @@ dependencies = [
 dev = [
   "pandas",
   "coiled",
+  "bokeh",
   "jupyterlab",
   "dask-labextension",
   "pytest",
@@ -45,6 +46,9 @@ dev = [
   "mkdocstrings[python]",
   "scalene",
   "memray",
+  "pandas-stubs",
+  "types-pyyaml",
+  "types-shapely",
 ]
 
 [project.urls]
@@ -93,6 +97,7 @@ module = [
   "s2geometry.*",
   "pybloom_live.*",
   "coiled.*",
+  "tqdm.*",
 ]
 ignore_missing_imports = true
 
@@ -102,6 +107,21 @@ local_scheme = "node-and-date"
 
 [dependency-groups]
 dev = [
+    "pandas",
+    "coiled",
+    "bokeh",
+    "jupyterlab",
+    "dask-labextension",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-xdist",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "zensical",
+    "mkdocstrings[python]",
+    "scalene",
+    "memray",
     "pandas-stubs>=3.0.5.260730",
     "types-pyyaml",
     "types-shapely>=2.1.0.20260728",

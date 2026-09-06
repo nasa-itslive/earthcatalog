@@ -9,6 +9,11 @@ containing (bucket, key) pairs for items not yet in the warehouse.
 Accumulates unconsumed previous deltas so no items are lost if the ingest
 pipeline doesn't run.
 
+The inventory is streamed part-file by part-file and anti-joined against the
+unified index with Arrow ``is_in`` — memory stays bounded by the batch size,
+not the inventory size, so this runs comfortably on a CI runner even for a
+multi-million-item inventory.
+
 Supports both S3 (s3://) and local filesystem paths for --warehouse-hash
 and --delta-prefix, enabling local testing without S3 credentials.
 
@@ -30,23 +35,38 @@ Usage
       --date 2026-04-27
 """
 
+from __future__ import annotations
+
 import argparse
 import io
 import json
+import os
 import sys
+import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import obstore
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import xxhash
 from obstore.store import S3Store
+from tqdm import tqdm
 
 _HASH_SEED = 42
 _BATCH_SIZE = 100_000
 _STAC_JSON_SUFFIX = ".stac.json"
+
+_SCHEMA = pa.schema(
+    [
+        pa.field("bucket", pa.string()),
+        pa.field("key", pa.string()),
+        pa.field("id_hash", pa.binary(16)),
+    ]
+)
 
 
 def _hash_id(item_id: str) -> bytes:
@@ -59,7 +79,6 @@ def _is_local(uri: str) -> bool:
 
 def _get_store(bucket: str, prefix: str = "") -> S3Store:
     import configparser
-    import os
 
     key_id = os.environ.get("AWS_ACCESS_KEY_ID")
     secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
@@ -98,18 +117,17 @@ def _fetch_manifest(store: S3Store, key: str) -> dict:
     return json.loads(raw)
 
 
-def _stream_inventory_hashes(
+def _iter_inventory_batches(
     manifest: dict, store: S3Store
-) -> tuple[list[tuple[str, str]], list[bytes]]:
-    """
-    Stream all .stac.json rows from manifest parquets, returning
-    (bucket, key) pairs and their xxh3_128 hashes.
-    """
-    data_keys = [f["key"] for f in manifest.get("files", [])]
-    pairs: list[tuple[str, str]] = []
-    hashes: list[bytes] = []
+) -> Iterator[tuple[pa.Array, pa.Array, pa.Array]]:
+    """Yield ``(buckets, keys, id_hashes)`` Arrow arrays for .stac.json rows.
 
-    for dk in data_keys:
+    Streams each inventory part file in batches, filtering to .stac.json keys
+    and hashing the item ID (last path segment without the suffix) with
+    xxh3_128.  Never materialises more than one batch at a time.
+    """
+    for f in manifest.get("files", []):
+        dk = f["key"]
         try:
             raw = bytes(obstore.get(store, dk).bytes())
         except Exception:
@@ -118,17 +136,51 @@ def _stream_inventory_hashes(
 
         pf = pq.ParquetFile(io.BytesIO(raw))
         for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["bucket", "key"]):
-            buckets = batch.column("bucket").to_pylist()
-            keys = batch.column("key").to_pylist()
-            for b, k in zip(buckets, keys):
-                if not k.endswith(_STAC_JSON_SUFFIX):
-                    continue
-                fname = k.rsplit("/", 1)[-1]
-                item_id = fname.removesuffix(_STAC_JSON_SUFFIX)
-                pairs.append((b, k))
-                hashes.append(_hash_id(item_id))
+            keys = batch.column("key")
+            mask = pc.ends_with(keys, pattern=_STAC_JSON_SUFFIX)
+            if not pc.any(mask).as_py():
+                continue
+            buckets = batch.column("bucket").filter(mask)
+            keys = keys.filter(mask)
+            keys_py = keys.to_pylist()
+            hashes = pa.array(
+                [_hash_id(k.rsplit("/", 1)[-1].removesuffix(_STAC_JSON_SUFFIX)) for k in keys_py],
+                type=pa.binary(16),
+            )
+            yield buckets, keys, hashes
 
-    return pairs, hashes
+
+def _load_index_hash_array(uri: str) -> pa.Array:
+    """Load the active (non-deleted) ``id_hash`` values from the unified Index.
+
+    Returns a unique Arrow array of 16-byte hashes — used directly as the
+    ``value_set`` for the streaming anti-join, so the index is never expanded
+    into a Python ``set``.
+    """
+    from obstore.store import LocalStore
+
+    if uri.startswith("s3://"):
+        bucket, key = _parse_s3_uri(uri)
+        store = _get_store(bucket)
+    else:
+        p = Path(uri)
+        store = LocalStore(str(p.parent))
+        key = p.name
+
+    try:
+        raw = bytes(obstore.get(store, key).bytes())
+    except FileNotFoundError:
+        return pa.array([], type=pa.binary(16))
+    pf = pq.ParquetFile(io.BytesIO(raw))
+    chunks = []
+    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash", "deleted"]):
+        h = batch.column("id_hash")
+        d = batch.column("deleted")
+        chunks.append(h.filter(pc.invert(d)))
+
+    if not chunks:
+        return pa.array([], type=pa.binary(16))
+    return pc.unique(pa.chunked_array(chunks))
 
 
 # ---------------------------------------------------------------------------
@@ -208,34 +260,6 @@ def _write_delta_parquet_local(rows: list[tuple[str, str, bytes]], path: str) ->
     return len(rows)
 
 
-def _load_index_hashes(uri: str) -> set[bytes]:
-    """Load the active (non-deleted) ``id_hash`` set from the unified Index.
-
-    Handles both ``s3://`` and local paths.  Uses ``Index.hash_set()`` which
-    excludes rows GC has marked deleted, so a re-added item is correctly
-    treated as new.
-    """
-    from obstore.store import LocalStore
-
-    from earthcatalog.index import Index
-
-    if uri.startswith("s3://"):
-        bucket, key = _parse_s3_uri(uri)
-        return Index(_get_store(bucket), key).hash_set()
-    path = Path(uri)
-    return Index(LocalStore(str(path.parent)), path.name).hash_set()
-
-
-def _write_inventory_cache(rows: list[tuple[str, str, bytes]], store: S3Store, key: str) -> None:
-    buckets = pa.array([r[0] for r in rows], type=pa.string())
-    keys = pa.array([r[1] for r in rows], type=pa.string())
-    id_hashes = pa.array([r[2] for r in rows], type=pa.binary(16))
-    tbl = pa.table({"bucket": buckets, "key": keys, "id_hash": id_hashes})
-    buf = io.BytesIO()
-    pq.write_table(tbl, buf, compression="zstd")
-    obstore.put(store, key, buf.getvalue())
-
-
 def _write_inventory_cache_local(rows: list[tuple[str, str, bytes]], path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     buckets = pa.array([r[0] for r in rows], type=pa.string())
@@ -243,20 +267,6 @@ def _write_inventory_cache_local(rows: list[tuple[str, str, bytes]], path: str) 
     id_hashes = pa.array([r[2] for r in rows], type=pa.binary(16))
     tbl = pa.table({"bucket": buckets, "key": keys, "id_hash": id_hashes})
     pq.write_table(tbl, path, compression="zstd")
-
-
-def _read_inventory_cache(store: S3Store, key: str) -> tuple[list[tuple[str, str]], list[bytes]]:
-    raw = bytes(obstore.get(store, key).bytes())
-    pf = pq.ParquetFile(io.BytesIO(raw))
-    pairs: list[tuple[str, str]] = []
-    hashes: list[bytes] = []
-    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["bucket", "key", "id_hash"]):
-        buckets = batch.column("bucket").to_pylist()
-        keys = batch.column("key").to_pylist()
-        id_hashes = batch.column("id_hash").to_pylist()
-        pairs.extend(zip(buckets, keys))
-        hashes.extend(id_hashes)
-    return pairs, hashes
 
 
 def _read_inventory_cache_local(path: str) -> tuple[list[tuple[str, str]], list[bytes]]:
@@ -303,74 +313,106 @@ def run_daily_delta(
             "delta_key": delta_output,
         }
 
-    # Tier 2: inventory cache exists — skip manifest fetch + inventory stream
-    inv_pairs: list[tuple[str, str]] = []
-    inv_hashes: list[bytes] = []
+    # Load the warehouse's active id_hash set once (Arrow array, not a set).
+    wh_hashes = _load_index_hash_array(warehouse_hash_uri)
+    print(f"Warehouse index: {len(wh_hashes):,} active hashes")
+
     inventory_cached = False
+    inventory_items = 0
+    new_items = 0
+    new_rows: dict[bytes, tuple[str, str, bytes]] = {}
 
-    if local_delta and Path(inventory_cache).exists():
-        print(f"Inventory cache found: {inventory_cache}")
-        inv_pairs, inv_hashes = _read_inventory_cache_local(inventory_cache)
-        print(f"Loaded cached inventory: {len(inv_pairs):,} .stac.json items")
-        inventory_cached = True
-    else:
-        manifest_bucket, manifest_key = _parse_s3_uri(manifest_uri)
-        manifest_store = _get_store(manifest_bucket)
-
-        print(f"Fetching manifest: {manifest_uri}")
-        manifest = _fetch_manifest(manifest_store, manifest_key)
-        n_data_files = len(manifest.get("files", []))
-        print(f"Manifest: {n_data_files} data file(s)")
-
-        print("Streaming inventory and hashing IDs ...")
-        inv_pairs, inv_hashes = _stream_inventory_hashes(manifest, manifest_store)
-        print(f"Inventory: {len(inv_pairs):,} .stac.json items")
-
-        inv_rows = [(b, k, h) for (b, k), h in zip(inv_pairs, inv_hashes)]
-        if local_delta:
-            _write_inventory_cache_local(inv_rows, inventory_cache)
-            print(f"Wrote inventory cache: {inventory_cache}")
-        else:
-            delta_bucket, delta_path = _parse_s3_uri(delta_prefix)
-            delta_store = _get_store(delta_bucket, prefix=delta_path)
-            inv_key = f"pending/inventory_{date_str}.parquet"
-            _write_inventory_cache(inv_rows, delta_store, inv_key)
-            print(f"Wrote inventory cache: {delta_prefix.rstrip('/')}/{inv_key}")
-
-    # Anti-join against warehouse (unified Index — excludes deleted rows)
-    wh_set = _load_index_hashes(warehouse_hash_uri)
-    print(f"Warehouse index: {len(wh_set):,} active hashes")
-
-    print("Computing anti-join ...")
-    new_pairs: list[tuple[str, str, bytes]] = []
-    for (b, k), h in zip(inv_pairs, inv_hashes):
-        if h not in wh_set:
-            new_pairs.append((b, k, h))
-    print(f"New items (not in warehouse): {len(new_pairs):,}")
-
-    print("Checking for pending deltas ...")
-    accumulated: dict[bytes, tuple[str, str, bytes]] = {}
-    for b, k, h in new_pairs:
-        accumulated[h] = (b, k, h)
+    def _absorb(buckets: pa.Array, keys: pa.Array, hashes: pa.Array) -> None:
+        """Anti-join one batch against the warehouse; keep new rows."""
+        nonlocal new_items
+        new_mask = pc.invert(pc.is_in(hashes, value_set=wh_hashes))
+        if not pc.any(new_mask).as_py():
+            return
+        for b, k, h in zip(
+            buckets.filter(new_mask).to_pylist(),
+            keys.filter(new_mask).to_pylist(),
+            hashes.filter(new_mask).to_pylist(),
+        ):
+            new_items += 1
+            new_rows.setdefault(h, (b, k, h))
 
     if local_delta:
-        pending_keys = _list_pending_deltas_local(delta_prefix)
+        cache_path = Path(inventory_cache)
+        if cache_path.exists():
+            # Tier 2: reuse the inventory cache (streamed anti-join).
+            inventory_cached = True
+            print(f"Inventory cache found: {inventory_cache}")
+            pf = pq.ParquetFile(str(cache_path))
+            with tqdm(desc="Anti-join", unit=" rows") as pbar:
+                for batch in pf.iter_batches(batch_size=_BATCH_SIZE):
+                    inventory_items += batch.num_rows
+                    _absorb(batch.column("bucket"), batch.column("key"), batch.column("id_hash"))
+                    pbar.update(batch.num_rows)
+        else:
+            manifest_bucket, manifest_key = _parse_s3_uri(manifest_uri)
+            store = _get_store(manifest_bucket)
+            print(f"Fetching manifest: {manifest_uri}")
+            manifest = _fetch_manifest(store, manifest_key)
+            print(f"Manifest: {len(manifest.get('files', []))} data file(s)")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with pq.ParquetWriter(str(cache_path), _SCHEMA, compression="zstd") as w:
+                with tqdm(desc="Scatter", unit=" rows") as pbar:
+                    for buckets, keys, hashes in _iter_inventory_batches(manifest, store):
+                        inventory_items += len(buckets)
+                        w.write_table(pa.Table.from_arrays([buckets, keys, hashes], schema=_SCHEMA))
+                        _absorb(buckets, keys, hashes)
+                        pbar.update(len(buckets))
+            print(f"Wrote inventory cache: {inventory_cache}")
     else:
         delta_bucket, delta_path = _parse_s3_uri(delta_prefix)
         delta_store = _get_store(delta_bucket, prefix=delta_path)
+        manifest_bucket, manifest_key = _parse_s3_uri(manifest_uri)
+        store = _get_store(manifest_bucket)
+        print(f"Fetching manifest: {manifest_uri}")
+        manifest = _fetch_manifest(store, manifest_key)
+        print(f"Manifest: {len(manifest.get('files', []))} data file(s)")
+
+        # Stream the inventory: write the cache to a local temp file (so the
+        # inventory is never held in RAM), anti-join, then upload the cache.
+        fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+        os.close(fd)
+        try:
+            with pq.ParquetWriter(tmp_path, _SCHEMA, compression="zstd") as w:
+                with tqdm(desc="Scatter", unit=" rows") as pbar:
+                    for buckets, keys, hashes in _iter_inventory_batches(manifest, store):
+                        inventory_items += len(buckets)
+                        w.write_table(pa.Table.from_arrays([buckets, keys, hashes], schema=_SCHEMA))
+                        _absorb(buckets, keys, hashes)
+                        pbar.update(len(buckets))
+            inv_key = f"pending/inventory_{date_str}.parquet"
+            obstore.put(delta_store, inv_key, tmp_path)
+            print(f"Wrote inventory cache: {delta_prefix.rstrip('/')}/{inv_key}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    print(f"Inventory: {inventory_items:,} .stac.json items")
+    print(f"New items (not in warehouse): {new_items:,}")
+
+    # Merge unconsumed previous deltas so nothing is lost.
+    print("Checking for pending deltas ...")
+    if local_delta:
+        pending_keys = _list_pending_deltas_local(delta_prefix)
+    else:
         pending_keys = _list_pending_deltas(delta_store, "")
 
     for pk in pending_keys:
         print(f"  Merging previous delta: {pk}")
-        if local_delta:
-            rows = _read_pending_delta_local(pk)
-        else:
-            rows = _read_pending_delta(delta_store, pk)
+        rows = (
+            _read_pending_delta_local(pk) if local_delta else _read_pending_delta(delta_store, pk)
+        )
         for b, k, h in rows:
-            if h not in accumulated:
-                accumulated[h] = (b, k, h)
+            if h not in new_rows:
+                new_rows[h] = (b, k, h)
 
-    final_rows = list(accumulated.values())
+    final_rows = list(new_rows.values())
     print(f"Accumulated delta: {len(final_rows):,} items")
 
     if local_delta:
@@ -382,23 +424,22 @@ def run_daily_delta(
         print(f"Written: {delta_prefix.rstrip('/')}/{delta_key} ({n:,} rows)")
 
     for pk in pending_keys:
-        if pk != delta_output and pk != f"pending/delta_{date_str}.parquet":
-            try:
-                if local_delta:
-                    Path(pk).unlink()
-                else:
-                    obstore.delete(delta_store, pk)
-                print(f"  Deleted old delta: {pk}")
-            except Exception:
-                pass
+        try:
+            if local_delta:
+                Path(pk).unlink()
+            else:
+                obstore.delete(delta_store, pk)
+            print(f"  Deleted old delta: {pk}")
+        except Exception:
+            pass
 
     return {
         "date": date_str,
         "skipped": False,
         "inventory_cached": inventory_cached,
-        "inventory_items": len(inv_pairs),
-        "warehouse_hashes": len(wh_set),
-        "new_items": len(new_pairs),
+        "inventory_items": inventory_items,
+        "warehouse_hashes": len(wh_hashes),
+        "new_items": new_items,
         "previous_deltas_merged": len(pending_keys),
         "accumulated_total": len(final_rows),
         "delta_key": delta_output

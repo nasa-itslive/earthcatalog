@@ -33,11 +33,62 @@ First-time ingest of the full catalog. Both paths route through
 
 ### With Dask/Coiled
 
-Runs the resumable staging pipeline: chunk the inventory → fetch STAC JSONs
-(parallel workers) → write NDJSON intermediates → compact to GeoParquet
-(memory-bounded) → register with Iceberg + update the unified index.
-Spot-resilient — interrupted chunks are retried on restart and the staged
-NDJSON survives.
+Distributed ingest runs as **scatter → map → reduce**:
+
+1. **Scatter** (head): the head streams the inventory once, filters
+   `.stac.json` items, and writes fixed-row shard parquets (one per
+   `chunk_size` items) to `{warehouse}/staging/shards/<run_id>/` plus a
+   `scatter.json` manifest.  Head memory stays bounded; every shard is the
+   same size regardless of source part-file skew.
+2. **Map** (workers): each worker reads its own shard URL, fetches the STAC
+   JSONs, and fans them out to per-(cell, year) NDJSON.
+3. **Reduce** (workers): each `(cell, year)` bucket is compacted to GeoParquet
+   by a worker (one task per bucket); the head then commits to Iceberg + the
+   unified index exactly once.  Shard files are deleted after a successful run.
+
+Each phase shows a `tqdm` progress bar.  The map/reduce can also be split so
+you can watch (or resume) the two phases independently — `skip_compact=True`
+runs only the NDJSON scatter, `skip_fetch=True` runs only the consolidation:
+
+```python
+# Phase A — scatter NDJSON (fetch → per-(cell,year) NDJSON), no GeoParquet yet
+catalog.ingest_inventory(
+    scatter_json,
+    mode="delta",
+    config=IngestConfig(create_client=lambda: client, skip_compact=True),
+)
+
+# Phase B — consolidate NDJSON → GeoParquet, no re-fetch
+catalog.ingest_inventory(
+    scatter_json,
+    mode="delta",
+    config=IngestConfig(create_client=lambda: client, skip_fetch=True),
+)
+```
+
+To keep workers from idling behind the head's inventory read, run scatter
+and map/reduce as **two separate steps**:
+
+```python
+# Step 1 — scatter only (no cluster needed)
+catalog.ingest_inventory(
+    "s3://bucket/inventory/full.parquet",
+    mode="full",
+    config=IngestConfig(create_client=lambda: client, scatter_only=True),
+)
+# → prints: scatter_only set — skipping map/reduce.
+# → returns {"scatter": "s3://.../staging/shards/<run_id>/scatter.json"}
+
+# Step 2 — consume the pre-scattered shards (workers start immediately)
+catalog.ingest_inventory(
+    "s3://.../staging/shards/<run_id>/scatter.json",
+    mode="full",
+    config=IngestConfig(create_client=lambda: client),
+)
+```
+
+A failed map/reduce keeps the shard files — re-run step 2 with the same
+`scatter.json` to resume (the unified index dedups already-ingested keys).
 
 ```python
 catalog.ingest_inventory(
@@ -121,6 +172,16 @@ uv run earthcatalog ingest --inventory s3://bucket/inventory/full.parquet \
 # Daily delta ingest (diff produced by scripts/daily_delta.py)
 uv run earthcatalog ingest --inventory s3://…/delta/pending/delta_2026-04-28.parquet \
     --mode delta --scheduler local --workers 4
+
+# Two-step scatter → map/reduce (workers don't idle behind the head read):
+# Step 1: scatter only (no cluster needed)
+uv run earthcatalog ingest --inventory s3://bucket/inventory/full.parquet \
+    --mode full --scatter-only
+# → prints: scatter_only set — skipping map/reduce.
+# → prints: Scatter: N shard file(s) … (s3://…/staging/shards/<run_id>/scatter.json)
+# Step 2: consume the pre-scattered shards on the cluster
+uv run earthcatalog ingest --inventory s3://…/staging/shards/<run_id>/scatter.json \
+    --mode delta --scheduler coiled
 
 # Resume a failed run — already-ingested source keys are skipped automatically.
 # Stage-only (compact later) or compact staged NDJSON:

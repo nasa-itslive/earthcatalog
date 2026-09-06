@@ -16,7 +16,6 @@ class IngestConfig:
     """
 
     chunk_size: int = 100_000
-    compact_rows: int = 100_000
     limit: int | None = None
     since: datetime | None = None
     staging_prefix: str | None = None
@@ -24,9 +23,16 @@ class IngestConfig:
     delta: bool | None = None
     skip_fetch: bool = False
     skip_compact: bool = False
+    # Distributed only: stop after the scatter step and return the scatter
+    # manifest path — workers never idle behind the head's inventory read.
+    # Re-invoke with inventory_path=<scatter.json> to run the map/reduce.
+    scatter_only: bool = False
     # "ndjson" stages items to per-(cell, year) NDJSON first (resumable,
     # memory-bounded compaction); "direct" writes GeoParquet immediately.
     stage: str = "ndjson"
+    # Concurrent in-flight S3 GETs per worker during the STAC fetch (async
+    # via obstore.get_async, so this is lightweight — no thread per request).
+    fetch_concurrency: int = 256
 
     @classmethod
     def from_kwargs(cls, **kwargs) -> IngestConfig:

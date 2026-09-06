@@ -103,13 +103,13 @@ class TestHashId:
 
 
 # ---------------------------------------------------------------------------
-# daily_delta._stream_inventory_hashes
+# daily_delta._iter_inventory_batches
 # ---------------------------------------------------------------------------
 
 
 class TestStreamInventoryHashes:
     def test_filters_stac_json_only(self):
-        from scripts.daily_delta import _stream_inventory_hashes
+        from scripts.daily_delta import _iter_inventory_batches
 
         store = MemoryStore()
         pairs = [
@@ -122,14 +122,16 @@ class TestStreamInventoryHashes:
         obstore.put(store, "data/inv.parquet", data)
 
         manifest = {"files": [{"key": "data/inv.parquet"}]}
-        result_pairs, result_hashes = _stream_inventory_hashes(manifest, store)
+        all_keys = []
+        for buckets, keys, hashes in _iter_inventory_batches(manifest, store):
+            all_keys.extend(keys.to_pylist())
 
-        assert len(result_pairs) == 2
-        assert result_pairs[0] == ("bucket", "path/to/item-1.stac.json")
-        assert result_pairs[1] == ("bucket", "path/to/item-2.stac.json")
+        assert len(all_keys) == 2
+        assert all_keys[0] == "path/to/item-1.stac.json"
+        assert all_keys[1] == "path/to/item-2.stac.json"
 
     def test_extracts_correct_hashes(self):
-        from scripts.daily_delta import _stream_inventory_hashes
+        from scripts.daily_delta import _iter_inventory_batches
 
         store = MemoryStore()
         pairs = [
@@ -140,10 +142,12 @@ class TestStreamInventoryHashes:
         obstore.put(store, "inv.parquet", data)
 
         manifest = {"files": [{"key": "inv.parquet"}]}
-        result_pairs, result_hashes = _stream_inventory_hashes(manifest, store)
+        all_hashes = []
+        for buckets, keys, hashes in _iter_inventory_batches(manifest, store):
+            all_hashes.extend(hashes.to_pylist())
 
-        assert result_hashes[0] == _hash_id("item-abc")
-        assert result_hashes[1] == _hash_id("item-def")
+        assert all_hashes[0] == _hash_id("item-abc")
+        assert all_hashes[1] == _hash_id("item-def")
 
 
 # ---------------------------------------------------------------------------

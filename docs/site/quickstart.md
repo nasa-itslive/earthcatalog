@@ -5,7 +5,7 @@ catalog backed by Apache Iceberg. Instead of a database, Parquet files sit on S3
 and a small SQLite file tracks the Iceberg schema. DuckDB reads them directly —
 no serialization overhead, no infrastructure.
 
-## Bulk ingest
+## Full ingest
 
 First-time full ingest from an S3 Inventory file. Drops any existing table and
 recreates it from scratch.
@@ -36,6 +36,10 @@ uv run earthcatalog ingest \
   --warehouse s3://my-bucket/catalog/warehouse \
   --mode full
 ```
+
+For large inventories, decouple the scatter from the map/reduce so workers
+don't idle behind the head's inventory read — see the
+[Ingest Guide](operations/ingest_guide.md#with-daskcoiled) for details.
 
 ## Delta ingest
 

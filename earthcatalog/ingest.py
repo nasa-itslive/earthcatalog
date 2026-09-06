@@ -25,9 +25,11 @@ Modes
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterator
+from functools import partial
 
 import obstore
 
@@ -56,9 +58,10 @@ class Ingester:
         warehouse_prefix: str = "",
         warehouse_root: str | None = None,
         batch_size: int = 10_000,
-        compact_rows: int = 100_000,
         skip_fetch: bool = False,
         skip_compact: bool = False,
+        fetch_concurrency: int = 256,
+        delta: bool = False,
     ) -> None:
         self._store = store
         self._index = index
@@ -69,9 +72,10 @@ class Ingester:
         self._warehouse_prefix = warehouse_prefix.rstrip("/")
         self._warehouse_root = warehouse_root
         self._batch_size = batch_size
-        self._compact_rows = compact_rows
         self._skip_fetch = skip_fetch
         self._skip_compact = skip_compact
+        self._fetch_concurrency = fetch_concurrency
+        self._delta = delta
         self._ndjson_prefix = (
             f"{self._warehouse_prefix}/staging/ndjson"
             if self._warehouse_prefix
@@ -163,34 +167,14 @@ class Ingester:
         return rows
 
     def _write_direct(self, items: list[dict]) -> tuple[list[str], list[dict], int]:
-        """Write items to GeoParquet without touching the table/index.
-
-        Returns ``(new_paths, index_rows, rows)`` so a distributed caller can
-        gather results from many workers and commit once on the head node.
-        """
-        fo = fan_out(items, self._partitioner) if self._partitioner else items
-        if not fo:
-            return [], [], 0
-
-        rows = 0
-        new_paths: list[str] = []
-        index_rows = [_to_index_row(it) for it in items if it.get("_source_key")]
-
-        for (cell, year), group in group_by_partition(fo).items():
-            year_str = str(year) if year is not None else "unknown"
-            key = f"{self._warehouse_prefix}/grid_partition={cell}/year={year_str}/part_{uuid.uuid4().hex[:8]}.parquet"
-            n, _ = write_geoparquet_s3(group, self._store, key)
-            if n > 0:
-                new_paths.append(key)
-                rows += n
-
-        return new_paths, index_rows, rows
+        """Write items to GeoParquet — see :func:`_write_direct`."""
+        return _write_direct(self._store, self._partitioner, self._warehouse_prefix, items)
 
     def _flush_ndjson(self, items: list[dict], touched: set[tuple[str, str]]) -> int:
         """Stage A only — fan out to per-(cell, year) NDJSON buckets.
 
         Records the buckets touched so the caller can compact each of them
-        exactly once after all batches (memory-bounded Stage B).
+        exactly once after all batches (Stage B).
         """
         fo = fan_out(items, self._partitioner) if self._partitioner else items
         buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -240,76 +224,17 @@ class Ingester:
     def _compact_ndjson_bucket(
         self, cell: str, year: str
     ) -> tuple[list[str], list[dict], int, list[str]]:
-        """Memory-bounded compact: stream NDJSON → dedup → write GeoParquet.
-
-        Only ``compact_rows`` items are held in memory at a time.  Dedup uses
-        an exact ``set`` of item IDs — for the largest cells (~500k items per
-        cell/year) this is ~25–50 MB, and unlike a Bloom filter it never
-        drops a legitimate item (a Bloom filter's ~0.1% false-positive rate
-        would lose ~500 real items per hot cell).  Each batch is sorted by
-        ``(platform, datetime)`` and written to its own ``part_<uuid>.parquet``
-        (uuid names keep incremental runs from clobbering prior files).
-
-        Returns ``(new_paths, index_rows, rows, ndjson_keys)`` — the caller
-        commits once, then deletes the consumed NDJSON.
-        """
-        bucket_dir = f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/"
-        jsonl_keys: list[str] = []
-        try:
-            for listing in obstore.list(self._store, prefix=bucket_dir):
-                for obj in listing:
-                    k: str = obj["path"]
-                    if k.endswith(".jsonl"):
-                        jsonl_keys.append(k)
-        except Exception:
-            return [], [], 0, []
-        if not jsonl_keys:
-            return [], [], 0, []
-
-        seen: set[str] = set()
-        batch: list[dict] = []
-        index_rows: list[dict] = []
-        new_paths: list[str] = []
-        rows = 0
-
-        def _write_batch() -> None:
-            nonlocal rows
-            if not batch:
-                return
-            out_key = (
-                f"{self._warehouse_prefix}/grid_partition={cell}/year={year}/"
-                f"part_{uuid.uuid4().hex[:8]}.parquet"
-            )
-            sorted_batch = sorted(batch, key=_sort_key)
-            n, _ = write_geoparquet_s3(sorted_batch, self._store, out_key)
-            if n > 0:
-                new_paths.append(out_key)
-                rows += n
-                index_rows.extend(_to_index_row(it) for it in batch if it.get("_source_key"))
-            batch.clear()
-
-        for key in sorted(jsonl_keys):
-            result = obstore.get(self._store, key)
-            for item in iter_ndjson_lines(result.stream()):
-                item_id = item.get("id")
-                if not item_id or item_id in seen:
-                    continue
-                seen.add(item_id)
-                batch.append(item)
-                if len(batch) >= self._compact_rows:
-                    _write_batch()
-
-        _write_batch()
-        return new_paths, index_rows, rows, jsonl_keys
+        """Compact one ``(cell, year)`` bucket — see :func:`_compact_bucket`."""
+        return _compact_bucket(
+            self._store,
+            self._ndjson_prefix,
+            self._warehouse_prefix,
+            (cell, year),
+            delta=self._delta,
+        )
 
     def _append_ndjson(self, key: str, items: list[dict]) -> None:
-        lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
-        try:
-            raw = bytes(obstore.get(self._store, key).bytes())
-            merged = raw.decode("utf-8") + lines
-            obstore.put(self._store, key, merged.encode("utf-8"))
-        except FileNotFoundError:
-            obstore.put(self._store, key, lines.encode("utf-8"))
+        _append_ndjson(self._store, key, items)
 
 
 class DaskIngester(Ingester):
@@ -318,10 +243,11 @@ class DaskIngester(Ingester):
     Each *shard* is an :class:`earthcatalog.inventory.InventoryShard` spec
     (preferred — the worker streams its own inventory part files, so only
     file keys cross the wire) or a plain sequence of ``(bucket, key)``
-    pairs.  In ``"ndjson"`` stage, workers write per-shard NDJSON and the
-    head compacts + commits once.  In ``"direct"`` stage, each worker runs
-    :meth:`Ingester._write_direct` (write-only GeoParquet) and returns
-    ``(new_paths, index_rows, rows)``; the head node then calls
+    pairs.  In ``"ndjson"`` stage, workers write per-shard NDJSON and then
+    compact it to GeoParquet (one task per ``(cell, year)`` bucket); only
+    the final Iceberg/index commit stays on the head.  In ``"direct"`` stage,
+    each worker runs :meth:`Ingester._write_direct` (write-only GeoParquet)
+    and returns ``(new_paths, index_rows, rows)``; the head node then calls
     ``table.add_files()`` and ``index.append()`` exactly once, so the shared
     index file is never written concurrently.
 
@@ -335,7 +261,17 @@ class DaskIngester(Ingester):
         if self._stage == "ndjson":
             return self._run_ndjson(inventory, client=client)
 
-        results = client.map(self._write_direct_with_fetch, list(inventory))
+        # Ship only plain state to workers (not the Iceberg table/index) via a
+        # module-level function, so it pickles/tokenizes deterministically.
+        write_fn = partial(
+            _write_direct_shard,
+            self._store,
+            self._fetch_fn,
+            self._partitioner,
+            self._warehouse_prefix,
+            fetch_concurrency=self._fetch_concurrency,
+        )
+        results = _collect(client, write_fn, list(inventory), desc="Write GeoParquet")
 
         new_paths: list[str] = []
         index_rows: list[dict] = []
@@ -352,71 +288,76 @@ class DaskIngester(Ingester):
 
         return {"items": total, "rows": total}
 
-    def _write_direct_with_fetch(self, shard):
-        """Fetch each pair in *shard*, then write-only fan-out."""
-        items = [self._fetch_fn(b, k) for b, k in _shard_iter_pairs(shard)]
-        items = [it for it in items if it is not None]
-        return self._write_direct(items)
-
     def _run_ndjson(self, shards, *, client) -> dict:
-        """Distributed NDJSON mode: workers write NDJSON, head compacts once.
+        """Distributed NDJSON mode, splittable into two steps.
 
-        Each worker fans out its shard into per-(cell, year) NDJSON buckets,
-        writing to a shard-unique key so concurrent workers never clobber.
-        The head then reads every bucket, dedups by item ID, and writes
-        GeoParquet + commits ``add_files``/``index.append`` once, then
-        deletes the staged NDJSON so the run is resumable and idempotent.
+        Stage A (scatter NDJSON): workers fetch each shard and fan out to
+        per-(cell, year) NDJSON buckets.  Stage B (consolidate): workers
+        compact each bucket to GeoParquet.  ``skip_compact=True`` runs only
+        Stage A; ``skip_fetch=True`` runs only Stage B against already-staged
+        NDJSON.
+
+        Each bucket is committed as it finishes — ``add_files`` +
+        ``index.append`` + delete its NDJSON — so a failed/OOM run only loses
+        the in-flight bucket: re-running (``skip_fetch=True``) discovers only
+        buckets that still have staged NDJSON and skips the rest.  The head is
+        the single writer (appends are sequential), so the shared index file is
+        never written concurrently.
         """
-        results = client.map(self._write_ndjson_with_fetch, enumerate(list(shards)))
-
-        # Collect every (cell, year) bucket produced by any worker.
         buckets: set[tuple[str, str]] = set()
-        for touched in results:
-            buckets.update(touched)
-
-        new_paths: list[str] = []
-        index_rows: list[dict] = []
-        consumed: list[str] = []
         total = 0
-        for cell, year in sorted(buckets):
-            np, ir, n, ndjson_keys = self._compact_ndjson_bucket(cell, year)
-            new_paths.extend(np)
-            index_rows.extend(ir)
-            consumed.extend(ndjson_keys)
-            total += n
 
-        if new_paths:
-            self._table.add_files([self._full_path(k) for k in new_paths])
-            if index_rows:
-                self._index.append(index_rows)
-        for key in consumed:
-            try:
-                obstore.delete(self._store, key)
-            except Exception:
-                pass
-
-        return {"items": total, "rows": total}
-
-    def _write_ndjson_with_fetch(self, shard_with_index):
-        """Fetch a shard, fan out to NDJSON; return the (cell, year) buckets touched."""
-        shard_index, shard = shard_with_index
-        items = [self._fetch_fn(b, k) for b, k in _shard_iter_pairs(shard)]
-        items = [it for it in items if it is not None]
-
-        fo = fan_out(items, self._partitioner) if self._partitioner else items
-        buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        for item in fo:
-            cell = item.get("properties", {}).get("grid_partition", "__none__")
-            year = str(_year_from_item(item) or "unknown")
-            buckets[(cell, year)].append(item)
-
-        for (cell, year), group in buckets.items():
-            key = (
-                f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/shard_{shard_index}.jsonl"
+        # Stage A — fetch → NDJSON (distributed).
+        if not self._skip_fetch:
+            stage_fn = partial(
+                _write_ndjson_shard,
+                self._store,
+                self._fetch_fn,
+                self._partitioner,
+                self._ndjson_prefix,
+                fetch_concurrency=self._fetch_concurrency,
             )
-            self._append_ndjson(key, group)
+            results = _collect(client, stage_fn, list(enumerate(shards)), desc="Stage NDJSON")
+            for n_items, touched in results:
+                total += n_items
+                buckets.update(touched)
 
-        return list(buckets.keys())
+        # Stage B — compact NDJSON → GeoParquet (distributed).
+        if self._skip_compact:
+            return {"items": total, "rows": 0}
+
+        if self._skip_fetch:
+            buckets = self._discover_staged_buckets()
+
+        compact_fn = partial(
+            _compact_bucket,
+            self._store,
+            self._ndjson_prefix,
+            self._warehouse_prefix,
+            delta=self._delta,
+        )
+
+        rows = 0
+
+        def _commit(result: tuple[list[str], list[dict], int, list[str]]) -> None:
+            nonlocal rows
+            np, ir, n, ndjson_keys = result
+            if np:
+                self._table.add_files([self._full_path(k) for k in np])
+            if ir:
+                self._index.append(ir)
+            for key in ndjson_keys:
+                try:
+                    obstore.delete(self._store, key)
+                except Exception:
+                    pass
+            rows += n
+
+        _for_each_result(
+            client, compact_fn, sorted(buckets), desc="Compact GeoParquet", on_result=_commit
+        )
+
+        return {"items": total, "rows": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +370,179 @@ def _shard_iter_pairs(shard) -> Iterator[tuple[str, str]]:
     if isinstance(shard, _inventory.InventoryShard):
         return shard.iter_pairs()
     return iter(shard)
+
+
+def _collect(client, fn, iterable, *, desc: str):
+    """``client.map`` + collect results with a tqdm progress bar.
+
+    Works with a real Dask ``Client`` (Futures, collected via
+    ``as_completed`` so the bar advances as tasks finish) and with the
+    in-process fake test client (whose ``map`` returns plain results).
+    """
+    from tqdm import tqdm
+
+    items = list(iterable)
+    futures = client.map(fn, items)
+
+    if futures and hasattr(futures[0], "result"):
+        from dask.distributed import as_completed
+
+        results: list = [None] * len(futures)
+        order = {f: i for i, f in enumerate(futures)}
+        with tqdm(total=len(futures), desc=desc) as pbar:
+            for fut, res in as_completed(futures, with_results=True):
+                results[order[fut]] = res
+                pbar.update(1)
+        return results
+
+    with tqdm(total=len(items), desc=desc) as pbar:
+        for _ in futures:
+            pbar.update(1)
+    return futures
+
+
+def _for_each_result(client, fn, iterable, *, desc: str, on_result) -> None:
+    """``client.map`` + invoke *on_result* per result as it completes.
+
+    Like :func:`_collect` but streaming — each result is handed to
+    ``on_result`` in completion order (so the head can commit each bucket as
+    soon as its workers finish), with a tqdm progress bar.  Works with a real
+    Dask ``Client`` (via ``as_completed``) and the in-process fake test client.
+    """
+    from tqdm import tqdm
+
+    items = list(iterable)
+    futures = client.map(fn, items)
+
+    if futures and hasattr(futures[0], "result"):
+        from dask.distributed import as_completed
+
+        with tqdm(total=len(futures), desc=desc) as pbar:
+            for _fut, res in as_completed(futures, with_results=True):
+                on_result(res)
+                pbar.update(1)
+        return
+
+    with tqdm(total=len(items), desc=desc) as pbar:
+        for res in futures:
+            on_result(res)
+            pbar.update(1)
+
+
+def _append_ndjson(store: object, key: str, items: list[dict]) -> None:
+    """Append items to an NDJSON object, creating or extending it."""
+    lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
+    try:
+        raw = bytes(obstore.get(store, key).bytes())
+        merged = raw.decode("utf-8") + lines
+        obstore.put(store, key, merged.encode("utf-8"))
+    except FileNotFoundError:
+        obstore.put(store, key, lines.encode("utf-8"))
+
+
+def _put_ndjson(store: object, key: str, items: list[dict]) -> None:
+    """Write items to a fresh NDJSON object (single PUT, no read-modify-write)."""
+    lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
+    obstore.put(store, key, lines.encode("utf-8"))
+
+
+def _write_direct(
+    store: object,
+    partitioner,
+    warehouse_prefix: str,
+    items: list[dict],
+) -> tuple[list[str], list[dict], int]:
+    """Write items to GeoParquet without touching the table/index.
+
+    Worker-safe (plain state only) so a distributed caller can fan out this
+    function and commit once on the head.  Returns
+    ``(new_paths, index_rows, rows)``.
+    """
+    fo = fan_out(items, partitioner) if partitioner else items
+    if not fo:
+        return [], [], 0
+
+    rows = 0
+    new_paths: list[str] = []
+    index_rows = [_to_index_row(it) for it in items if it.get("_source_key")]
+
+    for (cell, year), group in group_by_partition(fo).items():
+        year_str = str(year) if year is not None else "unknown"
+        key = f"{warehouse_prefix}/grid_partition={cell}/year={year_str}/part_{uuid.uuid4().hex[:8]}.parquet"
+        n, _ = write_geoparquet_s3(group, store, key)
+        if n > 0:
+            new_paths.append(key)
+            rows += n
+
+    return new_paths, index_rows, rows
+
+
+def _fetch_items(fetch_fn, pairs: list[tuple[str, str]], concurrency: int) -> list:
+    """Fetch STAC items for (bucket, key) pairs concurrently, dropping Nones.
+
+    The default fetch (``earthcatalog.inventory.fetch_item``) runs through the
+    async path (``obstore.get_async`` + orjson, like ``main``) — true I/O
+    concurrency without a thread per request.  A custom ``fetch_fn`` (tests)
+    falls back to a thread pool.
+    """
+    if fetch_fn is _inventory.fetch_item:
+        return _inventory.fetch_items_async(pairs, concurrency=concurrency)
+
+    if concurrency > 1 and len(pairs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            return [it for it in ex.map(lambda bk: fetch_fn(bk[0], bk[1]), pairs) if it is not None]
+    return [it for it in (fetch_fn(b, k) for b, k in pairs) if it is not None]
+
+
+def _write_direct_shard(
+    store: object,
+    fetch_fn,
+    partitioner,
+    warehouse_prefix: str,
+    shard,
+    fetch_concurrency: int = 256,
+) -> tuple[list[str], list[dict], int]:
+    """Fetch each pair in *shard* (concurrent), then write-only fan-out."""
+    pairs = list(_shard_iter_pairs(shard))
+    items = _fetch_items(fetch_fn, pairs, fetch_concurrency)
+    return _write_direct(store, partitioner, warehouse_prefix, items)
+
+
+def _write_ndjson_shard(
+    store: object,
+    fetch_fn,
+    partitioner,
+    ndjson_prefix: str,
+    shard_with_index,
+    fetch_concurrency: int = 256,
+) -> tuple[int, list[tuple[str, str]]]:
+    """Fetch a shard (concurrent), fan out to NDJSON (worker task).
+
+    Returns ``(n_items, touched_buckets)`` — the number of items staged and
+    the ``(cell, year)`` buckets touched, so the head can compact each bucket
+    exactly once.
+    """
+    shard_index, shard = shard_with_index
+    pairs = list(_shard_iter_pairs(shard))
+    items = _fetch_items(fetch_fn, pairs, fetch_concurrency)
+
+    fo = fan_out(items, partitioner) if partitioner else items
+    buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for item in fo:
+        cell = item.get("properties", {}).get("grid_partition", "__none__")
+        year = str(_year_from_item(item) or "unknown")
+        buckets[(cell, year)].append(item)
+
+    for (cell, year), group in buckets.items():
+        # grid_partition (geometry) + year (time) + shard index: the index is a
+        # deterministic integer (like main's chunk_id), so each shard writes a
+        # unique file and concurrent workers never collide.
+        key = f"{ndjson_prefix}/grid_partition={cell}/year={year}/shard_{shard_index}.jsonl"
+        _put_ndjson(store, key, group)
+
+    return len(items), list(buckets.keys())
 
 
 def _year_from_item(item: dict) -> int | None:
@@ -467,3 +581,88 @@ def iter_ndjson_lines(stream) -> Iterator[dict]:
                 yield json.loads(line)
     if pending.strip():
         yield json.loads(pending)
+
+
+_PART_RE = re.compile(r"part_(\d+)\.parquet$")
+
+
+def _next_part_index(store: object, warehouse_prefix: str, cell: str, year: str) -> int:
+    """Next free ``part_N`` index for a (cell, year) partition (max + 1, or 0)."""
+    prefix = f"{warehouse_prefix}/grid_partition={cell}/year={year}/"
+    indices: list[int] = []
+    try:
+        for listing in obstore.list(store, prefix=prefix):
+            for obj in listing:
+                m = _PART_RE.search(obj["path"].rsplit("/", 1)[-1])
+                if m:
+                    indices.append(int(m.group(1)))
+    except Exception:
+        pass
+    return (max(indices) + 1) if indices else 0
+
+
+def _compact_bucket(
+    store: object,
+    ndjson_prefix: str,
+    warehouse_prefix: str,
+    bucket: tuple[str, str],
+    delta: bool = False,
+) -> tuple[list[str], list[dict], int, list[str]]:
+    """Compact one ``(cell, year)`` NDJSON bucket into a single GeoParquet file.
+
+    Worker-safe: takes only plain state (store, string prefixes, int) rather
+    than the whole :class:`Ingester`, so it can be shipped to Dask workers
+    without pickling the Iceberg table or unified index.  *bucket* is a
+    single ``(cell, year)`` tuple so it maps cleanly over ``client.map``.
+
+    Like main's warehouse consolidation, the whole partition is held in
+    memory: every staged NDJSON file is streamed line-by-line (never a full
+    ``.bytes()`` read), deduped exactly by item ID, sorted by
+    ``(platform, datetime)``, and written as ONE deterministic
+    ``part_{idx:06d}.parquet``.  A hot cell with ~500k items needs a few GB —
+    scale the worker VM instead of batching.
+
+    The output name is deterministic so a re-run overwrites the same file
+    instead of orphaning ``part_<uuid>`` copies.  In full mode (*delta* False)
+    the index is 0 (idempotent re-run); in delta mode (*delta* True) it
+    continues from the next free ``part_N`` so existing files are never
+    clobbered.
+
+    Returns ``(new_paths, index_rows, rows, ndjson_keys)`` — the caller (head
+    node) commits to Iceberg + index once, then deletes the consumed NDJSON.
+    """
+    cell, year = bucket
+    bucket_dir = f"{ndjson_prefix}/grid_partition={cell}/year={year}/"
+    jsonl_keys: list[str] = []
+    try:
+        for listing in obstore.list(store, prefix=bucket_dir):
+            for obj in listing:
+                k: str = obj["path"]
+                if k.endswith(".jsonl"):
+                    jsonl_keys.append(k)
+    except Exception:
+        return [], [], 0, []
+    if not jsonl_keys:
+        return [], [], 0, []
+
+    seen: set[str] = set()
+    items: list[dict] = []
+    for key in sorted(jsonl_keys):
+        result = obstore.get(store, key)
+        for item in iter_ndjson_lines(result.stream()):
+            item_id = item.get("id")
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            items.append(item)
+
+    if not items:
+        return [], [], 0, jsonl_keys
+
+    idx = _next_part_index(store, warehouse_prefix, cell, year) if delta else 0
+    out_key = f"{warehouse_prefix}/grid_partition={cell}/year={year}/part_{idx:06d}.parquet"
+    n, _ = write_geoparquet_s3(sorted(items, key=_sort_key), store, out_key)
+    if n == 0:
+        return [], [], 0, jsonl_keys
+    index_rows = [_to_index_row(it) for it in items if it.get("_source_key")]
+    return [out_key], index_rows, n, jsonl_keys

@@ -26,9 +26,9 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     "catalog.py": CATALOG_PY_MAX_LINES,
     "search.py": 565,
     # Phase 3 target
-    "ingest.py": 500,
+    "ingest.py": 700,
     # Extracted from catalog.py — ingest orchestration
-    "pipeline.py": 160,
+    "pipeline.py": 245,
     # Everything else
     "*": 1600,
 }

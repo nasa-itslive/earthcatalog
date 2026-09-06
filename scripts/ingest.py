@@ -57,18 +57,20 @@ def run(
     catalog_key: str = "test-space/stac/catalog/earthcatalog.db",
     lock_key: str = "test-space/stac/catalog/.lock",
     chunk_size: int = 100_000,
-    compact_rows: int = 100_000,
     limit: int | None = None,
     since: "datetime | None" = None,
     delta: bool = False,
     mode: str | None = None,  # "full" | "delta" | "auto" — overrides delta
     skip_fetch: bool = False,
     skip_compact: bool = False,
+    scatter_only: bool = False,
+    fetch_concurrency: int = 256,
     grid=None,  # Optional GridConfig for fresh (full) builds
     # Scheduler — mutually exclusive with create_client
     scheduler: str = "synchronous",  # "synchronous" | "local" | "coiled"
     workers: int = 4,
     threads_per_worker: int = 2,
+    memory_limit: str = "auto",
     coiled_n_workers: int = 10,
     coiled_vm_type: str = "c6i.xlarge",
     coiled_scheduler_address: str | None = None,
@@ -84,7 +86,10 @@ def run(
     Parameters
     ----------
     inventory:
-        S3 Inventory manifest.json URI or local path.
+        S3 Inventory manifest.json URI or local path.  May also point at a
+        ``scatter.json`` manifest written by a previous ``scatter_only=True``
+        run — the pre-scattered shard files are consumed as-is and the
+        inventory is not re-read.
     catalog:
         Local SQLite path for the Iceberg catalog (created if absent).
     warehouse:
@@ -94,6 +99,11 @@ def run(
         ``earthcatalog.db`` at the end of the run.
     lock_key:
         Object key for the distributed lock file.
+    scatter_only:
+        Distributed only: stop after writing the fixed-row shard files (no
+        cluster needed) and print the scatter manifest path.  Re-run with
+        ``inventory=<that path>`` to execute the map/reduce — workers start
+        immediately instead of idling behind the head's inventory read.
     create_client:
         Optional callable that returns a Dask ``Client``.  When provided,
         ``scheduler`` / ``coiled_*`` parameters are ignored.  Use this from a
@@ -158,7 +168,10 @@ def run(
                 worker_vm_types=[coiled_vm_type],
                 region="us-west-2",
                 name="earthcatalog-ingest",
-                worker_options={"nthreads": threads_per_worker},
+                worker_options={
+                    "nthreads": threads_per_worker,
+                    "memory_limit": memory_limit,
+                },
                 spot_policy="spot_with_fallback",
             )
             client = Client(cluster)
@@ -188,7 +201,11 @@ def run(
         from dask.distributed import Client, LocalCluster
 
         def _make_local():
-            cluster = LocalCluster(n_workers=workers, threads_per_worker=threads_per_worker)
+            cluster = LocalCluster(
+                n_workers=workers,
+                threads_per_worker=threads_per_worker,
+                memory_limit=memory_limit,
+            )
             return Client(cluster)
 
         resolved_client = _make_local
@@ -216,16 +233,17 @@ def run(
 
     cfg = IngestConfig(
         chunk_size=chunk_size,
-        compact_rows=compact_rows,
         limit=limit,
         since=since,
         create_client=resolved_client,
         delta=(delta or None),
         skip_fetch=skip_fetch,
         skip_compact=skip_compact,
+        scatter_only=scatter_only,
+        fetch_concurrency=fetch_concurrency,
     )
 
-    ec.ingest_inventory(
+    return ec.ingest_inventory(
         inventory_path=inventory,
         mode=mode or ("delta" if delta else "auto"),
         config=cfg,
@@ -235,7 +253,12 @@ def run(
 def main() -> None:
     parser = argparse.ArgumentParser(description="EarthCatalog ingest pipeline")
     parser.add_argument(
-        "--inventory", required=True, help="S3 inventory path (CSV, Parquet, or manifest.json)"
+        "--inventory",
+        required=True,
+        help=(
+            "S3 inventory path (CSV, Parquet, or manifest.json), or a scatter.json "
+            "manifest from a previous --scatter-only run"
+        ),
     )
     parser.add_argument(
         "--catalog", default="/tmp/earthcatalog_v2.db", help="Local SQLite catalog path"
@@ -246,7 +269,6 @@ def main() -> None:
         help="Warehouse root (s3:// URI or local path)",
     )
     parser.add_argument("--chunk-size", type=int, default=100_000, help="Items per fetch chunk")
-    parser.add_argument("--compact-rows", type=int, default=100_000, help="Max rows per GeoParquet")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--since", default=None, help="Only items modified >= this date (YYYY-MM-DD)"
@@ -270,6 +292,12 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--threads-per-worker", type=int, default=2)
+    parser.add_argument(
+        "--memory-limit",
+        default="auto",
+        help="Worker memory limit (Dask format, e.g. '14GiB', or 0 to disable). "
+        "Default 'auto' = 60%% of worker RAM.",
+    )
     parser.add_argument("--coiled-n-workers", type=int, default=10)
     parser.add_argument("--coiled-vm-type", default="c6i.xlarge")
     parser.add_argument(
@@ -295,6 +323,21 @@ def main() -> None:
         "--skip-compact",
         action="store_true",
         help="Only fetch + stage NDJSON; leave compaction for a later run.",
+    )
+    parser.add_argument(
+        "--scatter-only",
+        action="store_true",
+        help=(
+            "Only scatter the inventory into fixed-row shard files (no cluster needed); "
+            "print the scatter.json path. Re-run with --inventory <that path> to "
+            "ingest without re-reading the inventory."
+        ),
+    )
+    parser.add_argument(
+        "--fetch-concurrency",
+        type=int,
+        default=256,
+        help="Concurrent in-flight S3 GETs per worker during the STAC fetch.",
     )
     parser.add_argument(
         "--grid",
@@ -342,17 +385,19 @@ def main() -> None:
         ),
         lock_key=os.environ.get("EARTHCATALOG_LOCK_KEY", "test-space/stac/catalog/.lock"),
         chunk_size=args.chunk_size,
-        compact_rows=args.compact_rows,
         limit=args.limit,
         since=since,
         delta=args.delta,
         mode=args.mode,
         skip_fetch=args.skip_fetch,
         skip_compact=args.skip_compact,
+        scatter_only=args.scatter_only,
+        fetch_concurrency=args.fetch_concurrency,
         grid=grid_cfg,
         scheduler=args.scheduler,
         workers=args.workers,
         threads_per_worker=args.threads_per_worker,
+        memory_limit=args.memory_limit,
         coiled_n_workers=args.coiled_n_workers,
         coiled_vm_type=args.coiled_vm_type,
         coiled_scheduler_address=args.coiled_scheduler_address,

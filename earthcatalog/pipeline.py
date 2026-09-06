@@ -7,15 +7,19 @@ table is rebuilt first (``mode``).  The engine — fetch, fan-out, stage,
 compact, commit — is identical, and the unified index makes every run
 resumable and idempotent regardless of scope.
 
-Sharding
---------
-Distributed runs split the inventory with
-:func:`earthcatalog.inventory.iter_inventory_shards`: a ``manifest.json``
-inventory becomes one shard per part file (workers stream their own files,
-so the head never materialises the full pair list), while single-file
-inventories or an exact ``limit`` fall back to pair-list shards.  Workers
-only write data files; the head node commits to Iceberg and the unified
-index exactly once, so neither is ever written concurrently.
+Distributed execution (scatter → map → reduce)
+----------------------------------------------
+*Scatter*: the head streams the inventory once and writes fixed-row shard
+parquets to the warehouse (``write_inventory_shards``); head memory stays
+bounded and every shard holds exactly ``chunk_size`` items, so worker load
+is uniform regardless of how unbalanced the source inventory part files
+are.  *Map*: each worker reads its own shard URL
+(:class:`earthcatalog.inventory.InventoryShard`), fetches the STAC items,
+and fans them out to per-(cell, year) NDJSON (or writes GeoParquet
+directly in ``direct`` stage).  *Reduce*: only the head node compacts,
+commits to Iceberg and appends to the unified index — exactly once — so
+neither is ever written concurrently.  Shard files are deleted after the
+run; a crashed run leaves only orphaned files under a dead run prefix.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from __future__ import annotations
 import os
 from datetime import UTC
 from datetime import datetime as _dt
+from itertools import islice
 from typing import TYPE_CHECKING
 
 from .ingest_config import IngestConfig
@@ -50,7 +55,16 @@ class IngestPipeline:
         from .grids import build_partitioner
         from .index import Index
         from .ingest import DaskIngester, Ingester
-        from .inventory import iter_inventory, iter_inventory_shards
+        from .inventory import (
+            delete_scatter,
+            is_scatter_manifest,
+            iter_inventory,
+            load_inventory_shards,
+            scatter_manifest_exists,
+            scatter_manifest_path,
+            scatter_staging_prefix,
+            write_inventory_shards,
+        )
         from .schema import FULL_NAME, NAMESPACE
 
         if not os.environ.get("AWS_ACCESS_KEY_ID"):
@@ -124,26 +138,101 @@ class IngestPipeline:
             warehouse_prefix=warehouse_prefix,
             warehouse_root=warehouse_root,
             batch_size=cfg.chunk_size,
-            compact_rows=cfg.compact_rows,
             skip_fetch=cfg.skip_fetch,
             skip_compact=cfg.skip_compact,
             stage=cfg.stage,
+            fetch_concurrency=cfg.fetch_concurrency,
+            delta=delta,
         )
 
-        if cfg.create_client is not None:
-            # Distributed: one shard per inventory part file when possible;
-            # workers stream their own pairs, the head never materialises them.
-            shards = iter_inventory_shards(
-                inventory_path,
-                chunk_size=cfg.chunk_size,
-                since=cfg.since,
-                suffix=".stac.json",
-                limit=cfg.limit,
-            )
+        if cfg.scatter_only or cfg.create_client is not None:
+            # Scatter step (head-only, no cluster needed).  The head streams
+            # the inventory, filters to .stac.json items, and writes fixed-row
+            # shard parquets + a scatter.json manifest.  scatter_only stops
+            # here; create_client proceeds to the distributed map/reduce.
+            # skip_fetch (Stage B only) consolidates already-staged NDJSON and
+            # needs no shards.
+            staging_prefix = ""
+            if cfg.skip_fetch and not cfg.scatter_only:
+                shards: list = []
+                print("skip_fetch set — consolidating staged NDJSON (no scatter).")
+            elif is_scatter_manifest(inventory_path):
+                # Step 2: consume pre-scattered shards, skip the head read.
+                shards = load_inventory_shards(inventory_path, cat._store)
+                staging_prefix = inventory_path.rstrip("/").rsplit("/", 1)[0]
+                print(
+                    f"Map/reduce: {len(shards)} pre-scattered shard file(s) from {inventory_path}"
+                )
+            else:
+                # Step 1: scatter the inventory into fixed-row shard files.  The
+                # prefix is deterministic in the inventory + params, so a re-run
+                # of this step detects an existing scatter and reuses it.
+                staging_prefix = scatter_staging_prefix(
+                    warehouse_prefix,
+                    inventory_path,
+                    chunk_size=cfg.chunk_size,
+                    since=cfg.since,
+                    suffix=".stac.json",
+                    limit=cfg.limit,
+                )
+                if scatter_manifest_exists(cat._store, staging_prefix):
+                    shards = load_inventory_shards(
+                        scatter_manifest_path(staging_prefix), cat._store
+                    )
+                    print(
+                        f"Scatter already exists ({len(shards)} shard file(s)) — reusing "
+                        f"{scatter_manifest_path(staging_prefix)}"
+                    )
+                else:
+                    shards = write_inventory_shards(
+                        inventory_path,
+                        cat._store,
+                        staging_prefix=staging_prefix,
+                        chunk_size=cfg.chunk_size,
+                        since=cfg.since,
+                        suffix=".stac.json",
+                        limit=cfg.limit,
+                    )
+                    print(
+                        f"Scatter: {len(shards)} shard file(s) of ≤{cfg.chunk_size:,} items "
+                        f"({scatter_manifest_path(staging_prefix)})"
+                    )
+
+            if cfg.scatter_only:
+                print("scatter_only set — skipping map/reduce.")
+                if cat._store and cat._catalog_key:
+                    cat.upload_catalog(local_db)
+                return {
+                    "items": 0,
+                    "rows": 0,
+                    "scatter": scatter_manifest_path(staging_prefix),
+                }
+
             client = cfg.create_client()
-            summary = DaskIngester(**kwargs).run(shards, client=client)
+            try:
+                summary = DaskIngester(**kwargs).run(shards, client=client)
+            except Exception:
+                if staging_prefix:
+                    print(
+                        "Ingest failed — shard files kept for resume; re-run with "
+                        f"inventory_path={scatter_manifest_path(staging_prefix)}"
+                    )
+                else:
+                    print("Ingest failed — staged NDJSON kept; re-run with skip_fetch=True.")
+                raise
+            if staging_prefix:
+                deleted = delete_scatter(cat._store, staging_prefix, shards)
+                print(f"Scatter cleanup: removed {deleted} object(s) under {staging_prefix}")
         else:
-            summary = Ingester(**kwargs).run(iter_inventory(inventory_path, since=cfg.since))
+            # Serial: filter .stac.json + limit, same as the scatter does.
+            pairs = (
+                (b, k)
+                for b, k in iter_inventory(inventory_path, since=cfg.since)
+                if k.endswith(".stac.json")
+            )
+            if cfg.limit is not None:
+                pairs = islice(pairs, cfg.limit)
+            summary = Ingester(**kwargs).run(pairs)
 
         if cat._store and cat._catalog_key:
             cat.upload_catalog(local_db)
