@@ -26,9 +26,8 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     "catalog.py": CATALOG_PY_MAX_LINES,
     "search.py": 565,
     # Phase 3 target (+ journal hooks, bounded fetch pool, dedupe DI).
-    # Temporarily loose: RPI-C deletes the serial ndjson branch (~-100 lines),
-    # tighten back to <=730 there.
-    "ingest.py": 810,
+    # Serial ndjson branch deleted in RPI-C (bulk-only now).
+    "ingest.py": 780,
     # Extracted from catalog.py — ingest orchestration + daily dry-run +
     # _last_run.json writer + full-mode reset + anti-join wiring
     "pipeline.py": 370,

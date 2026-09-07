@@ -32,11 +32,6 @@ class IngestConfig:
     # manifest path — workers never idle behind the head's inventory read.
     # Re-invoke with inventory_path=<scatter.json> to run the map/reduce.
     scatter_only: bool = False
-    # "direct" writes GeoParquet immediately — the daily default (the write-
-    # ahead journal covers its commit windows).  "ndjson" stages items to
-    # per-(cell, year) NDJSON first (PGSTAC interchange; resumable,
-    # memory-bounded compaction) — select it explicitly.
-    stage: str = "direct"
     # Concurrent in-flight S3 GETs per Dask worker during the STAC fetch (async
     # via obstore.get_async, so this is lightweight — no thread per request).
     fetch_concurrency: int = 256

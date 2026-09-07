@@ -162,7 +162,6 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
         index=index,
         table=_FakeTable(),
         fetch_fn=lambda b, k: _make_item(k),
-        stage="direct",
         warehouse_prefix="warehouse",
         warehouse_root=str(wh),
         batch_size=10,
@@ -208,7 +207,7 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
 
     from earthcatalog.ingest_config import IngestConfig
 
-    summary = IngestPipeline(ec, config=IngestConfig(stage="direct")).run(
+    summary = IngestPipeline(ec, config=IngestConfig()).run(
         str(inv_path), mode="full"
     )
 

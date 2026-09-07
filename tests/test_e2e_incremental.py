@@ -123,7 +123,6 @@ class TestEndToEndDaily:
             fetch_fn=_fetch,
             warehouse_prefix="warehouse",
             warehouse_root=wh,
-            stage="direct",
         )
         pairs1 = iter_inventory_parquet(day1)
         summary1 = ing1.run(pairs1)
@@ -150,7 +149,6 @@ class TestEndToEndDaily:
             fetch_fn=_fetch,
             warehouse_prefix="warehouse",
             warehouse_root=wh,
-            stage="direct",
         )
         summary2 = ing2.run(iter_inventory_parquet(new_path))
         # item-3's key is already known → skipped; only item-4 fetched.
@@ -195,7 +193,6 @@ class TestEndToEndDaily:
             fetch_fn=_fetch,
             warehouse_prefix="warehouse",
             warehouse_root=wh,
-            stage="direct",
         )
         summary3 = ing3.run(iter_inventory_parquet(new_path))
         assert summary3["items"] == 0, summary3

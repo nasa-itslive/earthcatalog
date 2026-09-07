@@ -228,13 +228,14 @@ class IngestPipeline:
             batch_size=cfg.chunk_size,
             skip_fetch=cfg.skip_fetch,
             skip_compact=cfg.skip_compact,
-            stage=cfg.stage,
             fetch_concurrency=cfg.fetch_concurrency,
             fetch_workers=cfg.fetch_workers,
             delta=delta,
         )
         if dedupe is not None:
             kwargs["dedupe"] = dedupe_pairs
+        # Bulk profile stages NDJSON internally (fan-out byproduct); the
+        # serial path is direct-only.
 
         if cfg.scatter_only or cfg.create_client is not None:
             # Scatter step (head-only, no cluster needed).  The head streams

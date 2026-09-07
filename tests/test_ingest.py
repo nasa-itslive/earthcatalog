@@ -39,7 +39,6 @@ def _make_item(key: str) -> dict:
 def _run(
     keys: list[str],
     *,
-    stage: str = "direct",
     fetch_fn=None,
     batch_size: int = 2,
 ):
@@ -64,7 +63,6 @@ def _run(
         index=index,
         table=table,
         fetch_fn=fetch_fn or _default_fetch,
-        stage=stage,
         warehouse_prefix="warehouse/",
         batch_size=batch_size,
     )
@@ -134,7 +132,6 @@ class TestResume:
             index=index,
             table=table,
             fetch_fn=_failing,
-            stage="direct",
             warehouse_prefix="warehouse/",
             batch_size=2,
         )
@@ -150,7 +147,6 @@ class TestResume:
             index=index,
             table=table,
             fetch_fn=lambda b, k: _make_item(k),
-            stage="direct",
             warehouse_prefix="warehouse/",
             batch_size=2,
         )
@@ -183,6 +179,7 @@ class TestDaskIngester:
             index=index,
             table=table,
             fetch_fn=lambda b, k: _make_item(k),
+            stage="direct",
             warehouse_prefix="warehouse/",
         )
 
@@ -217,7 +214,6 @@ class TestDaskIngesterShardSpecs:
             index=index,
             table=table,
             fetch_fn=lambda b, k: _make_item(k),
-            stage=stage,
             warehouse_prefix="warehouse/",
         )
 
@@ -390,341 +386,73 @@ class TestScatterMapReduce:
         assert all("shard" not in k for k in data_files) and data_files
 
 
-class TestNdjsonMode:
-    def test_single_node_stages_ndjson_then_compacts(self):
-        """stage=ndjson: Stage A writes NDJSON, Stage B compacts to GeoParquet."""
+class TestNdjsonCompaction:
+    """Bulk staging compaction: ``_compact_bucket`` over staged NDJSON.
+
+    (The NDJSON is a byproduct of the Dask worker fan-out; these tests call
+    the compaction directly with hand-staged buckets.)
+    """
+
+    def _stage(self, keys):
+        from earthcatalog.ingest import _put_ndjson
+
         store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json"]
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
+        prefix = "warehouse/staging/ndjson"
+        items = [_make_item(k) for k in keys]
+        _put_ndjson(
+            store,
+            f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl",
+            items,
         )
-        ing.run(_inventory(keys))
+        return store, prefix
 
-        files = _list_files(store, "warehouse/")
-        # NDJSON is staged, compacted, then deleted after the commit — a full
-        # ndjson run must leave only GeoParquet behind (resumable/idempotent).
-        assert not any(k.endswith(".jsonl") for k in files), files
-        assert len(table.files) >= 1
+    def _compact(self, store, prefix, *, delta=False):
+        from earthcatalog.ingest import _compact_bucket
 
-    def test_skip_compact_only_stages(self):
-        """skip_compact=True: Stage A writes NDJSON but does NOT compact."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json"]
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_compact=True,
-        )
-        ing.run(_inventory(keys))
-
-        # NDJSON staged, no GeoParquet registered.
-        ndjson = [k for k in _list_files(store, "warehouse/") if k.endswith(".jsonl")]
-        assert len(ndjson) >= 1
-        assert table.files == []
-
-    def test_skip_fetch_only_compacts_existing_staging(self):
-        """skip_fetch=True: no fetching; compacts whatever NDJSON is staged."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json"]
-
-        # Stage A only (skip_compact) to create the NDJSON.
-        ing1 = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_compact=True,
-        )
-        ing1.run(_inventory(keys))
-        assert table.files == []
-
-        # Resume: skip_fetch — no fetch calls, just compact the staged NDJSON.
-        fetch_calls = {"n": 0}
-
-        def _counting_fetch(b, k):
-            fetch_calls["n"] += 1
-            return _make_item(k)
-
-        ing2 = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=_counting_fetch,
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_fetch=True,
-        )
-        ing2.run(_inventory(keys))
-
-        assert fetch_calls["n"] == 0
-        assert len(table.files) >= 1
-        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
-        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
-
-    def test_dask_stages_ndjson_then_compacts(self):
-        """DaskIngester with stage=ndjson: workers write NDJSON, head compacts."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json", "c.stac.json"]
-        ing = DaskIngester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
+        return _compact_bucket(
+            store, prefix, "warehouse", ("cellA", "2020"), delta=delta
         )
 
-        class _FakeClient:
-            def map(self, fn, args):
-                return [fn(a) for a in args]
+    def _part_files(self, store):
+        return [
+            k
+            for k in _list_files(store, "warehouse/")
+            if k.endswith(".parquet") and "index" not in k
+        ]
 
-            def gather(self, results):
-                return results
-
-        shards = [_inventory(keys[:2]), _inventory(keys[2:])]
-        ing.run(shards, client=_FakeClient())
-
-        # NDJSON is consumed (deleted) after the head commits; only parquet remains.
-        assert not any(k.endswith(".jsonl") for k in _list_files(store, "warehouse/"))
-        assert len(table.files) >= 1
-        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
-
-        all_ids = []
-        for f in _list_files(store, "warehouse/"):
-            if f.endswith(".parquet") and "index" not in f:
-                all_ids.extend(_read_ids(store, f))
-        assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json", "item-c.stac.json"]
-
-    def test_dask_split_stages_scatter_then_consolidate(self):
-        """The distributed ndjson pipeline can run Stage A (scatter NDJSON,
-        skip_compact) and Stage B (consolidate, skip_fetch) as separate calls."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json", "c.stac.json"]
-
-        class _FakeClient:
-            def map(self, fn, args):
-                return [fn(a) for a in args]
-
-            def gather(self, results):
-                return results
-
-        shards = [_inventory(keys[:2]), _inventory(keys[2:])]
-
-        # Stage A: scatter NDJSON only — no GeoParquet, no index rows.
-        ing_a = DaskIngester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_compact=True,
-        )
-        summary_a = ing_a.run(shards, client=_FakeClient())
-        assert summary_a["items"] == 3
-        assert summary_a["rows"] == 0
-        assert table.files == []
-        assert index.known_source_keys() == set()
-        assert any(k.endswith(".jsonl") for k in _list_files(store, "warehouse/"))
-
-        # Stage B: consolidate the staged NDJSON — skip fetch entirely.
-        fetch_calls = {"n": 0}
-
-        def _counting_fetch(b, k):
-            fetch_calls["n"] += 1
-            return _make_item(k)
-
-        ing_b = DaskIngester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=_counting_fetch,
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_fetch=True,
-        )
-        summary_b = ing_b.run([], client=_FakeClient())
-        assert fetch_calls["n"] == 0, "Stage B must not fetch"
-        assert summary_b["rows"] == 3
-        assert len(table.files) >= 1
-        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
-        assert not any(k.endswith(".jsonl") for k in _list_files(store, "warehouse/"))
-
-    def test_ndjson_rerun_is_noop(self):
-        """Re-running ndjson mode skips already-indexed keys (no duplicates)."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json"]
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-        )
-        ing.run(_inventory(keys))
-        files_after_first = len(table.files)
-
-        ing.run(_inventory(keys))  # second run: nothing new
-
-        assert len(table.files) == files_after_first
-        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
-
-        all_ids = []
-        for f in _list_files(store, "warehouse/"):
-            if f.endswith(".parquet") and "index" not in f:
-                all_ids.extend(_read_ids(store, f))
-        assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json"]
-
-
-class TestNdjsonCompact:
     def test_compacts_to_single_part(self):
         """One (cell, year) bucket compacts to a single deterministic part
         file holding every staged item exactly once."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
+        store, prefix = self._stage([f"{c}.stac.json" for c in "abcde"])
+        np_, ir, rows, consumed = self._compact(store, prefix)
 
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = [f"{c}.stac.json" for c in "abcde"]
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-        )
-        ing.run(_inventory(keys))
-
-        part_files = [
-            k
-            for k in _list_files(store, "warehouse/")
-            if k.endswith(".parquet") and "index" not in k
-        ]
-        assert len(part_files) == 1, part_files
-
-        # Every item present exactly once, no duplicates.
+        assert rows == 5
+        assert len(np_) == 1
         all_ids = []
-        for f in part_files:
+        for f in np_:
             all_ids.extend(_read_ids(store, f))
         assert sorted(all_ids) == [f"item-{c}.stac.json" for c in "abcde"]
 
-    def test_each_part_sorted_within_batch(self):
-        """Within a batch, items are sorted by (platform, datetime)."""
+    def test_part_sorted_by_platform_datetime(self):
+        """Within a part, items are sorted by (platform, datetime)."""
+        from earthcatalog.ingest import _put_ndjson
+
         store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        # Items share a cell; give them distinct platforms to observe sort order.
-        keys = ["p2.stac.json", "p1.stac.json", "p3.stac.json"]
-
-        def _item_with_platform(key):
+        prefix = "warehouse/staging/ndjson"
+        items = []
+        for key in ("p2.stac.json", "p1.stac.json", "p3.stac.json"):
             it = _make_item(key)
             it["properties"]["platform"] = key[:2]
-            return it
-
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _item_with_platform(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
+            items.append(it)
+        _put_ndjson(
+            store,
+            f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl",
+            items,
         )
-        ing.run(_inventory(keys))
 
-        part_files = [
-            k
-            for k in _list_files(store, "warehouse/")
-            if k.endswith(".parquet") and "index" not in k
-        ]
-        assert len(part_files) == 1
-        assert _read_ids(store, part_files[0]) == [
+        np_, ir, rows, _ = self._compact(store, prefix)
+        assert len(np_) == 1
+        assert _read_ids(store, np_[0]) == [
             "item-p1.stac.json",
             "item-p2.stac.json",
             "item-p3.stac.json",
@@ -732,95 +460,29 @@ class TestNdjsonCompact:
 
     def test_exact_dedup_keeps_every_unique_item(self):
         """Duplicate NDJSON lines are deduped exactly — no legitimate item is
-        dropped (unlike a Bloom filter, which would lose ~0.1% of items in a
-        large cell/year bucket)."""
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
+        dropped (unlike a Bloom filter, which would lose ~0.1% of items)."""
+        from earthcatalog.ingest import _put_ndjson
 
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        keys = ["a.stac.json", "b.stac.json"]
-
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_compact=True,  # keep the NDJSON staged for the dedup step
-        )
-        # Run once to build the NDJSON, then append duplicate lines manually to
-        # simulate a crash-resume that re-wrote the same items.
-        ing.run(_inventory(keys))
-        ndjson = [k for k in _list_files(store, "warehouse/") if k.endswith(".jsonl")]
-        assert ndjson
-        key = ndjson[0]
+        store, prefix = self._stage(["a.stac.json", "b.stac.json"])
+        key = f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl"
         dup = bytes(store.get(key).bytes())
         store.put(key, dup + dup)  # double every line
 
-        # Re-run with a fresh ingester: index is empty of hashes only if the
-        # first run indexed nothing — it did, so instead compact the bucket
-        # directly via a second ingester that skips the index check.
-        ing2 = Ingester(
-            store=store,
-            index=Index(store, "warehouse/other.parquet"),  # fresh, empty index
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-        )
-        # Feed nothing new; Stage A writes nothing, but we compact the stale
-        # bucket manually to prove dedup drops duplicates exactly.
-        cell, year = "cellA", "2020"
-        np, _, rows, _ = ing2._compact_ndjson_bucket(cell, year)
-
-        # 2 unique items -> exactly 2 rows, never 4, and both ids survive.
-        assert rows == 2, rows
+        np_, ir, rows, _ = self._compact(store, prefix)
+        assert rows == 2
         all_ids = []
-        for f in np:
+        for f in np_:
             all_ids.extend(_read_ids(store, f))
         assert sorted(all_ids) == ["item-a.stac.json", "item-b.stac.json"]
 
     def test_compaction_streams_ndjson(self):
-        """Compaction reads NDJSON via stream(), never loading the whole file
-        into RAM (raw.decode().splitlines() would spike to ~file size)."""
+        """Compaction reads NDJSON via stream(), never a whole-file read."""
         import obstore as _obstore_mod
 
-        from earthcatalog.ingest import Ingester as _Ing
-        from earthcatalog.ingest import iter_ndjson_lines
+        from earthcatalog.ingest import _compact_bucket
 
-        store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
+        store, prefix = self._stage(["a.stac.json", "b.stac.json"])
 
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        ing = _Ing(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse/",
-            skip_compact=True,  # keep the NDJSON staged for the stream() assertion
-        )
-        ing.run(_inventory(["a.stac.json", "b.stac.json"]))
-
-        # Compact must use .stream() (a full-object .bytes() read is the
-        # anti-pattern that spikes RAM). We wrap get() and assert stream()
-        # was invoked on the result for the NDJSON read.
         real_get = _obstore_mod.get
         stream_used = {"yes": False}
 
@@ -839,82 +501,49 @@ class TestNdjsonCompact:
             return _SpyResult(real_get(store_obj, key))
 
         with patch.object(_obstore_mod, "get", side_effect=_fake_get):
-            ing._compact_ndjson_bucket("cellA", "2020")
+            _compact_bucket(store, prefix, "warehouse", ("cellA", "2020"))
 
         assert stream_used["yes"], "compaction did not read NDJSON via stream()"
-
-        # The streaming helper yields items without materializing the file.
-        ndjson = [k for k in _list_files(store, "warehouse/") if k.endswith(".jsonl")]
-        st = real_get(store, ndjson[0]).stream()
-        lines = list(iter_ndjson_lines(st))
-        assert [line["id"] for line in lines] == ["item-a.stac.json", "item-b.stac.json"]
-
-    def test_iter_ndjson_lines_splits_across_chunks(self):
-        """Lines split across stream chunks are reassembled correctly."""
-        from earthcatalog.ingest import iter_ndjson_lines
-
-        class _FakeStream:
-            def __init__(self, chunks):
-                self._chunks = iter(chunks)
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                return next(self._chunks)
-
-        # 'a' split so the newline lands at a chunk boundary.
-        chunks = [b'{"id": "item-a", "props":', b' {"x": 1}}\n{"id": "item-b"', b"}\n"]
-        items = list(iter_ndjson_lines(_FakeStream(chunks)))
-        assert [i["id"] for i in items] == ["item-a", "item-b"]
 
 
 class TestDeterministicPartNaming:
     def _stage(self, keys, *, delta=False):
+        from earthcatalog.ingest import _put_ndjson
+
         store = MemoryStore()
-        index = Index(store, "warehouse/index.parquet")
-
-        class _FakeTable:
-            def __init__(self):
-                self.files: list[str] = []
-
-            def add_files(self, paths):
-                self.files.extend(paths)
-
-        table = _FakeTable()
-        ing = Ingester(
-            store=store,
-            index=index,
-            table=table,
-            fetch_fn=lambda b, k: _make_item(k),
-            stage="ndjson",
-            warehouse_prefix="warehouse",
-            skip_compact=True,
-            delta=delta,
+        prefix = "warehouse/staging/ndjson"
+        _put_ndjson(
+            store,
+            f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl",
+            [_make_item(k) for k in keys],
         )
-        ing.run(_inventory(keys))
-        return store, index, table, ing
+        return store, prefix
+
+    def _compact(self, store, prefix, *, delta=False):
+        from earthcatalog.ingest import _compact_bucket
+
+        return _compact_bucket(
+            store, prefix, "warehouse", ("cellA", "2020"), delta=delta
+        )
 
     def test_full_mode_names_parts_deterministically(self):
         """Full compaction writes part_000000 — a single deterministic part
         file per bucket, no uuids."""
-        store, index, table, ing = self._stage([f"{c}.stac.json" for c in "abcde"])
-        np, ir, rows, _ = ing._compact_ndjson_bucket("cellA", "2020")
+        store, prefix = self._stage([f"{c}.stac.json" for c in "abcde"])
+        np_, ir, rows, _ = self._compact(store, prefix)
         assert rows == 5
-        names = [p.rsplit("/", 1)[-1] for p in np]
+        names = [p.rsplit("/", 1)[-1] for p in np_]
         assert names == ["part_000000.parquet"]
 
     def test_delta_mode_continues_from_next_part_index(self):
         """Delta compaction appends after existing part_N files, never clobbers."""
-        store, index, table, ing = self._stage(
-            ["a.stac.json", "b.stac.json", "c.stac.json"], delta=True
-        )
+        store, prefix = self._stage(["a.stac.json", "b.stac.json", "c.stac.json"])
         # Pre-existing partition files from a prior full ingest.
         store.put("warehouse/grid_partition=cellA/year=2020/part_000000.parquet", b"x")
         store.put("warehouse/grid_partition=cellA/year=2020/part_000001.parquet", b"x")
 
-        np, ir, rows, _ = ing._compact_ndjson_bucket("cellA", "2020")
-        names = [p.rsplit("/", 1)[-1] for p in np]
+        np_, ir, rows, _ = self._compact(store, prefix, delta=True)
+        names = [p.rsplit("/", 1)[-1] for p in np_]
         assert names == ["part_000002.parquet"]
 
 
@@ -1128,7 +757,6 @@ class TestUnknownYearSentinel:
             index=index,
             table=_FakeTable(),
             fetch_fn=lambda b, k: no_datetime_item(k),
-            stage="direct",
             warehouse_prefix="warehouse",
             batch_size=10,
         )

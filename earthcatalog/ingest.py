@@ -55,13 +55,9 @@ class Ingester:
         *,
         fetch_fn=None,
         partitioner=None,
-        stage: str = "direct",
         warehouse_prefix: str = "",
         warehouse_root: str | None = None,
         batch_size: int = 10_000,
-        skip_fetch: bool = False,
-        skip_compact: bool = False,
-        fetch_concurrency: int = 256,
         fetch_workers: int = 1,
         delta: bool = False,
         dedupe: Callable[[Iterator], Iterator] | None = None,
@@ -71,24 +67,15 @@ class Ingester:
         self._table = table
         self._fetch_fn = fetch_fn or _inventory.fetch_item
         self._partitioner = partitioner
-        self._stage = stage
         self._warehouse_prefix = warehouse_prefix.rstrip("/")
         self._warehouse_root = warehouse_root
         self._batch_size = batch_size
-        self._skip_fetch = skip_fetch
-        self._skip_compact = skip_compact
-        self._fetch_concurrency = fetch_concurrency
         self._fetch_workers = fetch_workers
         self._delta = delta
         self._dedupe = dedupe
         # Resume filter: pairs -> pairs with known keys removed.  Production
         # runs inject the DuckDB anti-join (diff.anti_join); without one the
         # run falls back to a set-based filter against the index.
-        self._ndjson_prefix = (
-            f"{self._warehouse_prefix}/staging/ndjson"
-            if self._warehouse_prefix
-            else "staging/ndjson"
-        )
 
     def _full_path(self, rel_key: str) -> str:
         """Map a store-relative key to the full URI Iceberg ``add_files`` needs."""
@@ -106,21 +93,18 @@ class Ingester:
     def run(self, inventory) -> dict:
         """Ingest ``(bucket, key)`` pairs from *inventory*; return a summary.
 
-        With ``skip_fetch=True`` the fetch loop is skipped entirely and only
-        already-staged NDJSON is compacted (Stage B resume).  With
-        ``skip_compact=True`` only Stage A (fetch + NDJSON staging) runs,
-        leaving GeoParquet compaction for a later resume.
+        Direct stage only — items are fetched through a bounded pool and
+        written straight to GeoParquet, journal-first per batch.  (Distributed
+        bulk runs use :class:`DaskIngester`, whose workers stage NDJSON as a
+        byproduct of the fan-out.)
         """
         total = 0
         rows = 0
         considered = 0
         pending: list[dict] = []
-        touched: set[tuple[str, str]] = set()
 
         # Close any crash window left by a previous run (no-op list when
-        # there are no journals), then journal this run's own batches.  The
-        # journal is a direct-stage mechanism: ndjson's staged buckets are
-        # re-compactable on their own, so ndjson runs journal nothing.
+        # there are no journals), then journal this run's own batches.
         recovery = recover_journals(
             self._store,
             self._warehouse_prefix,
@@ -128,11 +112,7 @@ class Ingester:
             self._table,
             full_path=self._full_path,
         )
-        journal = (
-            BatchJournal(self._store, self._warehouse_prefix, new_run_id())
-            if self._stage == "direct"
-            else None
-        )
+        journal = BatchJournal(self._store, self._warehouse_prefix, new_run_id())
 
         def _counted():
             nonlocal considered
@@ -140,7 +120,7 @@ class Ingester:
                 considered += 1
                 yield pair
 
-        if not self._skip_fetch:
+        if True:
             # The index is the resume checkpoint: it is consulted once per
             # pair-stream, never per item.  Production injects the DuckDB
             # anti-join (diff.anti_join); the fallback set-filter is exact
@@ -165,7 +145,7 @@ class Ingester:
                     pending = _fetch_many(chunk, self._fetch_fn, self._fetch_workers)
                     total += len(pending)
                     if pending:
-                        rows += self._flush(pending, touched, journal, seq)
+                        rows += self._flush_direct(pending, journal, seq)
                 pending = []
             else:
                 for bucket, key in new_pairs:
@@ -175,23 +155,17 @@ class Ingester:
                     pending.append(item)
                     total += 1
                     if len(pending) >= self._batch_size:
-                        rows += self._flush(pending, touched, journal)
+                        rows += self._flush_direct(pending, journal)
                         pending = []
 
             if pending:
-                rows += self._flush(pending, touched, journal)
-
-        if self._stage == "ndjson" and not self._skip_compact:
-            # Discover staged buckets even after a skip_fetch resume.
-            if self._skip_fetch:
-                touched = self._discover_staged_buckets()
-            rows += self._compact_all(touched)
+                rows += self._flush_direct(pending, journal)
 
         summary = {
             "items": total,
             "rows": rows,
             "considered": considered,
-            "stage": self._stage,
+            "stage": "direct",
         }
         if recovery["journals"]:
             summary["recovery"] = recovery
@@ -208,36 +182,7 @@ class Ingester:
 
         return _filter
 
-    def _discover_staged_buckets(self) -> set[tuple[str, str]]:
-        """List every (cell, year) bucket that has staged NDJSON files."""
-        buckets: set[tuple[str, str]] = set()
-        prefix = self._ndjson_prefix + "/"
-        for batch in obstore.list(self._store, prefix=prefix):
-            for obj in batch:
-                k: str = obj["path"]
-                if not k.endswith(".jsonl"):
-                    continue
-                parts = k.split("/")
-                # .../grid_partition=<cell>/year=<year>/<file>.jsonl
-                for i, part in enumerate(parts):
-                    if part.startswith("grid_partition="):
-                        cell = part.split("=", 1)[1]
-                        year = parts[i + 1].split("=", 1)[1] if i + 1 < len(parts) else "unknown"
-                        buckets.add((cell, year))
-        return buckets
-
     # -- internals ------------------------------------------------------------
-
-    def _flush(
-        self,
-        items: list[dict],
-        touched: set[tuple[str, str]],
-        journal: BatchJournal | None = None,
-        seq: int | None = None,
-    ) -> int:
-        if self._stage == "ndjson":
-            return self._flush_ndjson(items, touched)
-        return self._flush_direct(items, journal, seq)
 
     def _flush_direct(
         self,
@@ -245,6 +190,7 @@ class Ingester:
         journal: BatchJournal | None = None,
         seq: int | None = None,
     ) -> int:
+        """Journal-first commit of one batch: files -> add_files -> index part."""
         if journal is not None and seq is None:
             seq = journal.start_batch(
                 [f"s3://{it['_source_bucket']}/{it['_source_key']}" for it in items]
@@ -275,72 +221,6 @@ class Ingester:
             self._store, self._partitioner, self._warehouse_prefix, items, on_file=on_file
         )
 
-    def _flush_ndjson(self, items: list[dict], touched: set[tuple[str, str]]) -> int:
-        """Stage A only — fan out to per-(cell, year) NDJSON buckets.
-
-        Records the buckets touched so the caller can compact each of them
-        exactly once after all batches (Stage B).
-        """
-        fo = fan_out(items, self._partitioner) if self._partitioner else items
-        buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        for item in fo:
-            cell = item.get("properties", {}).get("grid_partition", "__none__")
-            year = str(_year_from_item(item) or "unknown")
-            buckets[(cell, year)].append(item)
-
-        for (cell, year), group in buckets.items():
-            touched.add((cell, year))
-            self._append_ndjson(self._ndjson_key(cell, year), group)
-        return 0
-
-    def _ndjson_key(self, cell: str, year: str) -> str:
-        return f"{self._ndjson_prefix}/grid_partition={cell}/year={year}/staging.jsonl"
-
-    def _compact_all(self, touched: set[tuple[str, str]]) -> int:
-        """Stage B — compact every touched bucket once, then commit once.
-
-        The staged NDJSON is only deleted *after* the Iceberg/index commit,
-        so ``skip_fetch`` resumes (or a crash) re-compact without duplicating
-        index rows; any GeoParquet written before a crash is simply garbage
-        collected (it is never registered in Iceberg).
-        """
-        new_paths: list[str] = []
-        index_rows: list[dict] = []
-        consumed: list[str] = []
-        total = 0
-        for cell, year in sorted(touched):
-            np, ir, n, ndjson_keys = self._compact_ndjson_bucket(cell, year)
-            new_paths.extend(np)
-            index_rows.extend(ir)
-            consumed.extend(ndjson_keys)
-            total += n
-
-        if new_paths:
-            self._table.add_files([self._full_path(k) for k in new_paths])
-            if index_rows:
-                self._index.append(index_rows)
-        for key in consumed:
-            try:
-                obstore.delete(self._store, key)
-            except Exception:
-                pass
-        return total
-
-    def _compact_ndjson_bucket(
-        self, cell: str, year: str
-    ) -> tuple[list[str], list[dict], int, list[str]]:
-        """Compact one ``(cell, year)`` bucket — see :func:`_compact_bucket`."""
-        return _compact_bucket(
-            self._store,
-            self._ndjson_prefix,
-            self._warehouse_prefix,
-            (cell, year),
-            delta=self._delta,
-        )
-
-    def _append_ndjson(self, key: str, items: list[dict]) -> None:
-        _append_ndjson(self._store, key, items)
-
 
 class DaskIngester(Ingester):
     """Distributed variant: shards the inventory and writes via ``client.map``.
@@ -359,6 +239,48 @@ class DaskIngester(Ingester):
     *client* must expose ``map(fn, shards)`` (a Dask ``Client`` works).
     """
 
+    def __init__(
+        self,
+        store: object,
+        index: Index,
+        table: object,
+        *,
+        fetch_fn=None,
+        partitioner=None,
+        stage: str = "ndjson",
+        warehouse_prefix: str = "",
+        warehouse_root: str | None = None,
+        batch_size: int = 10_000,
+        skip_fetch: bool = False,
+        skip_compact: bool = False,
+        fetch_concurrency: int = 256,
+        delta: bool = False,
+        dedupe: Callable[[Iterator], Iterator] | None = None,
+    ) -> None:
+        super().__init__(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=fetch_fn,
+            partitioner=partitioner,
+            warehouse_prefix=warehouse_prefix,
+            warehouse_root=warehouse_root,
+            batch_size=batch_size,
+            delta=delta,
+            dedupe=dedupe,
+        )
+        # Bulk-only knobs: the NDJSON staging format is a byproduct of the
+        # worker fan-out, compacted per (cell, year) bucket afterwards.
+        self._stage = stage
+        self._skip_fetch = skip_fetch
+        self._skip_compact = skip_compact
+        self._fetch_concurrency = fetch_concurrency
+        self._ndjson_prefix = (
+            f"{self._warehouse_prefix}/staging/ndjson"
+            if self._warehouse_prefix
+            else "staging/ndjson"
+        )
+
     def _prefilter_shards(self, inventory: list) -> list:
         """Head-side pre-filter: drop keys the index already has before
         shipping shards to workers, so a re-run never re-fetches.  A shard
@@ -373,6 +295,35 @@ class DaskIngester(Ingester):
             if kept:
                 shipped.append(kept)
         return shipped
+
+    def _discover_staged_buckets(self) -> set[tuple[str, str]]:
+        """List every (cell, year) bucket that has staged NDJSON files."""
+        buckets: set[tuple[str, str]] = set()
+        for batch in obstore.list(self._store, prefix=self._ndjson_prefix + "/"):
+            for obj in batch:
+                k: str = obj["path"]
+                if not k.endswith(".jsonl"):
+                    continue
+                parts = k.split("/")
+                # .../grid_partition=<cell>/year=<year>/<file>.jsonl
+                for i, part in enumerate(parts):
+                    if part.startswith("grid_partition="):
+                        cell = part.split("=", 1)[1]
+                        year = parts[i + 1].split("=", 1)[1] if i + 1 < len(parts) else "unknown"
+                        buckets.add((cell, year))
+        return buckets
+
+    def _compact_ndjson_bucket(
+        self, cell: str, year: str
+    ) -> tuple[list[str], list[dict], int, list[str]]:
+        """Compact one ``(cell, year)`` bucket — see :func:`_compact_bucket`."""
+        return _compact_bucket(
+            self._store,
+            self._ndjson_prefix,
+            self._warehouse_prefix,
+            (cell, year),
+            delta=self._delta,
+        )
 
     def run(self, inventory, *, client=None) -> dict:  # type: ignore[override]
         """Ingest each shard in *inventory* in parallel; workers stream their own pairs."""

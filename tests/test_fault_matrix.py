@@ -23,7 +23,7 @@ import pytest
 from obstore.store import MemoryStore
 
 from earthcatalog.index import Index
-from earthcatalog.ingest import Ingester
+from earthcatalog.ingest import DaskIngester, Ingester
 from earthcatalog.journal import BatchJournal, list_journals
 
 from tests.test_ingest import _inventory, _make_item
@@ -94,7 +94,6 @@ def _run(keys, store, index, table, *, batch_size=2, fetch_workers=1, fetch_call
         index=index,
         table=table,
         fetch_fn=fetch,
-        stage="direct",
         warehouse_prefix="warehouse",
         warehouse_root=WAREHOUSE_ROOT,
         batch_size=batch_size,
@@ -139,7 +138,6 @@ class TestFaultMatrix:
             index=index,
             table=table,
             fetch_fn=failing_fetch,
-            stage="direct",
             warehouse_prefix="warehouse",
             warehouse_root=WAREHOUSE_ROOT,
             batch_size=2,
@@ -171,7 +169,6 @@ class TestFaultMatrix:
             index=index,
             table=table,
             fetch_fn=failing_fetch,
-            stage="direct",
             warehouse_prefix="warehouse",
             warehouse_root=WAREHOUSE_ROOT,
             batch_size=4,
@@ -200,7 +197,6 @@ class TestFaultMatrix:
                 index=_FailAppendIndex(proxy_index, fail=fail),
                 table=table,
                 fetch_fn=lambda b, k: _make_item(k),
-                stage="direct",
                 warehouse_prefix="warehouse",
                 warehouse_root=WAREHOUSE_ROOT,
                 batch_size=2,
@@ -232,7 +228,6 @@ class TestFaultMatrix:
             index=index,
             table=table,
             fetch_fn=lambda b, k: _make_item(k),
-            stage="direct",
             warehouse_prefix="warehouse",
             warehouse_root=WAREHOUSE_ROOT,
             batch_size=2,
@@ -294,7 +289,6 @@ class TestFaultMatrix:
             index=index,
             table=table,
             fetch_fn=lambda b, k: _make_item(k),
-            stage="direct",
             warehouse_prefix="warehouse",
             warehouse_root=WAREHOUSE_ROOT,
             batch_size=2,
@@ -313,14 +307,22 @@ class TestFaultMatrix:
 
 class TestJournalStageScope:
     def test_ndjson_run_creates_no_journal(self):
-        """The journal is a direct-stage mechanism: an ndjson run must not
-        leave one behind for the next run's recovery to clean."""
+        """The journal is a direct-stage mechanism: bulk (Dask) runs stage
+        NDJSON as a fan-out byproduct and must not journal anything."""
         from earthcatalog.journal import list_journals
 
         store = MemoryStore()
         index = Index(store, "warehouse/index.parquet")
         table = _FakeTable()
-        ing = Ingester(
+
+        class _FakeClient:
+            def map(self, fn, args):
+                return [fn(a) for a in args]
+
+            def gather(self, results):
+                return results
+
+        ing = DaskIngester(
             store=store,
             index=index,
             table=table,
@@ -328,11 +330,9 @@ class TestJournalStageScope:
             stage="ndjson",
             warehouse_prefix="warehouse",
             warehouse_root=WAREHOUSE_ROOT,
-            batch_size=4,
-            fetch_workers=4,  # pooled path starts journals pre-fetch in direct
         )
-        summary = ing.run(_inventory(["a.stac.json", "b.stac.json"]))
-        assert summary["stage"] == "ndjson"
+        shards = [[("data-bucket", "a.stac.json")], [("data-bucket", "b.stac.json")]]
+        summary = ing.run(shards, client=_FakeClient())
         assert list_journals(store, "warehouse") == []
 
     def test_direct_run_leaves_no_journal_after_success(self):
@@ -344,7 +344,6 @@ class TestJournalStageScope:
             index=index,
             table=table,
             fetch_fn=lambda b, k: _make_item(k),
-            stage="direct",
             warehouse_prefix="warehouse",
             warehouse_root=WAREHOUSE_ROOT,
             batch_size=4,

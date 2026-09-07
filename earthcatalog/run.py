@@ -71,7 +71,6 @@ def run(
     scatter_only: bool = False,
     fetch_concurrency: int = 256,
     fetch_workers: int = 16,
-    stage: str = "direct",
     grid=None,  # Optional GridConfig for fresh (full) builds
     # Scheduler — mutually exclusive with create_client.  The distributed
     # path is the BULK profile; the daily path runs synchronous.
@@ -262,7 +261,6 @@ def run(
         scatter_only=scatter_only,
         fetch_concurrency=fetch_concurrency,
         fetch_workers=fetch_workers,
-        stage=stage,
     )
 
     return ec.ingest_inventory(
@@ -381,16 +379,6 @@ def main() -> None:
         help="Bounded fetch pool for the serial (daily) path.",
     )
     parser.add_argument(
-        "--stage",
-        choices=["direct", "ndjson"],
-        default="direct",
-        help=(
-            "direct: write GeoParquet immediately (daily default, journaled). "
-            "ndjson: stage per-(cell, year) NDJSON first (PGSTAC interchange; "
-            "compacted in a second pass)."
-        ),
-    )
-    parser.add_argument(
         "--grid",
         default="h3",
         choices=["h3", "s2", "utm", "geojson"],
@@ -447,7 +435,6 @@ def main() -> None:
         scatter_only=args.scatter_only,
         fetch_concurrency=args.fetch_concurrency,
         fetch_workers=args.fetch_workers,
-        stage=args.stage,
         grid=grid_cfg,
         scheduler=args.scheduler,
         workers=args.workers,
