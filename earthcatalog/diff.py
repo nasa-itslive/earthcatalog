@@ -125,6 +125,23 @@ def _read_parquet(files: list[str], suffix: str) -> str:
     )
 
 
+def count_rows(files, suffix: str = ".stac.json") -> int:
+    """Rows in *files* (path/glob/list) matching *suffix*."""
+    if isinstance(files, str):
+        files = resolve_files(files)
+    s3 = any(f.startswith("s3://") for f in files)
+    con = _connect(region=DEFAULT_REGION, max_memory=DEFAULT_MAX_MEMORY,
+                   temp_directory=tempfile.gettempdir(), s3=s3)
+    try:
+        if any(str(f).endswith(".csv") for f in files):
+            sql = f"SELECT count(*) FROM read_csv_auto({files!r}) WHERE key LIKE '%{suffix}'"
+        else:
+            sql = f"SELECT count(*) FROM read_parquet({files!r}) WHERE key LIKE '%{suffix}'"
+        return int(con.execute(sql).fetchone()[0])
+    finally:
+        con.close()
+
+
 def anti_join(
     left: object,
     index_uri: str | list[str],

@@ -189,10 +189,11 @@ class IngestPipeline:
             return dedupe(direct_left, suffix=".stac.json", limit=cfg.limit, since=cfg.since)
 
         if cfg.dry_run:
-            considered = 0
-
             if direct_left:
-                pairs = dedupe_source()
+                from .diff import count_rows
+
+                considered = count_rows(resolve_files(source))
+                new = sum(1 for _ in dedupe_source())
             else:
                 base = (
                     (b, k)
@@ -202,14 +203,15 @@ class IngestPipeline:
                 if cfg.limit is not None:
                     base = islice(base, cfg.limit)
                 pairs = dedupe_pairs(base) if dedupe else base
+                considered = 0
 
-            def _counted():
-                nonlocal considered
-                for pair in pairs:
-                    considered += 1
-                    yield pair
+                def _counted():
+                    nonlocal considered
+                    for pair in pairs:
+                        considered += 1
+                        yield pair
 
-            new = sum(1 for _ in _counted())
+                new = sum(1 for _ in _counted())
             return {
                 "dry_run": True,
                 "source": source,
@@ -337,6 +339,9 @@ class IngestPipeline:
                 if cfg.limit is not None:
                     pairs = islice(pairs, cfg.limit)
             serial_kwargs = dict(kwargs)
+            # Bulk-only knobs (the Dask workers own them).
+            for bulk_only in ("skip_fetch", "skip_compact", "fetch_concurrency"):
+                serial_kwargs.pop(bulk_only, None)
             serial_kwargs.pop("dedupe", None)  # pairs already filtered
             summary = Ingester(**serial_kwargs).run(pairs)
 
