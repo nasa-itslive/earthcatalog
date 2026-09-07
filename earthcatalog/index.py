@@ -170,7 +170,7 @@ class Index:
                     [int(r["year"]) if r.get("year") is not None else None for r in rows],
                     type=pa.int32(),
                 ),
-                "ingested_at": pa.array([now] * len(rows)),
+                "ingested_at": pa.array([r.get("ingested_at") or now for r in rows]),
                 "deleted": pa.array([False] * len(rows)),
             },
             schema=_SCHEMA,
@@ -296,6 +296,33 @@ class Index:
             for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["deleted"]):
                 total += int(pc_sum(pc_invert(batch.column("deleted")).cast(pa.int32())).as_py())
         return total
+
+    def items_per_day(
+        self, days: int = 14, *, locations: list[str] | None = None
+    ) -> list[tuple[str, int]]:
+        """Items ingested per day, newest first — from ``ingested_at``.
+
+        DuckDB groups the ``ingested_at`` column across all index locations
+        out-of-core; distinct ``s3_key`` counts, so multi-cell items count
+        once per day.  *locations* overrides ``self.locations()`` with
+        filesystem paths / URIs readable by DuckDB (the caller maps
+        store-relative keys to full paths/URIs).
+        """
+        import tempfile
+
+        from .diff import DEFAULT_MAX_MEMORY, DEFAULT_REGION, _connect
+
+        locs = locations if locations is not None else self.locations()
+        if not locs:
+            return []
+        con = _connect(DEFAULT_REGION, DEFAULT_MAX_MEMORY,
+                       tempfile.gettempdir(), s3=any(f.startswith("s3://") for f in locs))
+        sql = (
+            f"SELECT CAST(ingested_at AS DATE) AS d, count(DISTINCT s3_key) AS items "
+            f"FROM read_parquet({locs!r}) "
+            f"GROUP BY 1 ORDER BY 1 DESC LIMIT {int(days)}"
+        )
+        return [(str(d), int(n)) for d, n in con.execute(sql).fetchall()]
 
     def hash_set(self) -> set[bytes]:
         """``id_hash`` values for active (non-deleted) rows — for dedup."""

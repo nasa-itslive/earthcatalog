@@ -417,6 +417,38 @@ def info(
     if years:
         typer.echo(f"  Years         : {years[0]}-{years[-1]} ({len(years)} years)")
 
+    # Hot locations — top partitions by row count.
+    top = info.top_cells(table, limit=5)
+    if top:
+        typer.echo("  Hot locations :")
+        for s in top:
+            typer.echo(f"    {s['grid_partition']}: {s['row_count']:,} rows")
+
+    # Unified-index counts: unique active items + ingest rate per day.
+    try:
+        from obstore.store import LocalStore
+
+        from earthcatalog.index import Index as _Index
+        from earthcatalog.run import _make_s3_store
+
+        if index_path.startswith("s3://"):
+            bucket = index_path.removeprefix("s3://").split("/", 1)[0]
+            store = _make_s3_store(bucket)
+            idx = _Index(store, index_path.removeprefix("s3://").split("/", 1)[1])
+            full = [f"s3://{bucket}/{loc}" for loc in idx.locations()]
+        else:
+            idx = _Index(LocalStore(str(Path(index_path).parent)), Path(index_path).name)
+            full = [str(Path(index_path).parent / loc) for loc in idx.locations()]
+        unique = idx.count_active()
+        typer.echo(f"  Unique items  : {unique:,}")
+        per_day = idx.items_per_day(days=14, locations=full)
+        if per_day:
+            typer.echo("  Items per day :")
+            for d, n in per_day:
+                typer.echo(f"    {d}: {n:,}")
+    except Exception as exc:
+        typer.echo(f"  Unique items  : unavailable ({exc})")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
