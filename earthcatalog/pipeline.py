@@ -52,6 +52,16 @@ class IngestPipeline:
         self._catalog: SqlCatalog = catalog._catalog
         self._table: Table = catalog._table
 
+    @staticmethod
+    def _store_relative(key: str) -> str:
+        """Normalize an index path/URI to a store-relative object key."""
+        if key.startswith("s3://"):
+            return key.removeprefix("s3://").split("/", 1)[1]
+        if os.path.isabs(key):
+            # Local stores are rooted at the warehouse dir.
+            return os.path.basename(key)
+        return key
+
     def run(self, inventory_path: str, *, mode: str = "auto") -> dict:
         """Ingest *inventory_path* into the catalog's Iceberg table.
 
@@ -142,14 +152,8 @@ class IngestPipeline:
             # Local stores are rooted at the warehouse dir — same
             # store-relative rule as the index key above.
             warehouse_prefix = os.path.basename(warehouse_root.rstrip("/")) + "/"
-        index_key = resolve_index_path(cat._table, f"{warehouse_root.rstrip('/')}_index.parquet")
-        if index_key.startswith("s3://"):
-            index_key = index_key.removeprefix("s3://").split("/", 1)[1]
-        elif os.path.isabs(index_key):
-            # Local stores are rooted at the warehouse dir: keep the key
-            # store-relative so reads, writes, and the full-mode reset all
-            # land on the same object.
-            index_key = os.path.basename(index_key)
+        index_prop = resolve_index_path(cat._table, f"{warehouse_root.rstrip('/')}_index.parquet")
+        index_key = self._store_relative(index_prop)
         if cat._store is None:
             raise RuntimeError("ingest requires a warehouse store")
         store: ObjectStore = cat._store
@@ -183,7 +187,12 @@ class IngestPipeline:
             bucket = warehouse_root.removeprefix("s3://").split("/", 1)[0]
             index_uris = [f"s3://{bucket}/{loc}" for loc in index.locations()]
         else:
-            index_uris = [f"{warehouse_root.rstrip('/')}/{loc}" for loc in index.locations()]
+            # Local: anchor to the absolute index property path — the
+            # LocalStore root is not derivable from the warehouse dir
+            # (the store may be rooted at the warehouse's parent).
+            index_uris = [
+                os.path.join(os.path.dirname(index_prop), loc) for loc in index.locations()
+            ]
         dedupe = partial(anti_join, index_uri=index_uris) if index_uris else None
         direct_left = (
             source if dedupe is not None and source.endswith((".parquet", ".json")) else None
@@ -330,6 +339,24 @@ class IngestPipeline:
             # Serial (the daily path): the anti-join IS the resume check.
             # dedupe is None only on a warehouse's very first run.
             if direct_left:
+                # Pre-ingest diff report — the join is re-executed for the run.
+                considered = count_rows(resolve_files(source))
+                if dedupe is not None:
+                    from .diff import count_new_keys
+
+                    new = count_new_keys(
+                        direct_left,
+                        index_uris,
+                        suffix=".stac.json",
+                        since=cfg.since,
+                        limit=cfg.limit,
+                    )
+                else:
+                    new = considered
+                print(
+                    f"Diff report: {new:,} new items from the current inventory "
+                    f"({considered:,} considered, {considered - new:,} already indexed)"
+                )
                 pairs_iter = dedupe_source(limit=cfg.limit)
             elif dedupe is not None:
                 base = (
@@ -357,12 +384,40 @@ class IngestPipeline:
 
         summary["source"] = source
         summary["mode"] = mode
+        if not cfg.scatter_only:
+            self._reconcile(summary)
         self._write_last_run(summary)
 
         if store and cat._catalog_key:
             cat.upload_catalog(local_db)
 
         return summary
+
+    def _reconcile(self, summary: dict) -> None:
+        """Post-ingest report: what the index and Iceberg hold *right now*.
+
+        Metadata-only counts — DuckDB over the index parts, manifest
+        statistics for the table.  No full scans, no item fetches.
+        """
+        from .index import Index, resolve_index_path
+
+        cat = self._cat
+        root = self._catalog.properties.get("warehouse", "")
+        key = resolve_index_path(cat._table, f"{root.rstrip('/')}_index.parquet")
+        try:
+            key = self._store_relative(key)
+            if key and cat._store is not None:
+                summary["index_keys"] = Index(cat._store, key).count_active()
+            summary["iceberg_rows"] = cat._table.scan().count()
+            summary["iceberg_files"] = sum(1 for _ in cat._table.scan().plan_files())
+        except Exception as exc:
+            print(f"(reconciliation counts unavailable: {exc})")
+            return
+        print(
+            f"Post-ingest: index holds {summary['index_keys']:,} source keys; "
+            f"Iceberg holds {summary['iceberg_rows']:,} rows in "
+            f"{summary['iceberg_files']} data files (rows > keys with multi-cell fan-out)"
+        )
 
     def _write_last_run(self, summary: dict) -> None:
         """Persist the run summary to ``{warehouse}/_last_run.json``."""

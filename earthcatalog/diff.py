@@ -188,6 +188,39 @@ def anti_join(
     return _anti_join_stream(left, index_uri, suffix, limit, since, batch_size, con)
 
 
+def count_new_keys(
+    left: object,
+    index_uri: str | list[str],
+    *,
+    suffix: str = ".stac.json",
+    limit: int | None = None,
+    since: object | None = None,
+    con: object | None = None,
+) -> int:
+    """Count the pairs *left* holds that the index does not know.
+
+    Same filtering as :func:`anti_join` (suffix, *since*, *limit*), consumed
+    as a stream — nothing materialised.  Used for the pre-ingest report;
+    the real run re-executes the join.
+    """
+    if con is None:
+        if isinstance(left, str):
+            files: list[str] | None = resolve_files(left)
+        elif isinstance(left, list):
+            files = left
+        else:
+            files = None
+        s3 = any(str(f).startswith("s3://") for f in (files or []))
+        con = _connect(
+            region=DEFAULT_REGION,
+            max_memory=DEFAULT_MAX_MEMORY,
+            temp_directory=tempfile.gettempdir(),
+            s3=s3,
+        )
+    stream = _anti_join_stream(left, index_uri, suffix, limit, since, 10_000, con)
+    return sum(1 for _ in stream)
+
+
 def _anti_join_stream(
     left: object,
     index_uri: str | list[str],

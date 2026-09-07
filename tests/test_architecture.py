@@ -30,7 +30,9 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     "ingest.py": 780,
     # Extracted from catalog.py — ingest orchestration + daily dry-run +
     # _last_run.json writer + full-mode reset + anti-join wiring
-    "pipeline.py": 395,
+    # (+34: pre-ingest diff report and post-ingest index/Iceberg
+    # reconciliation, per the daily-workflow reporting requirement)
+    "pipeline.py": 440,
     # Everything else
     "*": 1600,
 }
