@@ -5,62 +5,87 @@ catalog backed by Apache Iceberg. Instead of a database, Parquet files sit on S3
 and a small SQLite file tracks the Iceberg schema. DuckDB reads them directly —
 no serialization overhead, no infrastructure.
 
-## Full ingest
+## Daily update (the normal path)
 
-First-time full ingest from an S3 Inventory file. Drops any existing table and
-recreates it from scratch.
-
-```python
-from earthcatalog.ingest_config import IngestConfig
-
-catalog.ingest_inventory(
-    "s3://bucket/inventory/full.parquet",
-    mode="full",
-    config=IngestConfig(create_client=lambda: coiled.Client(n_workers=100)),
-)
-```
-
-For smaller inventories the single-node path works without Dask (the default
-``stage="ndjson"`` writes resumable NDJSON first, then compacts in bounded
-memory):
-
-```python
-catalog.ingest_inventory("s3://bucket/inventory/full.parquet", mode="full")
-```
-
-Or from the CLI:
+Two exact steps. The diff is an out-of-core DuckDB `EXCEPT` between two
+inventory days; the ingest anti-joins the result against the unified index, so
+already-ingested keys are skipped even if a previous run was missed.
 
 ```bash
-uv run earthcatalog ingest \
+# 1. What changed between yesterday and today?  (exact, string comparison)
+earthcatalog diff \
+    --current  s3://…/inventory/2026-09-06T01-00Z/manifest.json \
+    --previous s3://…/inventory/2026-09-05T01-00Z/manifest.json \
+    --out      s3://…/diffs/new-20260905-20260906.parquet \
+    --out-old  s3://…/diffs/old-20260905-20260906.parquet   # disappeared keys (GC input)
+
+# 2. Ingest what is actually new (~40k keys ≈ 15 min on a GitHub runner)
+earthcatalog ingest \
+    --diff s3://…/diffs/new-20260905-20260906.parquet \
+    --warehouse s3://my-bucket/catalog/warehouse \
+    --mode delta --fetch-workers 16
+```
+
+`earthcatalog ingest --diff` is:
+
+- **exact** — new = string anti-join against the unified index, no hash
+  collisions, no false "already ingested";
+- **idempotent** — re-running the same command does nothing once everything
+  is indexed;
+- **self-healing** — a crash leaves a small journal; the next run recovers
+  it automatically, and a stale index catches up from the backlog instead of
+  skipping days;
+- **resumable** — every batch commits journal-first; a crash loses at most
+  one batch.
+
+Add `--dry-run` to count `considered / new / already indexed` without writing
+anything, and `--limit N` to bound a test run.
+
+## Full (re)build
+
+First-time build from a complete inventory. Drops the existing table, index,
+and staging area, then ingests everything.
+
+```bash
+earthcatalog ingest \
   --inventory s3://bucket/inventory/full.parquet \
   --warehouse s3://my-bucket/catalog/warehouse \
-  --mode full
+  --mode full --grid h3 --resolution 1
 ```
 
-For large inventories, decouple the scatter from the map/reduce so workers
-don't idle behind the head's inventory read — see the
-[Ingest Guide](operations/ingest_guide.md#with-daskcoiled) for details.
+`--mode full` resets the table **and** the index and sweeps `_staging/` — a
+populated warehouse re-ingests from zero.
 
-## Delta ingest
+## Bulk ingest (Dask/Coiled — not for the daily path)
 
-Daily incremental updates. Appends new files to the existing table without
-overwriting, and updates the unified index for duplicate detection.
-
-```python
-catalog.ingest_inventory("s3://bucket/delta/2026-04-28.parquet", mode="delta")
-```
-
-Or from the CLI:
+Large historical builds can fan out to a cluster. Stop after the scatter step
+so workers never idle behind the head's inventory read, then run the
+map/reduce:
 
 ```bash
-uv run earthcatalog ingest \
-  --inventory s3://bucket/delta/2026-04-28.parquet \
-  --warehouse s3://my-bucket/catalog/warehouse \
-  --mode delta
+# Step 1: scatter into fixed-row shard files (no cluster needed)
+earthcatalog ingest --inventory s3://bucket/inventory/full.parquet \
+    --mode full --scatter-only
+# Step 2: map/reduce on the cluster
+earthcatalog ingest --inventory s3://…/staging/shards/<run_id>/scatter.json \
+    --mode full --scheduler coiled
 ```
 
-Ingest is resumable: `--skip-fetch` resumes compaction of already-staged
-NDJSON, and `--skip-compact` only stages NDJSON for a later run.
+See the [Ingest Guide](operations/ingest_guide.md) for scheduler options.
+
+## Catching up a stale catalog
+
+If the catalog index is behind the inventory (missed runs), the daily flow
+self-corrects: the diff still only carries the days' changes, and the
+anti-join ingests everything the index is missing. For a large gap, diff
+against the index directly:
+
+```bash
+earthcatalog diff --current s3://…/today.manifest.json \
+    --against-index s3://…/catalog/warehouse_index.parquet \
+    --out s3://…/catchup.parquet
+earthcatalog ingest --diff s3://…/catchup.parquet --warehouse s3://…/catalog/warehouse
+```
 
 ## Search
 
