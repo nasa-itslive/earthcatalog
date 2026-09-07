@@ -126,7 +126,9 @@ class IngestPipeline:
             except Exception:
                 delta = False
 
-        if cat._store and cat._catalog_key:
+        if cat._store and cat._catalog_key and not os.path.exists(local_db):
+            # run.py downloads before opening the catalog; re-downloading
+            # here would swap the sqlite under the open connection.
             cat.download_catalog(local_db)
 
         if not delta:
@@ -422,8 +424,6 @@ class IngestPipeline:
     def _write_last_run(self, summary: dict) -> None:
         """Persist the run summary to ``{warehouse}/_last_run.json``."""
         import json
-        from datetime import UTC
-        from datetime import datetime as _dt2
 
         import obstore
 
@@ -435,6 +435,6 @@ class IngestPipeline:
         rel = root.removeprefix("s3://").split("/", 1)
         key = f"{rel[1].rstrip('/')}/_last_run.json" if len(rel) == 2 else "_last_run.json"
         payload = dict(summary)
-        payload["finished_at"] = _dt2.now(UTC).isoformat()
+        payload["finished_at"] = _dt.now(UTC).isoformat()
         obstore.put(store, key, json.dumps(payload, default=str).encode())
         print(f"Run summary: {root}/_last_run.json")

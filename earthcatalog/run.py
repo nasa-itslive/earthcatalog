@@ -154,7 +154,12 @@ def run(
     store_config.set_catalog_key(catalog_key)
     store_config.set_lock_key(lock_key)
 
-    if delta and warehouse.startswith("s3://"):
+    if warehouse.startswith("s3://"):
+        # Pull the remote catalog db BEFORE opening the local sqlite:
+        # get_or_create below must load the last uploaded table.  Without
+        # this, a fresh process creates a competing empty table and the
+        # first Iceberg commit fails the snapshot-ref requirement
+        # ("branch main was created concurrently" — observed on CI).
         from earthcatalog.catalog import download_catalog
 
         download_catalog(catalog)
