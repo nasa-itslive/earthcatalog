@@ -53,7 +53,7 @@ class IngestPipeline:
         """
         from .catalog import get_or_create
         from .config import GridConfig
-        from .diff import anti_join
+        from .diff import anti_join, count_rows, resolve_files
         from .grids import build_partitioner
         from .index import Index, resolve_index_path
         from .ingest import DaskIngester, Ingester
@@ -185,8 +185,8 @@ class IngestPipeline:
         def dedupe_pairs(pairs):
             return dedupe(pairs)
 
-        def dedupe_source():
-            return dedupe(direct_left, suffix=".stac.json", limit=cfg.limit, since=cfg.since)
+        def dedupe_source(limit: int | None = None):
+            return dedupe(direct_left, suffix=".stac.json", since=cfg.since, limit=limit)
 
         if cfg.dry_run:
             if direct_left:
@@ -320,7 +320,7 @@ class IngestPipeline:
         else:
             # Serial (the daily path): the anti-join IS the resume check.
             if direct_left:
-                pairs = dedupe_source()
+                pairs = dedupe_source(limit=cfg.limit)
             elif dedupe is not None:
                 base = (
                     (b, k)
