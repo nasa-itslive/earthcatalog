@@ -45,10 +45,32 @@ real mirrored inventory:
 * index layout: legacy file + per-run parts, DuckDB anti-join across both
 * journals: none left after successful runs; recovery self-heals leftovers
 
-**Remaining before the first real runner dispatch** (RPI-6): AWS secrets in
-the repo, and one validation run on an actual `ubuntu-latest` runner — the
-20-minute budget projection is based on local timings (diff ≈ 7 min) and has
-not yet been observed on GitHub hardware.
+**First real runner dispatch — DONE (2026-09-07, RPI-6 closed).** With AWS
+secrets in the repo, `daily_delta.yml` (dispatch-only, defaults = scratch pad,
+every write path a workflow input) was validated on `ubuntu-latest` in four
+escalating runs against the known 2026-09-05→06 manifest pair:
+
+| run | config | result |
+|---|---|---|
+| A | `dry_run` | ✅ 2m16s — `considered 27,458 · new 0 · already indexed 27,458`, matches local exactly |
+| B | `limit=1000`, fresh `warehouse-ci` | ✅ 3m17s — 1,000 keys fetched; reconciliation `index 1,000 · Iceberg 1,342 rows / 30 files` |
+| C | full delta | ✅ **15m15s total** — 26,458 fetched (resume after B), final `index 27,458 · Iceberg 39,219 rows / 386 files` |
+| C2 | identical re-run | ✅ 4m33s — `new 0`, state byte-identical (idempotent) |
+
+Run C v1 **caught a real production bug**: `run()` opened the local sqlite and
+ran `get_or_create` *before* downloading the remote catalog db (the old
+download was gated on the legacy `--delta` flag; the CLI passes `--mode
+delta`), so a fresh process built a competing table and the first Iceberg
+commit died with `branch main was created concurrently`.  Fixed in 91ea567:
+download before open, unconditionally; the pipeline only fetches when no
+local db exists.  The same bug would have forked the production catalog db
+during the catch-up — fix first, then catch up.
+
+**Next (needs explicit GO — writes outside the scratch pad):** run the
+catch-up against the real catalog (`catchup-vs-catalog-20260906.parquet`,
+394,964 keys, ~1.5–2 h), then flip `daily_delta.yml` defaults from
+`refactoring/` to `catalog/` and decide on a schedule.  Gap grows ~27k/day
+while the real catalog idles.
 
 ## What landed (this cycle)
 
