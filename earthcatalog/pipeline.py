@@ -53,7 +53,7 @@ class IngestPipeline:
         from .catalog import get_or_create
         from .config import GridConfig
         from .grids import build_partitioner
-        from .index import Index
+        from .index import Index, resolve_index_path
         from .ingest import DaskIngester, Ingester
         from .inventory import (
             delete_scatter,
@@ -128,10 +128,39 @@ class IngestPipeline:
             # bucket); the full s3:// URI is passed as warehouse_root so
             # Iceberg add_files resolves real paths.
             warehouse_prefix = warehouse_prefix.removeprefix("s3://").split("/", 1)[1]
-        index_key = f"{warehouse_root.rstrip('/')}_index.parquet"
+        elif os.path.isabs(warehouse_prefix):
+            # Local stores are rooted at the warehouse dir — same
+            # store-relative rule as the index key above.
+            warehouse_prefix = os.path.basename(warehouse_root.rstrip("/")) + "/"
+        index_key = resolve_index_path(
+            cat._table, f"{warehouse_root.rstrip('/')}_index.parquet"
+        )
         if index_key.startswith("s3://"):
             index_key = index_key.removeprefix("s3://").split("/", 1)[1]
+        elif os.path.isabs(index_key):
+            # Local stores are rooted at the warehouse dir: keep the key
+            # store-relative so reads, writes, and the full-mode reset all
+            # land on the same object.
+            index_key = os.path.basename(index_key)
         index = Index(cat._store, index_key)
+
+        if not delta and cat._store:
+            # Full mode really rebuilds: the index object and staging area
+            # die with the table, or the resume checkpoint would skip every
+            # item and a "full" ingest would ingest nothing.
+            import obstore
+
+            try:
+                obstore.delete(cat._store, index_key)
+            except FileNotFoundError:
+                pass
+            staging = f"{warehouse_prefix.rstrip('/')}/_staging"
+            try:
+                for listing in obstore.list(cat._store, prefix=staging):
+                    for obj in listing:
+                        obstore.delete(cat._store, obj["path"])
+            except FileNotFoundError:
+                pass
 
         if cfg.dry_run:
             from .keydiff import iter_new_keys

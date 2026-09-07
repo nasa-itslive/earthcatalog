@@ -78,6 +78,26 @@ def hash_id(item_id: str) -> bytes:
     return xxhash.xxh3_128(item_id.encode("utf-8"), seed=_HASH_SEED).digest()
 
 
+def resolve_index_path(table: object | None, default_index_path: str) -> str:
+    """The single resolver for the unified index location.
+
+    ``earthcatalog.index_path`` table property first, then
+    *default_index_path* (the caller's conventional
+    ``{warehouse_root}_index.parquet``), else ``""``.  The legacy
+    ``earthcatalog.hash_index_path`` property is deliberately NOT followed:
+    it names the retired ``*_id_hashes.parquet`` file whose schema this
+    Index cannot read — run :func:`earthcatalog.migrate.migrate_indices`
+    on such warehouses (which stamps the property as its final step).
+    """
+    from .schema import PROP_INDEX_PATH
+
+    if table is not None:
+        p = table.properties.get(PROP_INDEX_PATH)
+        if p:
+            return p
+    return default_index_path or ""
+
+
 class Index:
     """Provenance + dedup index backed by a single Parquet file in *store*."""
 

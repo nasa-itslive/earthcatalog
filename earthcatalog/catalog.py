@@ -34,6 +34,7 @@ from .schema import (
     PROP_GRID_RESOLUTION,
     PROP_GRID_TYPE,
     PROP_HASH_INDEX_PATH,  # noqa: F401  (re-export: consumers import from catalog)
+    PROP_INDEX_PATH,
     TABLE_NAME,  # noqa: F401  (re-export: consumers import from catalog)
 )
 
@@ -204,9 +205,9 @@ class CatalogInfo:
         """Number of active (non-deleted) items in the unified index."""
         from obstore.store import LocalStore
 
-        from earthcatalog.index import Index
+        from earthcatalog.index import Index, resolve_index_path
 
-        index_path = table.properties.get("earthcatalog.hash_index_path") or default_index_path
+        index_path = resolve_index_path(table, default_index_path or "")
         if not index_path:
             return 0
 
@@ -359,9 +360,17 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
         if grid_config.id_field is not None:
             props[PROP_GRID_ID_FIELD] = str(grid_config.id_field)
 
+    warehouse = catalog.properties.get("warehouse", "")
+    if warehouse:
+        props[PROP_INDEX_PATH] = f"{warehouse.rstrip('/')}_index.parquet"
+
     try:
         table = catalog.load_table(FULL_NAME)
         missing = {k: v for k, v in props.items() if k not in table.properties}
+        # A legacy warehouse carries earthcatalog.hash_index_path; leave the
+        # index property alone until migrate_indices() stamps it.
+        if table.properties.get(PROP_HASH_INDEX_PATH):
+            missing.pop(PROP_INDEX_PATH, None)
         if missing:
             with table.transaction() as tx:
                 tx.set_properties(**missing)
@@ -876,7 +885,11 @@ class EarthCatalog:
             return uri.removeprefix("s3://").split("/", 1)[1] if uri.startswith("s3://") else uri
 
         # Unified index — same path the ingest pipeline writes to.
-        index_key = _strip(f"{warehouse_root.rstrip('/')}_index.parquet")
+        from earthcatalog.index import resolve_index_path
+
+        index_key = _strip(
+            resolve_index_path(self._table, f"{warehouse_root.rstrip('/')}_index.parquet")
+        )
 
         result = run_garbage_collection(
             inventory_path=inventory_path,
@@ -963,10 +976,16 @@ class EarthCatalog:
         if warehouse_path:
             rows.append(("Warehouse", warehouse_path))
 
-        hash_idx = self._table.properties.get("earthcatalog.hash_index_path")
-        if not hash_idx and warehouse_path:
-            hash_idx = warehouse_path.rstrip("/") + "_index.parquet"
-        rows.append(("Unique index", "Available" if hash_idx else "Not available"))
+        from earthcatalog.index import resolve_index_path
+
+        index_path = (
+            resolve_index_path(
+                self._table, f"{warehouse_path.rstrip('/')}_index.parquet"
+            )
+            if warehouse_path
+            else ""
+        )
+        rows.append(("Unique index", "Available" if index_path else "Not available"))
 
         table_html = "<table style='border-collapse: collapse; width: 100%; margin: 0;'>"
         for label, value in rows:

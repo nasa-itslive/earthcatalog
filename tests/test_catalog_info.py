@@ -524,10 +524,15 @@ class TestCatalogInfoStatsMethods:
             ]
         )
 
-        # Don't set the table property - test default path
+        # get_or_create stamps earthcatalog.index_path automatically; drop it
+        # to simulate a warehouse with no known index location.
+        from earthcatalog.schema import PROP_INDEX_PATH
+
+        with tbl.transaction() as tx:
+            tx.remove_properties(PROP_INDEX_PATH)
         info = _catalog_info(tbl)
 
-        # Without default path, should return 0
+        # Without property or default path, should return 0
         count_no_default = info.unique_item_count(tbl, store=None)
         assert count_no_default == 0
 

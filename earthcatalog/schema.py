@@ -28,6 +28,7 @@ PROP_GRID_TYPE = "earthcatalog.grid.type"
 PROP_GRID_RESOLUTION = "earthcatalog.grid.resolution"
 PROP_GRID_BOUNDARIES_PATH = "earthcatalog.grid.boundaries_path"
 PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
+PROP_INDEX_PATH = "earthcatalog.index_path"
 PROP_HASH_INDEX_PATH = "earthcatalog.hash_index_path"
 
 _HIVE_RE = re.compile(

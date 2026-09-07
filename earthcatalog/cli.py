@@ -275,6 +275,54 @@ def diff(
 
 
 # ---------------------------------------------------------------------------
+# `migrate-indices` sub-command — legacy index files → unified index
+# ---------------------------------------------------------------------------
+
+
+@app.command("migrate-indices")
+def migrate_indices_command(
+    catalog: str = typer.Option(
+        "/tmp/earthcatalog.db",
+        "--catalog",
+        help="Local SQLite Iceberg catalog path.",
+    ),
+    warehouse: str = typer.Option(
+        ...,
+        "--warehouse",
+        help="Warehouse root (s3:// URI or local path).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report what would be migrated without writing.",
+    ),
+) -> None:
+    """Merge legacy *_id_hashes / *_source_index files into the unified index.
+
+    One-shot, validated (row counts against the sum of inputs), atomic
+    (sidecar write then single PUT).  Legacy files are kept until a green
+    GC run.  Idempotent: an already-migrated warehouse is reported and
+    left alone.
+    """
+    from obstore.store import LocalStore
+
+    from earthcatalog.catalog import _open_sqlite
+    from earthcatalog.migrate import migrate_indices
+    from earthcatalog.run import _make_s3_store
+
+    cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
+    if warehouse.startswith("s3://"):
+        bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+        store = _make_s3_store(bucket)
+    else:
+        store = LocalStore(warehouse)
+
+    report = migrate_indices(cat, store, warehouse, dry_run=dry_run)
+    for k, v in report.items():
+        typer.echo(f"{k}: {v}")
+
+
+# ---------------------------------------------------------------------------
 # `info` sub-command — catalog summary
 # ---------------------------------------------------------------------------
 
@@ -319,7 +367,8 @@ def info(
     os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
     os.environ.pop("AWS_SESSION_TOKEN", None)
 
-    from earthcatalog.catalog import FULL_NAME, PROP_HASH_INDEX_PATH, _catalog_info, _open_sqlite
+    from earthcatalog.catalog import FULL_NAME, _catalog_info, _open_sqlite
+    from earthcatalog.index import resolve_index_path
 
     cat = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse)
     try:
@@ -336,9 +385,7 @@ def info(
     typer.echo(f"  Resolution    : {info.grid_resolution}")
     typer.echo(f"  Warehouse     : {warehouse}")
 
-    index_path = (
-        table.properties.get(PROP_HASH_INDEX_PATH) or f"{warehouse.rstrip('/')}_index.parquet"
-    )
+    index_path = resolve_index_path(table, f"{warehouse.rstrip('/')}_index.parquet")
     typer.echo(f"  Unique index  : {index_path}")
 
     stats = info.stats(table)
