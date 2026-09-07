@@ -26,9 +26,10 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     "catalog.py": CATALOG_PY_MAX_LINES,
     "search.py": 565,
     # Phase 3 target
-    "ingest.py": 700,
-    # Extracted from catalog.py — ingest orchestration
-    "pipeline.py": 245,
+    "ingest.py": 730,
+    # Extracted from catalog.py — ingest orchestration + daily dry-run +
+    # _last_run.json writer
+    "pipeline.py": 300,
     # Everything else
     "*": 1600,
 }
@@ -38,6 +39,7 @@ STORE_CONFIG_ALLOWLIST = {
     "catalog.py",
     "cli.py",
     "lock.py",
+    "run.py",
     "store_config.py",
 }
 

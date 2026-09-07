@@ -62,6 +62,7 @@ class Ingester:
         skip_fetch: bool = False,
         skip_compact: bool = False,
         fetch_concurrency: int = 256,
+        fetch_workers: int = 1,
         delta: bool = False,
     ) -> None:
         self._store = store
@@ -76,6 +77,7 @@ class Ingester:
         self._skip_fetch = skip_fetch
         self._skip_compact = skip_compact
         self._fetch_concurrency = fetch_concurrency
+        self._fetch_workers = fetch_workers
         self._delta = delta
         self._ndjson_prefix = (
             f"{self._warehouse_prefix}/staging/ndjson"
@@ -106,23 +108,47 @@ class Ingester:
         """
         total = 0
         rows = 0
+        considered = 0
         pending: list[dict] = []
         touched: set[tuple[str, str]] = set()
+
+        def _counted():
+            nonlocal considered
+            for pair in inventory:
+                considered += 1
+                yield pair
 
         if not self._skip_fetch:
             # The index is the resume checkpoint: one read per run, never
             # per item (keydiff.iter_new_keys streams the inventory against
             # the sorted hash array in bounded batches).
             known = self._index.known_key_hashes()
-            for bucket, key in iter_new_keys(inventory, known):
-                item = self._fetch_fn(bucket, key)
-                if item is None:
-                    continue
-                pending.append(item)
-                total += 1
-                if len(pending) >= self._batch_size:
-                    rows += self._flush(pending, touched)
-                    pending = []
+            new_pairs = iter_new_keys(_counted(), known)
+            if self._fetch_workers > 1:
+                # Daily-path bounded fetch pool: one batch is fully fetched
+                # before it is flushed, so batch semantics (and the crash
+                # windows) are unchanged.
+                from itertools import islice
+
+                while True:
+                    chunk = list(islice(new_pairs, self._batch_size))
+                    if not chunk:
+                        break
+                    pending = _fetch_many(chunk, self._fetch_fn, self._fetch_workers)
+                    total += len(pending)
+                    if pending:
+                        rows += self._flush(pending, touched)
+                pending = []
+            else:
+                for bucket, key in new_pairs:
+                    item = self._fetch_fn(bucket, key)
+                    if item is None:
+                        continue
+                    pending.append(item)
+                    total += 1
+                    if len(pending) >= self._batch_size:
+                        rows += self._flush(pending, touched)
+                        pending = []
 
             if pending:
                 rows += self._flush(pending, touched)
@@ -133,7 +159,7 @@ class Ingester:
                 touched = self._discover_staged_buckets()
             rows += self._compact_all(touched)
 
-        return {"items": total, "rows": rows}
+        return {"items": total, "rows": rows, "considered": considered}
 
     def _discover_staged_buckets(self) -> set[tuple[str, str]]:
         """List every (cell, year) bucket that has staged NDJSON files."""
@@ -586,6 +612,21 @@ def iter_ndjson_lines(stream) -> Iterator[dict]:
 
 
 _PART_RE = re.compile(r"part_(\d+)\.parquet$")
+
+
+def _fetch_many(pairs: list[tuple[str, str]], fetch_fn, workers: int) -> list[dict]:
+    """Fetch *pairs* with a bounded pool; drops failures (None contract).
+
+    The default fetcher goes through the async obstore path (one light
+    event loop, no thread per request); a custom *fetch_fn* (tests) runs
+    in a thread pool with the same None-on-error semantics.
+    """
+    if fetch_fn is _inventory.fetch_item:
+        return _inventory.fetch_items_async(pairs, concurrency=workers)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return [it for it in ex.map(lambda p: fetch_fn(*p), pairs) if it is not None]
 
 
 def _next_part_index(store: object, warehouse_prefix: str, cell: str, year: str) -> int:

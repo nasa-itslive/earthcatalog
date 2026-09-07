@@ -76,6 +76,9 @@ class IngestPipeline:
 
         cat = self._cat
         cfg = self._cfg
+        # The daily path consumes a diff Parquet (from `earthcatalog diff`)
+        # in place of a raw inventory manifest.
+        source = cfg.diff or inventory_path
 
         warehouse_root = cat._catalog.properties.get("warehouse", "")
         uri = cat._catalog.properties.get("uri", "")
@@ -130,6 +133,34 @@ class IngestPipeline:
             index_key = index_key.removeprefix("s3://").split("/", 1)[1]
         index = Index(cat._store, index_key)
 
+        if cfg.dry_run:
+            from .keydiff import iter_new_keys
+
+            known = index.known_key_hashes()
+            pairs = (
+                (b, k)
+                for b, k in iter_inventory(source, since=cfg.since)
+                if k.endswith(".stac.json")
+            )
+            if cfg.limit is not None:
+                pairs = islice(pairs, cfg.limit)
+            considered = 0
+
+            def _counted():
+                nonlocal considered
+                for pair in pairs:
+                    considered += 1
+                    yield pair
+
+            new = sum(1 for _ in iter_new_keys(_counted(), known))
+            return {
+                "dry_run": True,
+                "source": source,
+                "considered": considered,
+                "new": new,
+                "known": considered - new,
+            }
+
         kwargs = dict(
             store=cat._store,
             index=index,
@@ -142,6 +173,7 @@ class IngestPipeline:
             skip_compact=cfg.skip_compact,
             stage=cfg.stage,
             fetch_concurrency=cfg.fetch_concurrency,
+            fetch_workers=cfg.fetch_workers,
             delta=delta,
         )
 
@@ -156,7 +188,7 @@ class IngestPipeline:
             if cfg.skip_fetch and not cfg.scatter_only:
                 shards: list = []
                 print("skip_fetch set — consolidating staged NDJSON (no scatter).")
-            elif is_scatter_manifest(inventory_path):
+            elif is_scatter_manifest(source):
                 # Step 2: consume pre-scattered shards, skip the head read.
                 shards = load_inventory_shards(inventory_path, cat._store)
                 staging_prefix = inventory_path.rstrip("/").rsplit("/", 1)[0]
@@ -169,7 +201,7 @@ class IngestPipeline:
                 # of this step detects an existing scatter and reuses it.
                 staging_prefix = scatter_staging_prefix(
                     warehouse_prefix,
-                    inventory_path,
+                    source,
                     chunk_size=cfg.chunk_size,
                     since=cfg.since,
                     suffix=".stac.json",
@@ -227,14 +259,37 @@ class IngestPipeline:
             # Serial: filter .stac.json + limit, same as the scatter does.
             pairs = (
                 (b, k)
-                for b, k in iter_inventory(inventory_path, since=cfg.since)
+                for b, k in iter_inventory(source, since=cfg.since)
                 if k.endswith(".stac.json")
             )
             if cfg.limit is not None:
                 pairs = islice(pairs, cfg.limit)
             summary = Ingester(**kwargs).run(pairs)
 
+        summary["source"] = source
+        summary["mode"] = mode
+        self._write_last_run(summary)
+
         if cat._store and cat._catalog_key:
             cat.upload_catalog(local_db)
 
         return summary
+
+    def _write_last_run(self, summary: dict) -> None:
+        """Persist the run summary to ``{warehouse}/_last_run.json``."""
+        import json
+        from datetime import UTC
+        from datetime import datetime as _dt2
+
+        import obstore
+
+        cat = self._cat
+        if not cat._store:
+            return
+        root = cat._catalog.properties.get("warehouse", "")
+        rel = root.removeprefix("s3://").split("/", 1)
+        key = f"{rel[1].rstrip('/')}/_last_run.json" if len(rel) == 2 else "_last_run.json"
+        payload = dict(summary)
+        payload["finished_at"] = _dt2.now(UTC).isoformat()
+        obstore.put(cat._store, key, json.dumps(payload, default=str).encode())
+        print(f"Run summary: {root}/_last_run.json")

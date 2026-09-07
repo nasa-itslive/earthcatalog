@@ -31,11 +31,23 @@ app = typer.Typer(
 
 @app.command()
 def ingest(
-    inventory: str = typer.Option(
-        ...,
+    inventory: str | None = typer.Option(
+        None,
         "--inventory",
         "-i",
-        help="Path or s3:// URI to the S3 Inventory (CSV, Parquet, or manifest.json).",
+        help="Path or s3:// URI to the S3 Inventory (CSV, Parquet, or manifest.json). "
+        "Mutually exclusive with --diff.",
+    ),
+    diff: str | None = typer.Option(
+        None,
+        "--diff",
+        help="Diff Parquet from `earthcatalog diff` (new/changed keys vs the previous "
+        "inventory day) — the daily path.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Count the keys the run would fetch (diff vs index) and exit — no writes.",
     ),
     catalog: str = typer.Option(
         "/tmp/earthcatalog.db",
@@ -98,7 +110,12 @@ def ingest(
     fetch_concurrency: int = typer.Option(
         256,
         "--fetch-concurrency",
-        help="Concurrent in-flight S3 GETs per worker during the STAC fetch.",
+        help="Concurrent in-flight S3 GETs per Dask worker during the STAC fetch.",
+    ),
+    fetch_workers: int = typer.Option(
+        16,
+        "--fetch-workers",
+        help="Bounded fetch pool for the serial (daily) path.",
     ),
     grid: str = typer.Option(
         "h3",
@@ -147,7 +164,7 @@ def ingest(
     import os
 
     from earthcatalog.config import GridConfig
-    from scripts.ingest import run as run_ingest
+    from earthcatalog.run import run as run_ingest
 
     grid_cfg = GridConfig(
         type=grid,
@@ -156,8 +173,13 @@ def ingest(
         id_field=id_field,
     )
 
+    if bool(inventory) == bool(diff):
+        typer.echo("ERROR: give exactly one of --inventory or --diff")
+        raise typer.Exit(1)
+
     run_ingest(
         inventory=inventory,
+        diff=diff,
         catalog=catalog,
         warehouse=warehouse,
         catalog_key=catalog_key
@@ -167,6 +189,7 @@ def ingest(
         chunk_size=chunk_size,
         limit=limit,
         mode=mode,
+        dry_run=dry_run,
         scheduler=scheduler,
         workers=workers,
         memory_limit=memory_limit,
@@ -174,8 +197,81 @@ def ingest(
         skip_compact=skip_compact,
         scatter_only=scatter_only,
         fetch_concurrency=fetch_concurrency,
+        fetch_workers=fetch_workers,
         grid=grid_cfg,
     )
+
+
+# ---------------------------------------------------------------------------
+# `diff` sub-command — inventory-vs-inventory (or -vs-index) diff via DuckDB
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def diff(
+    current: str = typer.Option(
+        ...,
+        "--current",
+        help="Current inventory day: manifest.json, a URI-per-line .txt/.files "
+        "list, or a Parquet path/glob.",
+    ),
+    previous: str | None = typer.Option(
+        None,
+        "--previous",
+        help="Previous inventory day (same forms). Day-over-day EXCEPT mode.",
+    ),
+    against_index: str | None = typer.Option(
+        None,
+        "--against-index",
+        help="Unified index Parquet URI — keys not yet ingested (first-run mode).",
+    ),
+    out: str = typer.Option(
+        ...,
+        "--out",
+        help="Where to write the new-keys Parquet (s3:// URI or local path).",
+    ),
+    out_old: str | None = typer.Option(
+        None,
+        "--out-old",
+        help="Optionally also write the disappeared-keys Parquet (with --previous).",
+    ),
+    suffix: str = typer.Option(
+        ".stac.json",
+        "--suffix",
+        help="Only diff keys with this suffix.",
+    ),
+    max_memory: str = typer.Option(
+        "10GB",
+        "--max-memory",
+        help="DuckDB memory cap; excess spills to the temp directory.",
+    ),
+) -> None:
+    """Diff inventories exactly (DuckDB, out-of-core, string comparison).
+
+    The daily narrowing step: `--current` EXCEPT `--previous` gives new and
+    re-uploaded (changed) keys; the reverse EXCEPT (`--out-old`) gives keys
+    that disappeared (future GC input).  Feed the new-keys file to
+    `earthcatalog ingest --diff`.
+    """
+    from earthcatalog.diff import run_diff
+
+    if bool(previous) == bool(against_index):
+        typer.echo("ERROR: give exactly one of --previous or --against-index")
+        raise typer.Exit(1)
+
+    result = run_diff(
+        current=current,
+        out=out,
+        previous=previous,
+        against_index=against_index,
+        out_old=out_old,
+        suffix=suffix,
+        max_memory=max_memory,
+    )
+    typer.echo(f"new keys: {result.new_rows:,}")
+    if result.old_rows is not None:
+        typer.echo(f"disappeared keys: {result.old_rows:,}")
+    typer.echo(f"done in {result.seconds:.1f}s")
 
 
 # ---------------------------------------------------------------------------

@@ -1,69 +1,50 @@
 name: Daily Catalog Update
 
-# Job 1 (produce-delta): scans the latest S3 Inventory against the unified
-#   index and writes a delta Parquet of new item keys to the pending prefix.
-# Job 2 (ingest): consumes that delta Parquet, fetches the STAC JSONs,
-#   and appends rows to the warehouse + unified index.
+# One job, two steps:
+#   1. diff:   DuckDB EXCEPT of today's inventory vs yesterday's → new/changed
+#              keys parquet (exact, out-of-core; writes only the diff file).
+#   2. ingest: earthcatalog ingest --diff <file> anti-joins the diff against
+#              the unified index (already-known keys skipped), fetches the
+#              unknown STAC items with a bounded pool, commits, and writes
+#              {warehouse}/_last_run.json (uploaded as an artifact).
 #
-# DISABLED (workflow_dispatch only) until the AWS credentials secrets
-# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) are injected.  No schedule yet.
+# The `concurrency` group is the primary single-writer guard (the S3Lock is
+# advisory backup).  DISABLED (workflow_dispatch only) until the AWS
+# credentials secrets are injected.  No schedule yet.
 
 on:
   workflow_dispatch:
     inputs:
-      date:
-        description: "Override date (YYYY-MM-DD). Defaults to yesterday."
+      current_manifest:
+        description: "Current inventory manifest.json (defaults to yesterday)"
         required: false
         default: ""
-      scheduler:
-        description: "Dask scheduler for the ingest job"
-        type: choice
-        options:
-          - local
-          - coiled
-          - synchronous
-        default: local
-      workers:
-        description: "Dask local workers"
+      previous_manifest:
+        description: "Previous inventory manifest.json (defaults to day before)"
         required: false
-        default: "4"
-      coiled_n_workers:
-        description: "Coiled worker count"
-        required: false
-        default: "10"
-      coiled_vm_type:
-        description: "Coiled VM type"
-        required: false
-        default: "c6i.xlarge"
-      chunk_size:
-        description: "STAC items per ingest chunk"
-        required: false
-        default: "10000"
+        default: ""
 
 permissions:
   contents: read
+
+concurrency:
+  group: earthcatalog-daily_delta
+  cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   WAREHOUSE:       s3://its-live-data/test-space/stac/catalog/warehouse
-  WAREHOUSE_INDEX: s3://its-live-data/test-space/stac/catalog/warehouse_index.parquet
-  DELTA_PREFIX:    s3://its-live-data/test-space/stac/catalog/delta
   CATALOG_KEY:     test-space/stac/catalog/earthcatalog.db
+  DIFFS_PREFIX:    s3://its-live-data/test-space/stac/catalog/diffs
   INVENTORY_BASE:  s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
 
-# ---------------------------------------------------------------------------
-# Job 1 — Produce delta
-# ---------------------------------------------------------------------------
 jobs:
-  produce-delta:
-    name: Produce daily delta
+  daily:
+    name: Diff + ingest
     runs-on: ubuntu-latest
-    outputs:
-      date:        ${{ steps.manifest.outputs.date }}
-      manifest_url: ${{ steps.manifest.outputs.manifest_url }}
-      delta_path:  ${{ steps.manifest.outputs.delta_path }}
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -78,117 +59,56 @@ jobs:
       - name: Install earthcatalog
         run: uv sync
 
-      - name: Resolve date and paths
-        id: manifest
+      - name: Resolve days and paths
+        id: days
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            DATE="${{ github.event.inputs.date }}"
+          if [ -n "${{ github.event.inputs.current_manifest }}" ]; then
+            echo "current=${{ github.event.inputs.current_manifest }}" >> "$GITHUB_OUTPUT"
           else
-            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
+            echo "current=${{ env.INVENTORY_BASE }}/$(date -u -d 'yesterday' +%Y-%m-%d)T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
           fi
-          echo "date=$DATE"                                                                        >> "$GITHUB_OUTPUT"
-          echo "manifest_url=${{ env.INVENTORY_BASE }}/${DATE}T01-00Z/manifest.json"             >> "$GITHUB_OUTPUT"
-          echo "delta_path=${{ env.DELTA_PREFIX }}/pending/delta_${DATE}.parquet"                >> "$GITHUB_OUTPUT"
-
-      - name: Run daily delta
-        run: |
-          uv run python scripts/daily_delta.py \
-            "${{ steps.manifest.outputs.manifest_url }}" \
-            --warehouse-hash ${{ env.WAREHOUSE_INDEX }} \
-            --delta-prefix   ${{ env.DELTA_PREFIX }} \
-            --date           "${{ steps.manifest.outputs.date }}"
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "### Delta Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "Date: ${{ steps.manifest.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Manifest: \`${{ steps.manifest.outputs.manifest_url }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Delta written to: \`${{ steps.manifest.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
-
-# ---------------------------------------------------------------------------
-# Job 2 — Ingest delta (runs only after produce-delta succeeds)
-# ---------------------------------------------------------------------------
-  ingest:
-    name: Ingest delta
-    needs: produce-delta
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        run: pip install uv
-
-      - name: Install earthcatalog
-        run: uv sync
-
-      - name: Verify delta file exists
-        run: |
-          aws s3 ls "${{ needs.produce-delta.outputs.delta_path }}" || {
-            echo "::error::Delta file not found: ${{ needs.produce-delta.outputs.delta_path }}"
-            exit 1
-          }
-
-      - name: Download catalog
-        run: |
-          uv run python -c "
-          from obstore.store import S3Store
-          from earthcatalog import store_config
-          from earthcatalog.catalog import download_catalog
-          store = S3Store(bucket='its-live-data', region='us-west-2')
-          store_config.set_store(store)
-          store_config.set_catalog_key('${{ env.CATALOG_KEY }}')
-          download_catalog('/tmp/earthcatalog.db')
-          "
-
-      - name: Catalog info (before)
-        run: |
-          uv run python scripts/info.py \
-            --catalog   /tmp/earthcatalog.db \
-            --warehouse ${{ env.WAREHOUSE }}
-
-      - name: Run delta ingest
-        run: |
-          SCHEDULER="${{ github.event.inputs.scheduler || 'local' }}"
-          EXTRA=""
-
-          if [ "$SCHEDULER" = "local" ]; then
-            EXTRA="--workers ${{ github.event.inputs.workers || '4' }}"
-          elif [ "$SCHEDULER" = "coiled" ]; then
-            EXTRA="--coiled-n-workers ${{ github.event.inputs.coiled_n_workers || '10' }} --coiled-vm-type ${{ github.event.inputs.coiled_vm_type || 'c6i.xlarge' }}"
+          if [ -n "${{ github.event.inputs.previous_manifest }}" ]; then
+            echo "previous=${{ github.event.inputs.previous_manifest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "previous=${{ env.INVENTORY_BASE }}/$(date -u -d '2 days ago' +%Y-%m-%d)T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
           fi
+          echo "diff_out=${{ env.DIFFS_PREFIX }}/new-$(date -u -d '2 days ago' +%Y%m%d)-$(date -u -d 'yesterday' +%Y%m%d).parquet" >> "$GITHUB_OUTPUT"
 
+      - name: Diff inventories (DuckDB, out-of-core)
+        run: |
+          uv run earthcatalog diff \
+            --current  "${{ steps.days.outputs.current }}" \
+            --previous "${{ steps.days.outputs.previous }}" \
+            --out      "${{ steps.days.outputs.diff_out }}"
+
+      - name: Ingest the diff
+        run: |
           uv run earthcatalog ingest \
-            --inventory   "${{ needs.produce-delta.outputs.delta_path }}" \
-            --catalog     /tmp/earthcatalog.db \
-            --warehouse   ${{ env.WAREHOUSE }} \
-            --mode        delta \
-            --scheduler   "$SCHEDULER" \
-            --chunk-size  "${{ github.event.inputs.chunk_size || '10000' }}" \
-            $EXTRA
+            --diff          "${{ steps.days.outputs.diff_out }}" \
+            --catalog       /tmp/earthcatalog.db \
+            --warehouse     ${{ env.WAREHOUSE }} \
+            --mode          delta \
+            --scheduler     synchronous \
+            --fetch-workers 16 \
+            --chunk-size    10000
 
-      - name: Mark delta as ingested
-        if: success()
-        run: |
-          INGESTED="${{ env.DELTA_PREFIX }}/ingested/delta_${{ needs.produce-delta.outputs.date }}.done"
-          aws s3 mv "${{ needs.produce-delta.outputs.delta_path }}" "$INGESTED"
-
-      - name: Catalog info (after)
+      - name: Download run summary
         if: always()
         run: |
-          uv run python scripts/info.py \
-            --catalog   /tmp/earthcatalog.db \
-            --warehouse ${{ env.WAREHOUSE }}
+          aws s3 cp "${{ env.WAREHOUSE }}/_last_run.json" ./_last_run.json || \
+            echo "::warning::no _last_run.json produced"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: last-run
+          path: _last_run.json
+          if-no-files-found: ignore
 
       - name: Summary
         if: always()
         run: |
-          echo "### Ingest Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "Date: ${{ needs.produce-delta.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Delta: \`${{ needs.produce-delta.outputs.delta_path }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Unified index: updated" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Daily Update" >> "$GITHUB_STEP_SUMMARY"
+          echo "Current: \`${{ steps.days.outputs.current }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Previous: \`${{ steps.days.outputs.previous }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Diff: \`${{ steps.days.outputs.diff_out }}\`" >> "$GITHUB_STEP_SUMMARY"
+          test -f _last_run.json && cat _last_run.json >> "$GITHUB_STEP_SUMMARY" || true

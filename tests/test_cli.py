@@ -32,13 +32,13 @@ def test_info_requires_catalog_or_s3():
 
 
 def test_ingest_delegates_to_run(monkeypatch):
-    """earthcatalog ingest forwards the essential knobs to scripts.ingest.run."""
+    """earthcatalog ingest forwards the essential knobs to earthcatalog.run.run."""
     captured = {}
 
     def fake_run(**kwargs):
         captured.update(kwargs)
 
-    import scripts.ingest as _mod
+    import earthcatalog.run as _mod
 
     monkeypatch.setattr(_mod, "run", fake_run)
 
@@ -59,7 +59,43 @@ def test_ingest_delegates_to_run(monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert captured.get("inventory") == "s3://b/inv/manifest.json"
+    assert captured.get("diff") is None
     assert captured.get("warehouse") == "s3://b/wh"
     assert captured.get("mode") == "full"
     assert captured.get("limit") == 100
     assert captured.get("skip_compact") is True
+
+
+def test_ingest_diff_path_delegates(monkeypatch):
+    """--diff reaches run() as the diff source (daily path)."""
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+
+    import earthcatalog.run as _mod
+
+    monkeypatch.setattr(_mod, "run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--diff",
+            "s3://b/diffs/new-20260905-20260906.parquet",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("inventory") is None
+    assert captured.get("diff") == "s3://b/diffs/new-20260905-20260906.parquet"
+    assert captured.get("dry_run") is True
+
+
+def test_ingest_rejects_inventory_and_diff():
+    result = runner.invoke(
+        app,
+        ["ingest", "--inventory", "s3://b/manifest.json", "--diff", "s3://b/d.parquet"],
+    )
+    assert result.exit_code == 1
+    assert "exactly one" in result.output
