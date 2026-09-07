@@ -37,6 +37,7 @@ def test_ingest_delegates_to_run(monkeypatch):
 
     def fake_run(**kwargs):
         captured.update(kwargs)
+        return {"items": 0, "rows": 0}
 
     import earthcatalog.run as _mod
 
@@ -72,6 +73,7 @@ def test_ingest_diff_path_delegates(monkeypatch):
 
     def fake_run(**kwargs):
         captured.update(kwargs)
+        return {"items": 0, "rows": 0}
 
     import earthcatalog.run as _mod
 

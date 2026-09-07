@@ -177,7 +177,7 @@ def ingest(
         typer.echo("ERROR: give exactly one of --inventory or --diff")
         raise typer.Exit(1)
 
-    run_ingest(
+    result = run_ingest(
         inventory=inventory,
         diff=diff,
         catalog=catalog,
@@ -200,6 +200,17 @@ def ingest(
         fetch_workers=fetch_workers,
         grid=grid_cfg,
     )
+    if result and result.get("dry_run"):
+        typer.echo(
+            f"dry run: considered {result['considered']:,}, "
+            f"new {result['new']:,}, already indexed {result['known']:,}"
+        )
+    else:
+        typer.echo(
+            f"ingest done: fetched {result.get('items', 0):,}, "
+            f"index rows {result.get('rows', 0):,}, "
+            f"considered {result.get('considered', 0):,}"
+        )
 
 
 # ---------------------------------------------------------------------------
