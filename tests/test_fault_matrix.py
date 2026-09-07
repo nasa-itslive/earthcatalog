@@ -331,7 +331,7 @@ class TestJournalStageScope:
             warehouse_root=WAREHOUSE_ROOT,
         )
         shards = [[("data-bucket", "a.stac.json")], [("data-bucket", "b.stac.json")]]
-        summary = ing.run(shards, client=_FakeClient())
+        ing.run(shards, client=_FakeClient())
         assert list_journals(store, "warehouse") == []
 
     def test_direct_run_leaves_no_journal_after_success(self):
