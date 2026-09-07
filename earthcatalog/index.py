@@ -134,7 +134,10 @@ class Index:
                 "s3_key": [r["s3_key"] for r in rows],
                 "stac_id": [r["stac_id"] for r in rows],
                 "grid_partition": [r["grid_partition"] for r in rows],
-                "year": pa.array([int(r.get("year") or 0) for r in rows], type=pa.int32()),
+                "year": pa.array(
+                    [int(r["year"]) if r.get("year") is not None else None for r in rows],
+                    type=pa.int32(),
+                ),
                 "ingested_at": pa.array([now] * len(rows)),
                 "deleted": pa.array([False] * len(rows)),
             },

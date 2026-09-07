@@ -1,6 +1,6 @@
 # Architecture Simplification Plan
 
-Status: **In progress — Phases 0–4 done, Phase 6 partially done**
+Status: **Superseded — see plan_daily_ingest.md (branch origin/plan/daily-ingest) for the daily-ingest bulletproofing plan; the structural refactor below has landed on feature/garbage-collection**
 Branch: `feature/garbage-collection`
 
 ## Implementation status
@@ -15,7 +15,7 @@ Branch: `feature/garbage-collection`
 | 5 — Unified-Index GC (`earthcatalog.gc`) | ✅ done |
 | 6a — `earthcatalog info` CLI subcommand | ✅ done |
 | 6b — Search SQL dedup (`build_query`) | ✅ done |
-| 7 — `migrate_indices()` + dead-code cleanup | ✅ done |
+| 7 — `migrate_indices()` + dead-code cleanup | ✅ done — implemented for real in `earthcatalog/migrate.py` (legacy id_hashes/source_index → unified index, validated atomic swap); this plan previously marked it done before it existed |
 | 8 — `run_backfill` kwargs simplification | ✅ done — **callers migrated to Ingester** |
 
 Also done while implementing: added `pyrightconfig.json` (fixes "could not be
@@ -23,11 +23,9 @@ resolved" type errors), installed dev extra `coiled`, fixed pre-existing ruff
 errors in `tests/test_gc_bugs.py`, simplified `Ingester` kwargs.
 
 **Deferred (explicitly, to avoid breaking things):**
-- `run_backfill` is **deprecated** (docstring) and no longer used by any
-  production caller: `EarthCatalog.bulk_ingest` and
-  `scripts/run_backfill.py` now route through the resumable
-  `Ingester`/`DaskIngester`.  The function itself remains for
-  backward compatibility and its tests.
+- `run_backfill` has since been **deleted** (scripts and package); its
+  store/client plumbing lives in `earthcatalog/run.py` behind the
+  `earthcatalog ingest` CLI.
 - CLI `incremental` options — deferred; `info` subcommand shipped as the
   pattern to follow.
 - `migrate_indices()` shipped; the one-shot run in production (GC workflow)

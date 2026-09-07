@@ -1097,3 +1097,68 @@ class TestHeadPreFilter:
 
         assert client.fetched == []
         assert summary["items"] == 0
+
+
+class TestUnknownYearSentinel:
+    def test_item_without_datetime_matches_gc_partition(self, tmp_path):
+        """A11: items without datetime go to year=unknown/ physically; the
+        index row must carry year=NULL (not 0) so GC's partition lookup
+        finds the same directory and can actually retire the file."""
+        import csv as _csv
+
+        from earthcatalog.gc import run_garbage_collection
+
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        def no_datetime_item(key):
+            item = _make_item(key)
+            del item["properties"]["datetime"]
+            return item
+
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=_FakeTable(),
+            fetch_fn=lambda b, k: no_datetime_item(k),
+            stage="direct",
+            warehouse_prefix="warehouse",
+            batch_size=10,
+        )
+        summary = ing.run(_inventory(["x.stac.json"]))
+        assert summary["items"] == 1
+
+        # Physically in year=unknown/.
+        unknown_files = [
+            k for k in _list_files(store, "warehouse/")
+            if "year=unknown" in k and k.endswith(".parquet")
+        ]
+        assert unknown_files, _list_files(store, "warehouse/")
+
+        # Index row year is NULL, not 0.
+        row = next(index.stream_active())
+        assert row["year"] is None
+
+        # GC against an inventory without the item retires the file — the
+        # partition lookup (unknown) matches where the file actually lives.
+        inv_csv = tmp_path / "inv.csv"
+        with inv_csv.open("w", newline="") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["bucket", "key"])
+
+        gc_result = run_garbage_collection(
+            str(inv_csv),
+            store=store,
+            index=Index(store, "warehouse/index.parquet"),
+            warehouse_prefix="warehouse/",
+            head_fn=lambda k: False,
+        )
+        assert gc_result["confirmed"] == 1, gc_result
+        assert gc_result["orphaned"] == 1, gc_result

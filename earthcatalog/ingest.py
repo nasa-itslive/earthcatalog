@@ -651,7 +651,9 @@ def _to_index_row(item: dict) -> dict:
         "s3_key": f"s3://{item['_source_bucket']}/{item['_source_key']}",
         "stac_id": item.get("id") or "",
         "grid_partition": props.get("grid_partition", "__none__"),
-        "year": _year_from_item(item) or 0,
+        # Null, not 0: files without a datetime live in year=unknown/, and
+        # GC's partition lookup maps None → unknown — the row must agree.
+        "year": _year_from_item(item),
     }
 
 

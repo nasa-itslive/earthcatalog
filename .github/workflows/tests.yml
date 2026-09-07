@@ -44,3 +44,35 @@ jobs:
         with:
           name: pytest-results-${{ matrix.python-version }}
           path: .pytest_cache/
+  wheel-smoke:
+    name: wheel install smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Install wheel into a fresh venv (no source tree)
+        run: |
+          uv venv smoke
+          source smoke/bin/activate
+          uv pip install dist/*.whl
+
+      - name: CLI must work from the wheel alone
+        run: |
+          source smoke/bin/activate
+          earthcatalog --help
+          earthcatalog ingest --help
+          earthcatalog diff --help
+          earthcatalog info --help
+          earthcatalog migrate-indices --help
+          python -c "import earthcatalog, earthcatalog.diff, earthcatalog.keydiff, earthcatalog.journal, earthcatalog.migrate; print('imports ok')"

@@ -169,9 +169,22 @@ index (no hash/source-index knobs to manage):
 uv run earthcatalog ingest --inventory s3://bucket/inventory/full.parquet \
     --mode full --grid s2 --resolution 2
 
-# Daily delta ingest (diff produced by scripts/daily_delta.py)
-uv run earthcatalog ingest --inventory s3://…/delta/pending/delta_2026-04-28.parquet \
-    --mode delta --scheduler local --workers 4
+# Daily update — exact diff, then ingest only what is new.
+# Step 1: DuckDB EXCEPT of the two inventory days (out-of-core, string-exact);
+# writes new/changed keys; --out-old captures disappeared keys (GC input).
+uv run earthcatalog diff \
+    --current  s3://…/inventory/dt=2026-09-06/manifest.json \
+    --previous s3://…/inventory/dt=2026-09-05/manifest.json \
+    --out      s3://…/diffs/new-20260905-20260906.parquet \
+    --out-old  s3://…/diffs/old-20260905-20260906.parquet
+
+# Step 2: anti-join the diff against the unified index (known keys skip),
+# fetch the rest with a bounded pool, commit, write _last_run.json.
+uv run earthcatalog ingest --diff s3://…/diffs/new-20260905-20260906.parquet \
+    --mode delta --scheduler synchronous --fetch-workers 16
+
+# Counts only, no writes:
+uv run earthcatalog ingest --diff s3://…/diffs/new-20260905-20260906.parquet --dry-run
 
 # Two-step scatter → map/reduce (workers don't idle behind the head read):
 # Step 1: scatter only (no cluster needed)

@@ -21,7 +21,6 @@ no partial state.
 from __future__ import annotations
 
 import io
-import re
 import tempfile
 import uuid
 from collections import defaultdict
@@ -37,8 +36,6 @@ from pybloom_live import ScalableBloomFilter
 
 from earthcatalog.index import Index
 from earthcatalog.inventory import _iter_inventory
-
-_GC_FILE_RE = re.compile(r"(.*/)(gc_[0-9a-f]+\.parquet)$")
 
 _DEFAULT_ERROR_RATE = 0.0001
 _DEFAULT_CONCURRENCY = 64
