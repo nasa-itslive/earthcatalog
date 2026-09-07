@@ -29,7 +29,7 @@ import obstore
 import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
-from obstore.store import S3Store
+from obstore.store import ObjectStore, S3Store
 from tqdm import tqdm
 
 _STORES: dict[str, S3Store] = {}
@@ -171,7 +171,7 @@ def iter_inventory_parquet(
             yield from zip(buckets, keys)
 
 
-def _parse_manifest(manifest_s3_uri: str) -> tuple[str, object, list[str]]:
+def _parse_manifest(manifest_s3_uri: str) -> tuple[str, ObjectStore, list[str]]:
     manifest_path = manifest_s3_uri.removeprefix("s3://")
     manifest_bucket, manifest_key = manifest_path.split("/", 1)
 
@@ -190,7 +190,7 @@ def _parse_manifest(manifest_s3_uri: str) -> tuple[str, object, list[str]]:
 
 
 def iter_inventory_file_from_store(
-    store: object,
+    store: ObjectStore,
     data_key: str,
     batch_size: int = 65_536,
     since: datetime | None = None,
@@ -205,6 +205,7 @@ def iter_inventory_manifest(
     since: datetime | None = None,
 ) -> Iterator[tuple[str, str]]:
     _source_bucket, dest_store, data_keys = _parse_manifest(manifest_s3_uri)
+    assert dest_store is not None
     for data_key in data_keys:
         yield from iter_inventory_file_from_store(
             dest_store, data_key, batch_size=batch_size, since=since
@@ -254,7 +255,7 @@ class InventoryShard:
 
     files: tuple[str, ...] = ()
     pairs: tuple[tuple[str, str], ...] = ()
-    store: object = None
+    store: ObjectStore | None = None
     since: datetime | None = None
     suffix: str | None = None
     limit: int | None = None
@@ -271,6 +272,7 @@ class InventoryShard:
     def _iter_raw(self) -> Iterator[tuple[str, str]]:
         if self.pairs:
             return iter(self.pairs)
+        assert self.store is not None
         return chain.from_iterable(
             iter_inventory_file_from_store(self.store, key, since=self.since) for key in self.files
         )
@@ -320,7 +322,7 @@ def scatter_staging_prefix(
     return f"{warehouse_prefix.rstrip('/')}/staging/shards/{digest}"
 
 
-def scatter_manifest_exists(store: object, staging_prefix: str) -> bool:
+def scatter_manifest_exists(store: ObjectStore, staging_prefix: str) -> bool:
     """True if a scatter manifest already exists under *staging_prefix*."""
     try:
         obstore.get(store, scatter_manifest_path(staging_prefix)).bytes()
@@ -331,7 +333,7 @@ def scatter_manifest_exists(store: object, staging_prefix: str) -> bool:
 
 def write_inventory_shards(
     inventory_path: str,
-    store: object,
+    store: ObjectStore,
     *,
     staging_prefix: str,
     chunk_size: int = 100_000,
@@ -409,7 +411,7 @@ def write_inventory_shards(
     return shards
 
 
-def load_inventory_shards(scatter_path: str, store: object) -> list[InventoryShard]:
+def load_inventory_shards(scatter_path: str, store: ObjectStore) -> list[InventoryShard]:
     """Load shards scattered by :func:`write_inventory_shards`.
 
     *scatter_path* may be the ``scatter.json`` manifest key or the staging
@@ -423,7 +425,7 @@ def load_inventory_shards(scatter_path: str, store: object) -> list[InventorySha
     return [InventoryShard(files=(k,), store=store) for k in manifest["shards"]]
 
 
-def delete_shard_files(store: object, shards: list[InventoryShard]) -> int:
+def delete_shard_files(store: ObjectStore, shards: list[InventoryShard]) -> int:
     """Best-effort delete of shard files written by :func:`write_inventory_shards`."""
     deleted = 0
     for shard in shards:
@@ -436,7 +438,7 @@ def delete_shard_files(store: object, shards: list[InventoryShard]) -> int:
     return deleted
 
 
-def delete_scatter(store: object, staging_prefix: str, shards: list[InventoryShard]) -> int:
+def delete_scatter(store: ObjectStore, staging_prefix: str, shards: list[InventoryShard]) -> int:
     """Best-effort delete of shard files *and* their scatter manifest."""
     deleted = delete_shard_files(store, shards)
     try:
@@ -468,7 +470,7 @@ def fetch_item(bucket: str, key: str) -> dict | None:
         return None
 
 
-async def _fetch_item_async(store: object, bucket: str, key: str) -> dict | None:
+async def _fetch_item_async(store: ObjectStore, bucket: str, key: str) -> dict | None:
     """Fetch one STAC JSON via ``obstore.get_async`` with retry/backoff.
 
     404 → None (skip); S3 error XML (SlowDown/Error) → retry; unexpected

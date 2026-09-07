@@ -25,14 +25,14 @@ from typing import TYPE_CHECKING
 
 import obstore
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from obstore.store import ObjectStore
 
 from .index import _SCHEMA, hash_id
 from .schema import FULL_NAME, PROP_INDEX_PATH
 
 if TYPE_CHECKING:
-    from .index import Index
+    pass
 
 
 def _strip(uri: str) -> str:
@@ -51,7 +51,7 @@ def _store_key(warehouse_root: str, suffix: str) -> str:
     return warehouse_root.rstrip("/").rsplit("/", 1)[-1] + suffix
 
 
-def _read_optional_parquet(store: object, key: str) -> pa.Table | None:
+def _read_optional_parquet(store: ObjectStore, key: str) -> pa.Table | None:
     try:
         raw = bytes(obstore.get(store, key).bytes())
     except FileNotFoundError:
@@ -61,7 +61,7 @@ def _read_optional_parquet(store: object, key: str) -> pa.Table | None:
 
 def migrate_indices(
     catalog,
-    store: object,
+    store: ObjectStore,
     warehouse_root: str,
     *,
     dry_run: bool = False,
@@ -119,9 +119,11 @@ def migrate_indices(
 
     # Hash-only rows: dedup protection for items whose provenance was never
     # recorded.  Known hashes (from the source index) are skipped.
-    known = {bytes(h) for h in source_tbl.column("id_hash").to_pylist()} if (
-        source_tbl is not None and "id_hash" in source_tbl.column_names
-    ) else set()
+    known = (
+        {bytes(h) for h in source_tbl.column("id_hash").to_pylist()}
+        if (source_tbl is not None and "id_hash" in source_tbl.column_names)
+        else set()
+    )
     known.update(hash_id(r["stac_id"]) for r in rows if r["stac_id"])
     hash_only = 0
     if hashes_tbl is not None:
@@ -157,8 +159,7 @@ def migrate_indices(
     tbl = pa.Table.from_pylist(rows, schema=_SCHEMA)
     if tbl.num_rows != expected:
         raise RuntimeError(
-            f"migration validation failed: wrote {tbl.num_rows} rows, "
-            f"expected {expected}"
+            f"migration validation failed: wrote {tbl.num_rows} rows, expected {expected}"
         )
 
     # Validated sidecar first, then a single atomic PUT into place.  The
@@ -170,9 +171,7 @@ def migrate_indices(
     obstore.put(store, sidecar_key, payload)
     written = pq.ParquetFile(io.BytesIO(payload)).metadata.num_rows
     if written != expected:
-        raise RuntimeError(
-            f"sidecar validation failed: {written} rows, expected {expected}"
-        )
+        raise RuntimeError(f"sidecar validation failed: {written} rows, expected {expected}")
     obstore.put(store, index_key, payload)
     obstore.delete(store, sidecar_key)
 

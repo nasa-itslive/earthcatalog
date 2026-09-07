@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 
 import obstore
 from obstore.exceptions import AlreadyExistsError
+from obstore.store import ObjectStore
 
 from . import store_config
 
@@ -52,7 +53,7 @@ class S3Lock:
         self,
         owner: str,
         ttl_hours: int = 12,
-        store: object | None = None,
+        store: ObjectStore | None = None,
         key: str | None = None,
     ) -> None:
         """
@@ -75,7 +76,7 @@ class S3Lock:
         self.release()
 
     @property
-    def _store(self) -> object:
+    def _store(self) -> ObjectStore:
         if self._explicit_store is not None:
             return self._explicit_store
         return store_config.get_store()

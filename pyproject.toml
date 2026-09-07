@@ -88,18 +88,28 @@ indent-style = "space"
 [tool.mypy]
 python_version = "3.12"
 
-# Third-party libs without py.typed markers — runtime-verified, stub-less.
 [[tool.mypy.overrides]]
+# Third-party libs without py.typed markers — runtime-verified, stub-less.
 module = [
-  "pyarrow.*",
-  "obstore.*",
+  "shapely.*",
+  "shapely",
+  "shapely.geometry",
+  "shapely.strtree",
+  "yaml",
+  "pandas.*",
+  "tqdm.*",
   "h3.*",
   "s2geometry.*",
   "pybloom_live.*",
   "coiled.*",
-  "tqdm.*",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The pyarrow.compute re-export shim: pyarrow's partial stubs make every
+# name here a mypy false positive.  Runtime-verified via the test suite.
+module = ["earthcatalog._pcc"]
+ignore_errors = true
 
 [tool.setuptools_scm]
 version_scheme = "no-guess-dev"

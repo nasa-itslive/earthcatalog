@@ -44,6 +44,8 @@ import uuid
 from typing import TYPE_CHECKING
 
 import obstore
+from obstore.store import ObjectStore
+from pyiceberg.table import Table
 
 if TYPE_CHECKING:
     from .index import Index
@@ -64,7 +66,7 @@ def new_run_id() -> str:
 class BatchJournal:
     """Write-ahead journal for one ingest run's batches."""
 
-    def __init__(self, store: object, warehouse_prefix: str, run_id: str) -> None:
+    def __init__(self, store: ObjectStore, warehouse_prefix: str, run_id: str) -> None:
         self._store = store
         self._prefix = journal_prefix(warehouse_prefix)
         self._run_id = run_id
@@ -105,12 +107,10 @@ class BatchJournal:
             return {"keys": [], "files": []}
 
     def _put(self, seq: int, doc: dict) -> None:
-        obstore.put(
-            self._store, self._key(seq), json.dumps(doc, default=str).encode()
-        )
+        obstore.put(self._store, self._key(seq), json.dumps(doc, default=str).encode())
 
 
-def list_journals(store: object, warehouse_prefix: str) -> list[str]:
+def list_journals(store: ObjectStore, warehouse_prefix: str) -> list[str]:
     """Every journal file across all run_ids (one LIST per run start)."""
     prefix = journal_prefix(warehouse_prefix)
     keys: list[str] = []
@@ -125,14 +125,14 @@ def list_journals(store: object, warehouse_prefix: str) -> list[str]:
     return sorted(keys)
 
 
-def _read_journal(store: object, key: str) -> dict | None:
+def _read_journal(store: ObjectStore, key: str) -> dict | None:
     try:
         return json.loads(bytes(obstore.get(store, key).bytes()))
     except Exception:
         return None
 
 
-def _registered_files(table: object) -> set[str] | None:
+def _registered_files(table: Table) -> set[str] | None:
     """Full paths registered in the Iceberg table, or None if unreadable."""
     try:
         inspect = table.inspect.files()
@@ -143,10 +143,10 @@ def _registered_files(table: object) -> set[str] | None:
 
 
 def recover_journals(
-    store: object,
+    store: ObjectStore,
     warehouse_prefix: str,
     index: Index,
-    table: object,
+    table: Table,
     full_path=lambda rel: rel,
 ) -> dict:
     """Recover every leftover journal; idempotent, run at ingest start.

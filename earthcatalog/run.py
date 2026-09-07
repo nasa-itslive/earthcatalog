@@ -263,8 +263,10 @@ def run(
         fetch_workers=fetch_workers,
     )
 
+    source = inventory if inventory is not None else diff
+    assert source is not None
     return ec.ingest_inventory(
-        inventory_path=inventory or diff,
+        inventory_path=source,
         mode=mode or ("delta" if delta else "auto"),
         config=cfg,
     )

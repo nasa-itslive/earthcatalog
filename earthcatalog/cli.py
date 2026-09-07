@@ -315,7 +315,7 @@ def migrate_indices_command(
     GC run.  Idempotent: an already-migrated warehouse is reported and
     left alone.
     """
-    from obstore.store import LocalStore
+    from obstore.store import LocalStore, S3Store
 
     from earthcatalog.catalog import _open_sqlite
     from earthcatalog.migrate import migrate_indices
@@ -324,7 +324,7 @@ def migrate_indices_command(
     cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
     if warehouse.startswith("s3://"):
         bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
-        store = _make_s3_store(bucket)
+        store: S3Store | LocalStore = _make_s3_store(bucket)
     else:
         store = LocalStore(warehouse)
 
@@ -360,6 +360,7 @@ def info(
         typer.echo("ERROR: specify --catalog or --catalog-s3")
         raise typer.Exit(1)
 
+    assert catalog is not None
     catalog_path = catalog
     if catalog_s3:
         import obstore

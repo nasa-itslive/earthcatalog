@@ -7,14 +7,13 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from obstore.store import LocalStore, MemoryStore
+from obstore.store import LocalStore
 
 from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
 from earthcatalog.config import GridConfig
 from earthcatalog.index import Index, resolve_index_path
 from earthcatalog.migrate import migrate_indices
 from earthcatalog.schema import PROP_HASH_INDEX_PATH, PROP_INDEX_PATH
-
 from tests.test_ingest import _make_item
 
 
@@ -144,9 +143,9 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     wh, store, cat, table = _make_warehouse(tmp_path)
 
+    from earthcatalog.catalog import EarthCatalog
     from earthcatalog.ingest import Ingester
     from earthcatalog.pipeline import IngestPipeline
-    from earthcatalog.catalog import EarthCatalog
 
     index = Index(store, "warehouse_index.parquet")
 

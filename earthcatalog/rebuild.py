@@ -8,10 +8,11 @@ consolidation after Parquet files are rewritten on S3.
 from __future__ import annotations
 
 import obstore
+from obstore.store import ObjectStore
 
 
 def _list_warehouse_keys(
-    warehouse_store: object,
+    warehouse_store: ObjectStore,
     warehouse_root: str,
 ) -> list[str]:
     """List all hive-style GeoParquet keys in *warehouse_store*.
@@ -45,7 +46,7 @@ def _list_warehouse_keys(
 def rebuild_iceberg_from_warehouse(
     catalog_path: str,
     warehouse_root: str,
-    warehouse_store: object,
+    warehouse_store: ObjectStore,
     *,
     upload: bool = True,
 ) -> int:

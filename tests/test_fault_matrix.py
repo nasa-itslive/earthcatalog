@@ -25,7 +25,6 @@ from obstore.store import MemoryStore
 from earthcatalog.index import Index
 from earthcatalog.ingest import DaskIngester, Ingester
 from earthcatalog.journal import BatchJournal, list_journals
-
 from tests.test_ingest import _inventory, _make_item
 
 WAREHOUSE_ROOT = "memory://warehouse"
@@ -300,7 +299,7 @@ class TestFaultMatrix:
         # The leaked file exists on the store and is not registered.
         assert store.get("warehouse/grid_partition=cellA/year=2020/part_leaked.parquet")
         calls = {"n": 0}
-        summary = _run(keys, store, index, table, fetch_calls=calls)
+        _run(keys, store, index, table, fetch_calls=calls)
         assert calls["outer"]["n"] == 4  # nothing had committed
         _assert_converged(store, index, table, keys, allow_orphans=1)
 

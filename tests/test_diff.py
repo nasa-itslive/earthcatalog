@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 
 from earthcatalog.diff import resolve_files, run_diff
 
-_LM = datetime(2026, 9, 5, 1, 0, tzinfo=timezone.utc)
+_LM = datetime(2026, 9, 5, 1, 0, tzinfo=UTC)
 
 
 def _write_inventory(path: Path, keys: list[str], sizes: list[int] | None = None) -> str:
@@ -103,8 +103,9 @@ def test_diff_suffix_filter(tmp_path):
 
 
 def test_diff_against_index_mode(tmp_path):
-    from earthcatalog.index import Index
     from obstore.store import MemoryStore
+
+    from earthcatalog.index import Index
 
     day = _write_inventory(
         tmp_path / "day.parquet", ["known.stac.json", "fresh.stac.json"]

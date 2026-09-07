@@ -14,24 +14,24 @@ local development and testing. Override before running any job:
 
 from pathlib import Path
 
-from obstore.store import LocalStore
+from obstore.store import LocalStore, ObjectStore
 
 # Default paths used with the LocalStore
 _DEFAULT_ROOT = "/tmp/earthcatalog_store"
 
 Path(_DEFAULT_ROOT).mkdir(parents=True, exist_ok=True)
-_store: object = LocalStore(_DEFAULT_ROOT)
+_store: ObjectStore = LocalStore(_DEFAULT_ROOT)
 _catalog_key: str = "catalog.db"
 _lock_key: str = ".lock"
 
 
-def set_store(store: object) -> None:
+def set_store(store: ObjectStore) -> None:
     """Override the store backend (e.g. S3Store for production)."""
     global _store
     _store = store
 
 
-def get_store() -> object:
+def get_store() -> ObjectStore:
     """Return the active obstore-compatible store."""
     return _store
 

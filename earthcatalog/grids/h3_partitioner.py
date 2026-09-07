@@ -29,12 +29,12 @@ This guarantees no data gap at cell boundaries regardless of item shape.
 import h3
 import numpy as np
 from shapely import wkb
-from shapely.geometry import mapping
+from shapely.geometry import Polygon, mapping
 
 from earthcatalog.partitioner import AbstractPartitioner
 
 
-def _boundary_cells(geom: object, resolution: int) -> set[str]:
+def _boundary_cells(geom: Polygon, resolution: int) -> set[str]:
     """
     Return all H3 cells touched by the polygon's exterior boundary ring.
     Densify the ring so no cell is skipped between two vertices.

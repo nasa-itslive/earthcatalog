@@ -461,7 +461,6 @@ class TestNdjsonCompaction:
     def test_exact_dedup_keeps_every_unique_item(self):
         """Duplicate NDJSON lines are deduped exactly — no legitimate item is
         dropped (unlike a Bloom filter, which would lose ~0.1% of items)."""
-        from earthcatalog.ingest import _put_ndjson
 
         store, prefix = self._stage(["a.stac.json", "b.stac.json"])
         key = f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl"

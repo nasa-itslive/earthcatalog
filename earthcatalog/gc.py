@@ -30,8 +30,14 @@ from pathlib import Path
 
 import obstore
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from obstore.store import ObjectStore
+from pyarrow.compute import (  # type: ignore[attr-defined]
+    invert as pc_invert,
+)
+from pyarrow.compute import (  # type: ignore[attr-defined]
+    is_in as pc_is_in,
+)
 from pybloom_live import ScalableBloomFilter
 
 from earthcatalog.index import Index
@@ -106,7 +112,7 @@ def confirm_deletions(
 
 
 def _list_partition_files(
-    store: object, warehouse_prefix: str, cell: str, year: int | None
+    store: ObjectStore, warehouse_prefix: str, cell: str, year: int | None
 ) -> list[str]:
     """List GeoParquet keys in one (cell, year) partition, newest first."""
     year_str = str(year) if year is not None else "unknown"
@@ -122,13 +128,13 @@ def _list_partition_files(
 
 
 def rewrite_file_without_orphans(
-    file_key: str, orphaned_ids: set[str], store: object
+    file_key: str, orphaned_ids: set[str], store: ObjectStore
 ) -> tuple[str, int]:
     """Rewrite the GeoParquet at *file_key*, dropping *orphaned_ids*, to ``gc_*``."""
     raw = bytes(obstore.get(store, file_key).bytes())
     tbl = pq.ParquetFile(io.BytesIO(raw)).read()
     id_col = tbl.column("id")
-    mask = pc.invert(pc.is_in(id_col, pa.array(list(orphaned_ids), type=id_col.type)))
+    mask = pc_invert(pc_is_in(id_col, pa.array(list(orphaned_ids), type=id_col.type)))
     cleaned = tbl.filter(mask)
 
     dir_path = file_key.rsplit("/", 1)[0]
@@ -156,7 +162,7 @@ def _orphans_by_partition(orphans: list[dict]) -> dict[tuple[str, int | None], s
 def execute_cleanup(
     orphans: list[dict],
     *,
-    store: object,
+    store: ObjectStore,
     index: Index,
     warehouse_prefix: str = "",
     dry_run: bool = False,
@@ -221,7 +227,7 @@ def execute_cleanup(
 def run_garbage_collection(
     inventory_path: str,
     *,
-    store: object,
+    store: ObjectStore,
     index: Index,
     warehouse_prefix: str = "",
     head_fn: Callable[[str], bool] | None = None,

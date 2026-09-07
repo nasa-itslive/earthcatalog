@@ -25,15 +25,21 @@ run; a crashed run leaves only orphaned files under a dead run prefix.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING
 
+from obstore.store import ObjectStore
+
 from .ingest_config import IngestConfig
 
 if TYPE_CHECKING:
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.table import Table
+
     from .catalog import EarthCatalog
 
 
@@ -43,6 +49,8 @@ class IngestPipeline:
     def __init__(self, catalog: EarthCatalog, config: IngestConfig | None = None) -> None:
         self._cat = catalog
         self._cfg = config or IngestConfig()
+        self._catalog: SqlCatalog = catalog._catalog
+        self._table: Table = catalog._table
 
     def run(self, inventory_path: str, *, mode: str = "auto") -> dict:
         """Ingest *inventory_path* into the catalog's Iceberg table.
@@ -82,8 +90,8 @@ class IngestPipeline:
         # in place of a raw inventory manifest.
         source = cfg.diff or inventory_path
 
-        warehouse_root = cat._catalog.properties.get("warehouse", "")
-        uri = cat._catalog.properties.get("uri", "")
+        warehouse_root = self._catalog.properties.get("warehouse", "")
+        uri = self._catalog.properties.get("uri", "")
         local_db = uri.removeprefix("sqlite:///")
 
         grid_cfg = GridConfig(
@@ -115,14 +123,14 @@ class IngestPipeline:
             from pyiceberg.exceptions import NoSuchTableError
 
             try:
-                cat._catalog.drop_table(FULL_NAME)
+                self._catalog.drop_table(FULL_NAME)
             except NoSuchTableError:
                 pass
             try:
-                cat._catalog.create_namespace(NAMESPACE)
+                self._catalog.create_namespace(NAMESPACE)
             except Exception:
                 pass
-            cat._table = get_or_create(cat._catalog, grid_config=grid_cfg)  # type: ignore[assignment]
+            cat._table = self._table = get_or_create(self._catalog, grid_config=grid_cfg)
 
         warehouse_prefix = warehouse_root.rstrip("/") + "/"
         if warehouse_prefix.startswith("s3://"):
@@ -134,9 +142,7 @@ class IngestPipeline:
             # Local stores are rooted at the warehouse dir — same
             # store-relative rule as the index key above.
             warehouse_prefix = os.path.basename(warehouse_root.rstrip("/")) + "/"
-        index_key = resolve_index_path(
-            cat._table, f"{warehouse_root.rstrip('/')}_index.parquet"
-        )
+        index_key = resolve_index_path(cat._table, f"{warehouse_root.rstrip('/')}_index.parquet")
         if index_key.startswith("s3://"):
             index_key = index_key.removeprefix("s3://").split("/", 1)[1]
         elif os.path.isabs(index_key):
@@ -144,16 +150,19 @@ class IngestPipeline:
             # store-relative so reads, writes, and the full-mode reset all
             # land on the same object.
             index_key = os.path.basename(index_key)
-        index = Index(cat._store, index_key)
+        if cat._store is None:
+            raise RuntimeError("ingest requires a warehouse store")
+        store: ObjectStore = cat._store
+        index = Index(store, index_key)
 
-        if not delta and cat._store:
+        if not delta and store:
             # Full mode really rebuilds: the index object and staging area
             # die with the table, or the resume checkpoint would skip every
             # item and a "full" ingest would ingest nothing.
             import obstore
 
             try:
-                obstore.delete(cat._store, index_key)
+                obstore.delete(store, index_key)
             except FileNotFoundError:
                 pass
             for prefix in (
@@ -161,9 +170,9 @@ class IngestPipeline:
                 f"{warehouse_prefix.rstrip('/')}/_staging",  # journals + NDJSON
             ):
                 try:
-                    for listing in obstore.list(cat._store, prefix=prefix):
+                    for listing in obstore.list(store, prefix=prefix):
                         for obj in listing:
-                            obstore.delete(cat._store, obj["path"])
+                            obstore.delete(store, obj["path"])
                 except FileNotFoundError:
                     pass
 
@@ -177,17 +186,18 @@ class IngestPipeline:
             index_uris = [f"{warehouse_root.rstrip('/')}/{loc}" for loc in index.locations()]
         dedupe = partial(anti_join, index_uri=index_uris) if index_uris else None
         direct_left = (
-            source
-            if dedupe is not None and source.endswith((".parquet", ".json"))
-            else None
+            source if dedupe is not None and source.endswith((".parquet", ".json")) else None
         )
 
         def dedupe_pairs(pairs):
+            assert dedupe is not None
             return dedupe(pairs)
 
         def dedupe_source(limit: int | None = None):
+            assert dedupe is not None
             return dedupe(direct_left, suffix=".stac.json", since=cfg.since, limit=limit)
 
+        pairs_iter: Iterator[tuple[str, str]] | islice
         if cfg.dry_run:
             if direct_left:
                 from .diff import count_rows
@@ -195,19 +205,19 @@ class IngestPipeline:
                 considered = count_rows(resolve_files(source))
                 new = sum(1 for _ in dedupe_source())
             else:
-                base = (
+                base: Iterator[tuple[str, str]] = (
                     (b, k)
                     for b, k in iter_inventory(source, since=cfg.since)
                     if k.endswith(".stac.json")
                 )
                 if cfg.limit is not None:
                     base = islice(base, cfg.limit)
-                pairs = dedupe_pairs(base) if dedupe else base
+                pairs_iter = dedupe_pairs(base) if dedupe is not None else base
                 considered = 0
 
                 def _counted():
                     nonlocal considered
-                    for pair in pairs:
+                    for pair in pairs_iter:
                         considered += 1
                         yield pair
 
@@ -221,7 +231,7 @@ class IngestPipeline:
             }
 
         kwargs = dict(
-            store=cat._store,
+            store=store,
             index=index,
             table=cat._table,
             partitioner=partitioner,
@@ -252,7 +262,7 @@ class IngestPipeline:
                 print("skip_fetch set — consolidating staged NDJSON (no scatter).")
             elif is_scatter_manifest(source):
                 # Step 2: consume pre-scattered shards, skip the head read.
-                shards = load_inventory_shards(inventory_path, cat._store)
+                shards = load_inventory_shards(inventory_path, store)
                 staging_prefix = inventory_path.rstrip("/").rsplit("/", 1)[0]
                 print(
                     f"Map/reduce: {len(shards)} pre-scattered shard file(s) from {inventory_path}"
@@ -269,10 +279,8 @@ class IngestPipeline:
                     suffix=".stac.json",
                     limit=cfg.limit,
                 )
-                if scatter_manifest_exists(cat._store, staging_prefix):
-                    shards = load_inventory_shards(
-                        scatter_manifest_path(staging_prefix), cat._store
-                    )
+                if scatter_manifest_exists(store, staging_prefix):
+                    shards = load_inventory_shards(scatter_manifest_path(staging_prefix), store)
                     print(
                         f"Scatter already exists ({len(shards)} shard file(s)) — reusing "
                         f"{scatter_manifest_path(staging_prefix)}"
@@ -280,7 +288,7 @@ class IngestPipeline:
                 else:
                     shards = write_inventory_shards(
                         inventory_path,
-                        cat._store,
+                        store,
                         staging_prefix=staging_prefix,
                         chunk_size=cfg.chunk_size,
                         since=cfg.since,
@@ -294,7 +302,7 @@ class IngestPipeline:
 
             if cfg.scatter_only:
                 print("scatter_only set — skipping map/reduce.")
-                if cat._store and cat._catalog_key:
+                if store and cat._catalog_key:
                     cat.upload_catalog(local_db)
                 return {
                     "items": 0,
@@ -302,6 +310,7 @@ class IngestPipeline:
                     "scatter": scatter_manifest_path(staging_prefix),
                 }
 
+            assert cfg.create_client is not None
             client = cfg.create_client()
             try:
                 summary = DaskIngester(**kwargs).run(shards, client=client)
@@ -315,12 +324,13 @@ class IngestPipeline:
                     print("Ingest failed — staged NDJSON kept; re-run with skip_fetch=True.")
                 raise
             if staging_prefix:
-                deleted = delete_scatter(cat._store, staging_prefix, shards)
+                deleted = delete_scatter(store, staging_prefix, shards)
                 print(f"Scatter cleanup: removed {deleted} object(s) under {staging_prefix}")
         else:
             # Serial (the daily path): the anti-join IS the resume check.
+            # dedupe is None only on a warehouse's very first run.
             if direct_left:
-                pairs = dedupe_source(limit=cfg.limit)
+                pairs_iter = dedupe_source(limit=cfg.limit)
             elif dedupe is not None:
                 base = (
                     (b, k)
@@ -329,27 +339,27 @@ class IngestPipeline:
                 )
                 if cfg.limit is not None:
                     base = islice(base, cfg.limit)
-                pairs = dedupe_pairs(base)
+                pairs_iter = dedupe_pairs(base)
             else:
-                pairs = (
+                pairs_iter = (
                     (b, k)
                     for b, k in iter_inventory(source, since=cfg.since)
                     if k.endswith(".stac.json")
                 )
                 if cfg.limit is not None:
-                    pairs = islice(pairs, cfg.limit)
+                    pairs_iter = islice(pairs_iter, cfg.limit)
             serial_kwargs = dict(kwargs)
             # Bulk-only knobs (the Dask workers own them).
             for bulk_only in ("skip_fetch", "skip_compact", "fetch_concurrency"):
                 serial_kwargs.pop(bulk_only, None)
             serial_kwargs.pop("dedupe", None)  # pairs already filtered
-            summary = Ingester(**serial_kwargs).run(pairs)
+            summary = Ingester(**serial_kwargs).run(pairs_iter)
 
         summary["source"] = source
         summary["mode"] = mode
         self._write_last_run(summary)
 
-        if cat._store and cat._catalog_key:
+        if store and cat._catalog_key:
             cat.upload_catalog(local_db)
 
         return summary
@@ -363,12 +373,13 @@ class IngestPipeline:
         import obstore
 
         cat = self._cat
-        if not cat._store:
+        store = cat._store
+        if not store:
             return
         root = cat._catalog.properties.get("warehouse", "")
         rel = root.removeprefix("s3://").split("/", 1)
         key = f"{rel[1].rstrip('/')}/_last_run.json" if len(rel) == 2 else "_last_run.json"
         payload = dict(summary)
         payload["finished_at"] = _dt2.now(UTC).isoformat()
-        obstore.put(cat._store, key, json.dumps(payload, default=str).encode())
+        obstore.put(store, key, json.dumps(payload, default=str).encode())
         print(f"Run summary: {root}/_last_run.json")

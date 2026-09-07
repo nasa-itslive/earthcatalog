@@ -38,7 +38,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import obstore
+import pyarrow as pa
 import rustac
+from obstore.store import ObjectStore
 
 from .partitioner import AbstractPartitioner
 
@@ -295,8 +297,8 @@ def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
     # Hive-partition directory discovery which breaks inside partitioned layouts.
     pf = pq.ParquetFile(path)
     file_meta = pf.metadata.metadata
-    table = pf.read()
-    table = _normalize_for_iceberg(table)
+    table: pa.Table = pf.read()
+    table = _normalize_for_iceberg(table)  # type: ignore[arg-type]
     preserve_keys = (b"geo", b"stac-geoparquet")
     extra = {k: v for k, v in file_meta.items() if k in preserve_keys}
     if extra:
@@ -315,7 +317,7 @@ def write_geoparquet(fan_out_items: list[dict], path: str) -> int:
 
 def write_geoparquet_s3(
     fan_out_items: list[dict],
-    store: object,
+    store: ObjectStore,
     s3_key: str,
 ) -> tuple[int, int]:
     """

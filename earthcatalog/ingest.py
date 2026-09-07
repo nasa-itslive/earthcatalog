@@ -32,6 +32,8 @@ from collections.abc import Callable, Iterator
 from functools import partial
 
 import obstore
+from obstore.store import ObjectStore
+from pyiceberg.table import Table
 
 from earthcatalog import inventory as _inventory
 from earthcatalog.index import Index
@@ -49,9 +51,9 @@ class Ingester:
 
     def __init__(
         self,
-        store: object,
+        store: ObjectStore,
         index: Index,
-        table: object,
+        table: Table,
         *,
         fetch_fn=None,
         partitioner=None,
@@ -195,11 +197,13 @@ class Ingester:
             seq = journal.start_batch(
                 [f"s3://{it['_source_bucket']}/{it['_source_key']}" for it in items]
             )
-        on_file = (
-            (lambda rel_key, rows: journal.record_file(seq, rel_key, rows))
-            if journal is not None
-            else None
-        )
+        on_file: Callable[[str, list[dict]], None] | None = None
+        if journal is not None:
+            assert seq is not None
+
+            def on_file(rel_key: str, rows: list[dict]) -> None:
+                journal.record_file(seq, rel_key, rows)
+
         new_paths, index_rows, rows = self._write_direct(items, on_file=on_file)
         if new_paths:
             # Iceberg commits first, the index part second: a crash between
@@ -210,12 +214,10 @@ class Ingester:
                 part = f"{journal.run_id}/{seq:04d}" if journal is not None else None
                 self._index.append(index_rows, part=part)
         if journal is not None:
-            journal.finish_batch(seq)
+            journal.finish_batch(seq or 0)
         return rows
 
-    def _write_direct(
-        self, items: list[dict], on_file=None
-    ) -> tuple[list[str], list[dict], int]:
+    def _write_direct(self, items: list[dict], on_file=None) -> tuple[list[str], list[dict], int]:
         """Write items to GeoParquet — see :func:`_write_direct`."""
         return _write_direct(
             self._store, self._partitioner, self._warehouse_prefix, items, on_file=on_file
@@ -241,9 +243,9 @@ class DaskIngester(Ingester):
 
     def __init__(
         self,
-        store: object,
+        store: ObjectStore,
         index: Index,
-        table: object,
+        table: Table,
         *,
         fetch_fn=None,
         partitioner=None,
@@ -501,7 +503,7 @@ def _for_each_result(client, fn, iterable, *, desc: str, on_result) -> None:
             pbar.update(1)
 
 
-def _append_ndjson(store: object, key: str, items: list[dict]) -> None:
+def _append_ndjson(store: ObjectStore, key: str, items: list[dict]) -> None:
     """Append items to an NDJSON object, creating or extending it."""
     lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
     try:
@@ -512,14 +514,14 @@ def _append_ndjson(store: object, key: str, items: list[dict]) -> None:
         obstore.put(store, key, lines.encode("utf-8"))
 
 
-def _put_ndjson(store: object, key: str, items: list[dict]) -> None:
+def _put_ndjson(store: ObjectStore, key: str, items: list[dict]) -> None:
     """Write items to a fresh NDJSON object (single PUT, no read-modify-write)."""
     lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
     obstore.put(store, key, lines.encode("utf-8"))
 
 
 def _write_direct(
-    store: object,
+    store: ObjectStore,
     partitioner,
     warehouse_prefix: str,
     items: list[dict],
@@ -573,7 +575,7 @@ def _fetch_items(fetch_fn, pairs: list[tuple[str, str]], concurrency: int) -> li
 
 
 def _write_direct_shard(
-    store: object,
+    store: ObjectStore,
     fetch_fn,
     partitioner,
     warehouse_prefix: str,
@@ -587,7 +589,7 @@ def _write_direct_shard(
 
 
 def _write_ndjson_shard(
-    store: object,
+    store: ObjectStore,
     fetch_fn,
     partitioner,
     ndjson_prefix: str,
@@ -679,7 +681,7 @@ def _fetch_many(pairs: list[tuple[str, str]], fetch_fn, workers: int) -> list[di
         return [it for it in ex.map(lambda p: fetch_fn(*p), pairs) if it is not None]
 
 
-def _next_part_index(store: object, warehouse_prefix: str, cell: str, year: str) -> int:
+def _next_part_index(store: ObjectStore, warehouse_prefix: str, cell: str, year: str) -> int:
     """Next free ``part_N`` index for a (cell, year) partition (max + 1, or 0)."""
     prefix = f"{warehouse_prefix}/grid_partition={cell}/year={year}/"
     indices: list[int] = []
@@ -695,7 +697,7 @@ def _next_part_index(store: object, warehouse_prefix: str, cell: str, year: str)
 
 
 def _compact_bucket(
-    store: object,
+    store: ObjectStore,
     ndjson_prefix: str,
     warehouse_prefix: str,
     bucket: tuple[str, str],

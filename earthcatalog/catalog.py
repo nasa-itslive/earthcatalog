@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import obstore
+from obstore.store import ObjectStore
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 
@@ -305,7 +306,7 @@ def _open_sqlite(db_path: str, warehouse_path: str) -> SqlCatalog:
 
 def download_catalog(
     local_path: str,
-    store: object | None = None,
+    store: ObjectStore | None = None,
     catalog_key: str | None = None,
 ) -> None:
     """Pull catalog.db from *store* to *local_path* before a job starts."""
@@ -322,7 +323,7 @@ def download_catalog(
 
 def upload_catalog(
     local_path: str,
-    store: object | None = None,
+    store: ObjectStore | None = None,
     catalog_key: str | None = None,
 ) -> None:
     """Push the updated catalog.db to *store* after all writes."""
@@ -333,7 +334,7 @@ def upload_catalog(
     print(f"Catalog uploaded: {local_path} -> {catalog_key}")
 
 
-def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
+def get_or_create(catalog: SqlCatalog, grid_config=None) -> Table:
     """Return the stac_items table, creating it (and the namespace) if needed.
 
     Parameters
@@ -374,7 +375,7 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
             missing.pop(PROP_INDEX_PATH, None)
         if missing:
             with table.transaction() as tx:
-                tx.set_properties(**missing)
+                tx.set_properties(**missing)  # type: ignore[arg-type]
         return table
     except NoSuchTableError:
         return catalog.create_table(
@@ -391,7 +392,7 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
 
 
 def open(
-    store: object,
+    store: ObjectStore,
     base: str,
     *,
     anonymous: bool | None = None,
@@ -493,10 +494,10 @@ class EarthCatalog:
 
     def __init__(
         self,
-        catalog: object,
+        catalog: SqlCatalog,
         table: Table,
         info: CatalogInfo,
-        store: object | None = None,
+        store: ObjectStore | None = None,
         *,
         catalog_key: str | None = None,
     ):
@@ -891,6 +892,7 @@ class EarthCatalog:
         index_key = _strip(
             resolve_index_path(self._table, f"{warehouse_root.rstrip('/')}_index.parquet")
         )
+        assert self._store is not None
 
         result = run_garbage_collection(
             inventory_path=inventory_path,
@@ -980,9 +982,7 @@ class EarthCatalog:
         from earthcatalog.index import resolve_index_path
 
         index_path = (
-            resolve_index_path(
-                self._table, f"{warehouse_path.rstrip('/')}_index.parquet"
-            )
+            resolve_index_path(self._table, f"{warehouse_path.rstrip('/')}_index.parquet")
             if warehouse_path
             else ""
         )

@@ -96,8 +96,7 @@ def _files_from_list(list_uri: str) -> list[str]:
     import obstore
 
     if list_uri.startswith("s3://"):
-        no_scheme = list_uri.removeprefix("s3://")
-        bucket, key = list_uri.split("/", 1)
+        bucket, key = list_uri.removeprefix("s3://").split("/", 1)
         store = _s3_store(bucket)
         text = bytes(obstore.get(store, key).bytes()).decode()
     else:
@@ -109,9 +108,9 @@ def _files_from_list(list_uri: str) -> list[str]:
 
 
 def _s3_store(bucket: str):
-    from obstore.store import S3Store
-
     import os
+
+    from obstore.store import S3Store
 
     region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or DEFAULT_REGION
     return S3Store(bucket=bucket, region=region)
@@ -119,10 +118,7 @@ def _s3_store(bucket: str):
 
 def _read_parquet(files: list[str], suffix: str) -> str:
     """A relation selecting the diff tuple columns, filtered to *suffix*."""
-    return (
-        f"SELECT {_DIFF_COLUMNS} FROM read_parquet({files!r}) "
-        f"WHERE key LIKE '%{suffix}'"
-    )
+    return f"SELECT {_DIFF_COLUMNS} FROM read_parquet({files!r}) WHERE key LIKE '%{suffix}'"
 
 
 def count_rows(files, suffix: str = ".stac.json") -> int:
@@ -130,8 +126,12 @@ def count_rows(files, suffix: str = ".stac.json") -> int:
     if isinstance(files, str):
         files = resolve_files(files)
     s3 = any(f.startswith("s3://") for f in files)
-    con = _connect(region=DEFAULT_REGION, max_memory=DEFAULT_MAX_MEMORY,
-                   temp_directory=tempfile.gettempdir(), s3=s3)
+    con = _connect(
+        region=DEFAULT_REGION,
+        max_memory=DEFAULT_MAX_MEMORY,
+        temp_directory=tempfile.gettempdir(),
+        s3=s3,
+    )
     try:
         if any(str(f).endswith(".csv") for f in files):
             sql = f"SELECT count(*) FROM read_csv_auto({files!r}) WHERE key LIKE '%{suffix}'"
@@ -166,7 +166,6 @@ def anti_join(
     Parquet path/URI/glob/list.  *since* (parquet/CSV left only) filters on
     ``last_modified_date``.  The caller guarantees the index exists.
     """
-    import pyarrow as pa
 
     # Eager validation: callers must see a bad *left* immediately, before
     # the first pair is pulled.
@@ -180,8 +179,12 @@ def anti_join(
 
     if con is None:
         s3 = any(f.startswith("s3://") for f in (left_files or []))
-        con = _connect(region=DEFAULT_REGION, max_memory=DEFAULT_MAX_MEMORY,
-                       temp_directory=tempfile.gettempdir(), s3=s3)
+        con = _connect(
+            region=DEFAULT_REGION,
+            max_memory=DEFAULT_MAX_MEMORY,
+            temp_directory=tempfile.gettempdir(),
+            s3=s3,
+        )
     return _anti_join_stream(left, index_uri, suffix, limit, since, batch_size, con)
 
 
@@ -200,8 +203,7 @@ def _anti_join_stream(
         files = resolve_files(left) if isinstance(left, str) else left
         if any(str(f).endswith(".csv") for f in files):
             left_rel = (
-                f"SELECT bucket, key FROM read_csv_auto({files!r}) "
-                f"WHERE key LIKE '%{suffix}'"
+                f"SELECT bucket, key FROM read_csv_auto({files!r}) WHERE key LIKE '%{suffix}'"
             )
         else:
             left_rel = _read_parquet(files, suffix)
@@ -214,9 +216,7 @@ def _anti_join_stream(
             }
         )
         con.register("left_pairs", tbl)  # type: ignore[attr-defined]
-        left_rel = (
-            f"SELECT bucket, key FROM left_pairs WHERE key LIKE '%{suffix}'"
-        )
+        left_rel = f"SELECT bucket, key FROM left_pairs WHERE key LIKE '%{suffix}'"
     else:
         raise ValueError("left must be a path/glob/list-of-paths or a pair iterable")
 
@@ -293,14 +293,19 @@ def run_diff(
         prev_files = resolve_files(previous)
         prev = _read_parquet(prev_files, suffix)
         s3 = s3 or any(f.startswith("s3://") for f in prev_files)
-    s3 = s3 or (against_index or "").startswith("s3://") or out.startswith("s3://") or (
-        out_old or ""
-    ).startswith("s3://")
+    s3 = (
+        s3
+        or (against_index or "").startswith("s3://")
+        or out.startswith("s3://")
+        or (out_old or "").startswith("s3://")
+    )
     con = _connect(region, max_memory, temp_directory, s3=s3)
 
     if previous is not None:
         con.execute(f"COPY ({cur} EXCEPT {prev}) TO '{out}' (FORMAT PARQUET)")
-        result.new_rows = int(con.execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0])
+        result.new_rows = int(
+            con.execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+        )
         if out_old:
             con.execute(f"COPY ({prev} EXCEPT {cur}) TO '{out_old}' (FORMAT PARQUET)")
             result.old_rows = int(
@@ -313,7 +318,9 @@ def run_diff(
             f"WHERE NOT deleted) i ON i.s3_key = 's3://' || c.bucket || '/' || c.key"
         )
         con.execute(f"COPY ({anti}) TO '{out}' (FORMAT PARQUET)")
-        result.new_rows = int(con.execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0])
+        result.new_rows = int(
+            con.execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+        )
 
     result.seconds = time.perf_counter() - t0
     return result

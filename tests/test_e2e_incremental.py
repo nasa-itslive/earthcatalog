@@ -16,7 +16,7 @@ real local Iceberg SqlCatalog:
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -28,7 +28,7 @@ from earthcatalog.diff import run_diff
 from earthcatalog.index import Index
 from earthcatalog.inventory import iter_inventory_parquet
 
-_LM = datetime(2026, 9, 5, 1, 0, tzinfo=timezone.utc)
+_LM = datetime(2026, 9, 5, 1, 0, tzinfo=UTC)
 
 
 def _make_item(item_id: str, key: str) -> dict:
@@ -177,7 +177,7 @@ class TestEndToEndDaily:
             store=store,
             index=Index(store, "warehouse_index.parquet"),
             warehouse_prefix="warehouse/",
-            head_fn=lambda k: k not in {f"s3://data-bucket/dir/item-1.stac.json"},
+            head_fn=lambda k: k not in {"s3://data-bucket/dir/item-1.stac.json"},
         )
         assert gc_result["confirmed"] == 1, gc_result
         assert gc_result["orphaned"] == 1, gc_result

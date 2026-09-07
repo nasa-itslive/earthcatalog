@@ -7,7 +7,7 @@ The unified index is the resume checkpoint: the anti-join yields exactly the
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -16,8 +16,7 @@ import pytest
 
 from earthcatalog.diff import anti_join
 
-
-_LM = datetime(2026, 9, 5, 1, 0, tzinfo=timezone.utc)
+_LM = datetime(2026, 9, 5, 1, 0, tzinfo=UTC)
 
 
 def _write_parquet(path: Path, table: pa.Table) -> str:

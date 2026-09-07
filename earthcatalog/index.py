@@ -47,9 +47,12 @@ from datetime import UTC, datetime
 
 import obstore
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import xxhash
+from obstore.store import ObjectStore
+from pyiceberg.table import Table
+
+from ._pcc import pc_any, pc_filter, pc_invert, pc_is_in, pc_or, pc_sum
 
 _HASH_SEED = 42
 _BATCH_SIZE = 100_000
@@ -72,7 +75,7 @@ def hash_id(item_id: str) -> bytes:
     return xxhash.xxh3_128(item_id.encode("utf-8"), seed=_HASH_SEED).digest()
 
 
-def resolve_index_path(table: object | None, default_index_path: str) -> str:
+def resolve_index_path(table: Table | None, default_index_path: str) -> str:
     """The single resolver for the unified index location.
 
     ``earthcatalog.index_path`` table property first, then
@@ -95,7 +98,7 @@ def resolve_index_path(table: object | None, default_index_path: str) -> str:
 class Index:
     """Provenance + dedup index, stored as immutable Parquet parts."""
 
-    def __init__(self, store: object, key: str) -> None:
+    def __init__(self, store: ObjectStore, key: str) -> None:
         self._store = store
         self._base = key.removesuffix(".parquet")
         # Legacy single-file location — where pre-parts warehouses kept the
@@ -191,17 +194,15 @@ class Index:
             except FileNotFoundError:
                 continue
             tbl = pq.ParquetFile(io.BytesIO(raw)).read()
-            marked = pc.is_in(tbl.column("stac_id"), pa.array(list(stac_ids)))
-            if not pc.any(marked).as_py():
+            marked = pc_is_in(tbl.column("stac_id"), pa.array(list(stac_ids)))
+            if not pc_any(marked).as_py():
                 continue
-            deleted_col = pc.or_(tbl.column("deleted"), marked)
-            tbl = tbl.set_column(
-                tbl.schema.get_field_index("deleted"), "deleted", deleted_col
-            )
+            deleted_col = pc_or(tbl.column("deleted"), marked)
+            tbl = tbl.set_column(tbl.schema.get_field_index("deleted"), "deleted", deleted_col)
             buf = io.BytesIO()
             pq.write_table(tbl, buf, compression="zstd")
             obstore.put(self._store, loc, buf.getvalue())
-            total += int(pc.sum(marked).as_py())
+            total += int(pc_sum(marked).as_py())
         return total
 
     def compact(self) -> int:
@@ -210,7 +211,7 @@ class Index:
         Physically removes soft-deleted rows.
         """
         tbl = self._read_all()
-        active = tbl.filter(pc.invert(tbl.column("deleted")))
+        active = tbl.filter(pc_invert(tbl.column("deleted")))
         buf = io.BytesIO()
         pq.write_table(active, buf, compression="zstd")
         obstore.put(self._store, self._legacy_key, buf.getvalue())
@@ -271,7 +272,7 @@ class Index:
                 continue
             pf = pq.ParquetFile(io.BytesIO(raw))
             for batch in pf.iter_batches(batch_size=_BATCH_SIZE):
-                keep = pc.invert(batch.column("deleted"))
+                keep = pc_invert(batch.column("deleted"))
                 active = batch.filter(keep)
                 for row in active.to_pylist():
                     if not row["s3_key"]:
@@ -293,7 +294,7 @@ class Index:
                 continue
             pf = pq.ParquetFile(io.BytesIO(raw))
             for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["deleted"]):
-                total += int(pc.sum(pc.invert(batch.column("deleted")).cast(pa.int32())).as_py())
+                total += int(pc_sum(pc_invert(batch.column("deleted")).cast(pa.int32())).as_py())
         return total
 
     def hash_set(self) -> set[bytes]:
@@ -306,9 +307,7 @@ class Index:
                 continue
             pf = pq.ParquetFile(io.BytesIO(raw))
             for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash", "deleted"]):
-                active = pc.filter(
-                    batch.column("id_hash"), pc.invert(batch.column("deleted"))
-                )
+                active = pc_filter(batch.column("id_hash"), pc_invert(batch.column("deleted")))
                 for h in active.to_pylist():
                     if h is not None:
                         hashes.add(bytes(h))
