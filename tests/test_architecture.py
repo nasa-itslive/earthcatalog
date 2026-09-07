@@ -25,8 +25,9 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     # Phase 4/6 target (slimmed, SQL deduped)
     "catalog.py": CATALOG_PY_MAX_LINES,
     "search.py": 565,
-    # Phase 3 target
-    "ingest.py": 730,
+    # Phase 3 target (+ journal hooks: recovery at run start, per-batch
+    # write-ahead journaling, bounded fetch pool)
+    "ingest.py": 780,
     # Extracted from catalog.py — ingest orchestration + daily dry-run +
     # _last_run.json writer
     "pipeline.py": 300,

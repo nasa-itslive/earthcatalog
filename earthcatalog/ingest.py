@@ -35,7 +35,8 @@ import obstore
 
 from earthcatalog import inventory as _inventory
 from earthcatalog.index import Index
-from earthcatalog.keydiff import iter_new_keys
+from earthcatalog.journal import BatchJournal, new_run_id, recover_journals
+from earthcatalog.keydiff import iter_new_keys, pair_key
 from earthcatalog.transform import (
     _sort_key,
     fan_out,
@@ -112,6 +113,17 @@ class Ingester:
         pending: list[dict] = []
         touched: set[tuple[str, str]] = set()
 
+        # Close any crash window left by a previous run (no-op list when
+        # there are no journals), then journal this run's own batches.
+        recovery = recover_journals(
+            self._store,
+            self._warehouse_prefix,
+            self._index,
+            self._table,
+            full_path=self._full_path,
+        )
+        journal = BatchJournal(self._store, self._warehouse_prefix, new_run_id())
+
         def _counted():
             nonlocal considered
             for pair in inventory:
@@ -134,10 +146,11 @@ class Ingester:
                     chunk = list(islice(new_pairs, self._batch_size))
                     if not chunk:
                         break
+                    seq = journal.start_batch([pair_key(b, k) for b, k in chunk])
                     pending = _fetch_many(chunk, self._fetch_fn, self._fetch_workers)
                     total += len(pending)
                     if pending:
-                        rows += self._flush(pending, touched)
+                        rows += self._flush(pending, touched, journal, seq)
                 pending = []
             else:
                 for bucket, key in new_pairs:
@@ -147,11 +160,11 @@ class Ingester:
                     pending.append(item)
                     total += 1
                     if len(pending) >= self._batch_size:
-                        rows += self._flush(pending, touched)
+                        rows += self._flush(pending, touched, journal)
                         pending = []
 
             if pending:
-                rows += self._flush(pending, touched)
+                rows += self._flush(pending, touched, journal)
 
         if self._stage == "ndjson" and not self._skip_compact:
             # Discover staged buckets even after a skip_fetch resume.
@@ -159,7 +172,10 @@ class Ingester:
                 touched = self._discover_staged_buckets()
             rows += self._compact_all(touched)
 
-        return {"items": total, "rows": rows, "considered": considered}
+        summary = {"items": total, "rows": rows, "considered": considered}
+        if recovery["journals"]:
+            summary["recovery"] = recovery
+        return summary
 
     def _discover_staged_buckets(self) -> set[tuple[str, str]]:
         """List every (cell, year) bucket that has staged NDJSON files."""
@@ -181,22 +197,48 @@ class Ingester:
 
     # -- internals ------------------------------------------------------------
 
-    def _flush(self, items: list[dict], touched: set[tuple[str, str]]) -> int:
+    def _flush(
+        self,
+        items: list[dict],
+        touched: set[tuple[str, str]],
+        journal: BatchJournal | None = None,
+        seq: int | None = None,
+    ) -> int:
         if self._stage == "ndjson":
             return self._flush_ndjson(items, touched)
-        return self._flush_direct(items)
+        return self._flush_direct(items, journal, seq)
 
-    def _flush_direct(self, items: list[dict]) -> int:
-        new_paths, index_rows, rows = self._write_direct(items)
+    def _flush_direct(
+        self,
+        items: list[dict],
+        journal: BatchJournal | None = None,
+        seq: int | None = None,
+    ) -> int:
+        if journal is not None and seq is None:
+            seq = journal.start_batch(
+                [f"s3://{it['_source_bucket']}/{it['_source_key']}" for it in items]
+            )
+        on_file = (
+            (lambda rel_key, rows: journal.record_file(seq, rel_key, rows))
+            if journal is not None
+            else None
+        )
+        new_paths, index_rows, rows = self._write_direct(items, on_file=on_file)
         if new_paths:
             self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 self._index.append(index_rows)
+        if journal is not None:
+            journal.finish_batch(seq)
         return rows
 
-    def _write_direct(self, items: list[dict]) -> tuple[list[str], list[dict], int]:
+    def _write_direct(
+        self, items: list[dict], on_file=None
+    ) -> tuple[list[str], list[dict], int]:
         """Write items to GeoParquet — see :func:`_write_direct`."""
-        return _write_direct(self._store, self._partitioner, self._warehouse_prefix, items)
+        return _write_direct(
+            self._store, self._partitioner, self._warehouse_prefix, items, on_file=on_file
+        )
 
     def _flush_ndjson(self, items: list[dict], touched: set[tuple[str, str]]) -> int:
         """Stage A only — fan out to per-(cell, year) NDJSON buckets.
@@ -479,12 +521,14 @@ def _write_direct(
     partitioner,
     warehouse_prefix: str,
     items: list[dict],
+    on_file=None,
 ) -> tuple[list[str], list[dict], int]:
     """Write items to GeoParquet without touching the table/index.
 
     Worker-safe (plain state only) so a distributed caller can fan out this
-    function and commit once on the head.  Returns
-    ``(new_paths, index_rows, rows)``.
+    function and commit once on the head.  *on_file(rel_key, index_rows)*,
+    when given, fires after each file is durably written — the journal's
+    per-file update.  Returns ``(new_paths, index_rows, rows)``.
     """
     fo = fan_out(items, partitioner) if partitioner else items
     if not fo:
@@ -501,6 +545,8 @@ def _write_direct(
         if n > 0:
             new_paths.append(key)
             rows += n
+            if on_file is not None:
+                on_file(key, [_to_index_row(it) for it in group if it.get("_source_key")])
 
     return new_paths, index_rows, rows
 
