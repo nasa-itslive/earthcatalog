@@ -30,6 +30,26 @@ Standing constraints:
 
 ---
 
+## End-to-end status (2026-09-07, live on real S3)
+
+The daily ingest works end to end on the current tree, verified against the
+real mirrored inventory:
+
+    earthcatalog ingest --diff s3://…refactoring/diffs/new-20260905-20260906.parquet \
+        --warehouse s3://…refactoring/warehouse --mode delta
+
+* dry-run projection: considered 27,458 · new 0 · already indexed 27,458 (full
+  diff now ingested; anti-join recognizes everything)
+* idempotent re-run: fetched 0 · considered 0
+* catalog: 39,219 rows · 213 files · 27,458-item day fully ingested
+* index layout: legacy file + per-run parts, DuckDB anti-join across both
+* journals: none left after successful runs; recovery self-heals leftovers
+
+**Remaining before the first real runner dispatch** (RPI-6): AWS secrets in
+the repo, and one validation run on an actual `ubuntu-latest` runner — the
+20-minute budget projection is based on local timings (diff ≈ 7 min) and has
+not yet been observed on GitHub hardware.
+
 ## What landed (this cycle)
 
 The daily pipeline is now **two exact steps**, both verified against the real
