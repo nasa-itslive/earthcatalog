@@ -87,8 +87,8 @@ class BatchJournal:
         """The batch committed — drop its journal."""
         try:
             obstore.delete(self._store, self._key(seq))
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"WARN: journal cleanup failed for {self._key(seq)}: {exc}")
 
     def _key(self, seq: int) -> str:
         return f"{self._prefix}/{self._run_id}/{seq:04d}.json"
