@@ -25,6 +25,7 @@ from obstore.store import MemoryStore
 from earthcatalog.index import Index
 from earthcatalog.ingest import DaskIngester, Ingester
 from earthcatalog.journal import BatchJournal, list_journals
+from earthcatalog.schema import partition_prefix
 from tests.test_ingest import _inventory, _make_item
 
 WAREHOUSE_ROOT = "memory://warehouse"
@@ -33,6 +34,7 @@ WAREHOUSE_ROOT = "memory://warehouse"
 class _FakeTable:
     def __init__(self):
         self.files: list[str] = []
+        self.properties: dict[str, str] = {}
 
     def add_files(self, paths):
         self.files.extend(paths)
@@ -276,10 +278,12 @@ class TestFaultMatrix:
             write_geoparquet_s3,
         )
 
-        def half_written(store, partitioner, prefix, items, on_file=None):
+        def half_written(store, partitioner, prefix, items, on_file=None, layout=None):
             fo = fan_out(items, partitioner) if partitioner else items
-            (cell, year), group = next(iter(group_by_partition(fo).items()))
-            k = f"{prefix}/grid_partition={cell}/year={year}/part_leaked.parquet"
+            grid, level, time_bin = layout or ("h3", "1", "year")
+            (cell, bin_val), group = next(iter(group_by_partition(fo, time_bin).items()))
+            prefix_ = partition_prefix(prefix, grid, level, cell, time_bin, bin_val)
+            k = f"{prefix_}part_leaked.parquet"
             write_geoparquet_s3(group, store, k)
             raise RuntimeError("injected crash after file write, pre-journal")
 
@@ -297,7 +301,7 @@ class TestFaultMatrix:
                 ing.run(_inventory(keys))
 
         # The leaked file exists on the store and is not registered.
-        assert store.get("warehouse/grid_partition=cellA/year=2020/part_leaked.parquet")
+        assert store.get("warehouse/grid=h3/level=1/tile=cellA/year=2020/part_leaked.parquet")
         calls = {"n": 0}
         _run(keys, store, index, table, fetch_calls=calls)
         assert calls["outer"]["n"] == 4  # nothing had committed

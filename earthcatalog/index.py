@@ -315,8 +315,12 @@ class Index:
         locs = locations if locations is not None else self.locations()
         if not locs:
             return []
-        con = _connect(DEFAULT_REGION, DEFAULT_MAX_MEMORY,
-                       tempfile.gettempdir(), s3=any(f.startswith("s3://") for f in locs))
+        con = _connect(
+            DEFAULT_REGION,
+            DEFAULT_MAX_MEMORY,
+            tempfile.gettempdir(),
+            s3=any(f.startswith("s3://") for f in locs),
+        )
         sql = (
             f"SELECT CAST(ingested_at AS DATE) AS d, count(DISTINCT s3_key) AS items "
             f"FROM read_parquet({locs!r}) "

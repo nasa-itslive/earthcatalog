@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections import defaultdict
 from collections.abc import Callable, Iterator
 from functools import partial
 
@@ -38,6 +37,7 @@ from pyiceberg.table import Table
 from earthcatalog import inventory as _inventory
 from earthcatalog.index import Index
 from earthcatalog.journal import BatchJournal, new_run_id, recover_journals
+from earthcatalog.schema import layout_of, partition_prefix
 from earthcatalog.transform import (
     _sort_key,
     fan_out,
@@ -75,6 +75,9 @@ class Ingester:
         self._fetch_workers = fetch_workers
         self._delta = delta
         self._dedupe = dedupe
+        # Schema-driven hive layout (grid, level, time_bin) — a plain tuple
+        # so it can ship to Dask workers.
+        self._layout = layout_of(table.properties)
         # Resume filter: pairs -> pairs with known keys removed.  Production
         # runs inject the DuckDB anti-join (diff.anti_join); without one the
         # run falls back to a set-based filter against the index.
@@ -220,7 +223,12 @@ class Ingester:
     def _write_direct(self, items: list[dict], on_file=None) -> tuple[list[str], list[dict], int]:
         """Write items to GeoParquet — see :func:`_write_direct`."""
         return _write_direct(
-            self._store, self._partitioner, self._warehouse_prefix, items, on_file=on_file
+            self._store,
+            self._partitioner,
+            self._warehouse_prefix,
+            items,
+            on_file=on_file,
+            layout=self._layout,
         )
 
 
@@ -299,7 +307,7 @@ class DaskIngester(Ingester):
         return shipped
 
     def _discover_staged_buckets(self) -> set[tuple[str, str]]:
-        """List every (cell, year) bucket that has staged NDJSON files."""
+        """List every (cell, bin_value) bucket that has staged NDJSON files."""
         buckets: set[tuple[str, str]] = set()
         for batch in obstore.list(self._store, prefix=self._ndjson_prefix + "/"):
             for obj in batch:
@@ -307,24 +315,26 @@ class DaskIngester(Ingester):
                 if not k.endswith(".jsonl"):
                     continue
                 parts = k.split("/")
-                # .../grid_partition=<cell>/year=<year>/<file>.jsonl
+                # v2: .../tile=<cell>/<bin>=<value>/<file>.jsonl
+                # v1: .../grid_partition=<cell>/year=<year>/<file>.jsonl
                 for i, part in enumerate(parts):
-                    if part.startswith("grid_partition="):
+                    if part.startswith(("tile=", "grid_partition=")):
                         cell = part.split("=", 1)[1]
-                        year = parts[i + 1].split("=", 1)[1] if i + 1 < len(parts) else "unknown"
-                        buckets.add((cell, year))
+                        bv = parts[i + 1].split("=", 1)[1] if i + 1 < len(parts) else "unknown"
+                        buckets.add((cell, bv))
         return buckets
 
     def _compact_ndjson_bucket(
-        self, cell: str, year: str
+        self, cell: str, bin_val: str
     ) -> tuple[list[str], list[dict], int, list[str]]:
-        """Compact one ``(cell, year)`` bucket — see :func:`_compact_bucket`."""
+        """Compact one ``(cell, bin_value)`` bucket — see :func:`_compact_bucket`."""
         return _compact_bucket(
             self._store,
             self._ndjson_prefix,
             self._warehouse_prefix,
-            (cell, year),
+            (cell, bin_val),
             delta=self._delta,
+            layout=self._layout,
         )
 
     def run(self, inventory, *, client=None) -> dict:  # type: ignore[override]
@@ -342,6 +352,7 @@ class DaskIngester(Ingester):
             self._fetch_fn,
             self._partitioner,
             self._warehouse_prefix,
+            layout=self._layout,
             fetch_concurrency=self._fetch_concurrency,
         )
         shards = self._prefilter_shards(list(inventory))
@@ -389,6 +400,7 @@ class DaskIngester(Ingester):
                 self._fetch_fn,
                 self._partitioner,
                 self._ndjson_prefix,
+                layout=self._layout,
                 fetch_concurrency=self._fetch_concurrency,
             )
             results = _collect(client, stage_fn, list(enumerate(shards)), desc="Stage NDJSON")
@@ -409,6 +421,7 @@ class DaskIngester(Ingester):
             self._ndjson_prefix,
             self._warehouse_prefix,
             delta=self._delta,
+            layout=self._layout,
         )
 
         rows = 0
@@ -526,14 +539,18 @@ def _write_direct(
     warehouse_prefix: str,
     items: list[dict],
     on_file=None,
+    layout: tuple[str, str, str] = ("h3", "1", "year"),
 ) -> tuple[list[str], list[dict], int]:
     """Write items to GeoParquet without touching the table/index.
 
     Worker-safe (plain state only) so a distributed caller can fan out this
     function and commit once on the head.  *on_file(rel_key, index_rows)*,
     when given, fires after each file is durably written — the journal's
-    per-file update.  Returns ``(new_paths, index_rows, rows)``.
+    per-file update.  *layout* is the schema-driven ``(grid, level,
+    time_bin)`` tuple; keys are built with :func:`partition_prefix`.
+    Returns ``(new_paths, index_rows, rows)``.
     """
+    grid, level, time_bin = layout
     fo = fan_out(items, partitioner) if partitioner else items
     if not fo:
         return [], [], 0
@@ -542,9 +559,9 @@ def _write_direct(
     new_paths: list[str] = []
     index_rows = [_to_index_row(it) for it in items if it.get("_source_key")]
 
-    for (cell, year), group in group_by_partition(fo).items():
-        year_str = str(year) if year is not None else "unknown"
-        key = f"{warehouse_prefix}/grid_partition={cell}/year={year_str}/part_{uuid.uuid4().hex[:8]}.parquet"
+    for (cell, bin_val), group in group_by_partition(fo, time_bin).items():
+        prefix = partition_prefix(warehouse_prefix, grid, level, cell, time_bin, bin_val)
+        key = f"{prefix}part_{uuid.uuid4().hex[:8]}.parquet"
         n, _ = write_geoparquet_s3(group, store, key)
         if n > 0:
             new_paths.append(key)
@@ -581,11 +598,12 @@ def _write_direct_shard(
     warehouse_prefix: str,
     shard,
     fetch_concurrency: int = 256,
+    layout: tuple[str, str, str] = ("h3", "1", "year"),
 ) -> tuple[list[str], list[dict], int]:
     """Fetch each pair in *shard* (concurrent), then write-only fan-out."""
     pairs = list(_shard_iter_pairs(shard))
     items = _fetch_items(fetch_fn, pairs, fetch_concurrency)
-    return _write_direct(store, partitioner, warehouse_prefix, items)
+    return _write_direct(store, partitioner, warehouse_prefix, items, layout=layout)
 
 
 def _write_ndjson_shard(
@@ -595,29 +613,27 @@ def _write_ndjson_shard(
     ndjson_prefix: str,
     shard_with_index,
     fetch_concurrency: int = 256,
+    layout: tuple[str, str, str] = ("h3", "1", "year"),
 ) -> tuple[int, list[tuple[str, str]]]:
     """Fetch a shard (concurrent), fan out to NDJSON (worker task).
 
     Returns ``(n_items, touched_buckets)`` — the number of items staged and
-    the ``(cell, year)`` buckets touched, so the head can compact each bucket
-    exactly once.
+    the ``(cell, bin_value)`` buckets touched, so the head can compact each
+    bucket exactly once.
     """
     shard_index, shard = shard_with_index
     pairs = list(_shard_iter_pairs(shard))
     items = _fetch_items(fetch_fn, pairs, fetch_concurrency)
 
+    grid, level, time_bin = layout
     fo = fan_out(items, partitioner) if partitioner else items
-    buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for item in fo:
-        cell = item.get("properties", {}).get("grid_partition", "__none__")
-        year = str(_year_from_item(item) or "unknown")
-        buckets[(cell, year)].append(item)
+    buckets = group_by_partition(fo, time_bin)
 
-    for (cell, year), group in buckets.items():
-        # grid_partition (geometry) + year (time) + shard index: the index is a
-        # deterministic integer (like main's chunk_id), so each shard writes a
-        # unique file and concurrent workers never collide.
-        key = f"{ndjson_prefix}/grid_partition={cell}/year={year}/shard_{shard_index}.jsonl"
+    for (cell, bin_val), group in buckets.items():
+        prefix = partition_prefix(ndjson_prefix, grid, level, cell, time_bin, bin_val)
+        # The shard index is a deterministic integer: concurrent workers
+        # never collide on the same file.
+        key = f"{prefix}shard_{shard_index}.jsonl"
         _put_ndjson(store, key, group)
 
     return len(items), list(buckets.keys())
@@ -681,18 +697,18 @@ def _fetch_many(pairs: list[tuple[str, str]], fetch_fn, workers: int) -> list[di
         return [it for it in ex.map(lambda p: fetch_fn(*p), pairs) if it is not None]
 
 
-def _next_part_index(store: ObjectStore, warehouse_prefix: str, cell: str, year: str) -> int:
-    """Next free ``part_N`` index for a (cell, year) partition (max + 1, or 0)."""
-    prefix = f"{warehouse_prefix}/grid_partition={cell}/year={year}/"
+def _next_part_index(store: ObjectStore, prefixes: list[str]) -> int:
+    """Next free ``part_N`` index across *prefixes* (max + 1, or 0)."""
     indices: list[int] = []
-    try:
-        for listing in obstore.list(store, prefix=prefix):
-            for obj in listing:
-                m = _PART_RE.search(obj["path"].rsplit("/", 1)[-1])
-                if m:
-                    indices.append(int(m.group(1)))
-    except Exception:
-        pass
+    for prefix in prefixes:
+        try:
+            for listing in obstore.list(store, prefix=prefix):
+                for obj in listing:
+                    m = _PART_RE.search(obj["path"].rsplit("/", 1)[-1])
+                    if m:
+                        indices.append(int(m.group(1)))
+        except Exception:
+            pass
     return (max(indices) + 1) if indices else 0
 
 
@@ -702,32 +718,28 @@ def _compact_bucket(
     warehouse_prefix: str,
     bucket: tuple[str, str],
     delta: bool = False,
+    layout: tuple[str, str, str] = ("h3", "1", "year"),
 ) -> tuple[list[str], list[dict], int, list[str]]:
-    """Compact one ``(cell, year)`` NDJSON bucket into a single GeoParquet file.
+    """Compact one ``(cell, bin_value)`` NDJSON bucket into a single GeoParquet file.
 
     Worker-safe: takes only plain state (store, string prefixes, int) rather
     than the whole :class:`Ingester`, so it can be shipped to Dask workers
     without pickling the Iceberg table or unified index.  *bucket* is a
-    single ``(cell, year)`` tuple so it maps cleanly over ``client.map``.
+    single ``(cell, bin_value)`` tuple so it maps cleanly over ``client.map``.
 
     Like main's warehouse consolidation, the whole partition is held in
-    memory: every staged NDJSON file is streamed line-by-line (never a full
-    ``.bytes()`` read), deduped exactly by item ID, sorted by
-    ``(platform, datetime)``, and written as ONE deterministic
-    ``part_{idx:06d}.parquet``.  A hot cell with ~500k items needs a few GB —
-    scale the worker VM instead of batching.
-
-    The output name is deterministic so a re-run overwrites the same file
-    instead of orphaning ``part_<uuid>`` copies.  In full mode (*delta* False)
-    the index is 0 (idempotent re-run); in delta mode (*delta* True) it
-    continues from the next free ``part_N`` so existing files are never
-    clobbered.
+    memory: staged NDJSON is streamed line-by-line, deduped exactly by item
+    ID, sorted by ``(platform, datetime)``, and written as ONE deterministic
+    ``part_{idx:06d}.parquet`` (delta mode continues from the next free
+    ``part_N``).  A hot cell with ~500k items needs a few GB — scale the
+    worker VM instead of batching.
 
     Returns ``(new_paths, index_rows, rows, ndjson_keys)`` — the caller (head
     node) commits to Iceberg + index once, then deletes the consumed NDJSON.
     """
-    cell, year = bucket
-    bucket_dir = f"{ndjson_prefix}/grid_partition={cell}/year={year}/"
+    grid, level, time_bin = layout
+    cell, bin_val = bucket
+    bucket_dir = partition_prefix(ndjson_prefix, grid, level, cell, time_bin, bin_val)
     jsonl_keys: list[str] = []
     try:
         for listing in obstore.list(store, prefix=bucket_dir):
@@ -754,8 +766,12 @@ def _compact_bucket(
     if not items:
         return [], [], 0, jsonl_keys
 
-    idx = _next_part_index(store, warehouse_prefix, cell, year) if delta else 0
-    out_key = f"{warehouse_prefix}/grid_partition={cell}/year={year}/part_{idx:06d}.parquet"
+    out_prefix = partition_prefix(warehouse_prefix, grid, level, cell, time_bin, bin_val)
+    if delta:
+        idx = _next_part_index(store, [out_prefix])
+    else:
+        idx = 0
+    out_key = f"{out_prefix}part_{idx:06d}.parquet"
     n, _ = write_geoparquet_s3(sorted(items, key=_sort_key), store, out_key)
     if n == 0:
         return [], [], 0, jsonl_keys

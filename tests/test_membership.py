@@ -81,9 +81,7 @@ def test_antijoin_iterable_left(tmp_path: Path):
 def test_antijoin_deleted_rows_are_unknown(tmp_path: Path):
     """A GC'd (soft-deleted) key re-offered by the inventory is new again."""
     left = _left_parquet(tmp_path / "left.parquet", ["a.stac.json"])
-    index = _index_parquet(
-        tmp_path / "index.parquet", ["a.stac.json"], deleted=[True]
-    )
+    index = _index_parquet(tmp_path / "index.parquet", ["a.stac.json"], deleted=[True])
     assert list(anti_join(left, index)) == [("data-bucket", "a.stac.json")]
 
 

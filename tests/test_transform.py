@@ -244,11 +244,11 @@ class TestGroupByPartition:
         groups = group_by_partition(rows)
         for (cell, year), items in groups.items():
             assert isinstance(cell, str)
-            assert year is None or isinstance(year, int)
+            assert isinstance(year, str)  # hive value: "2021" / "unknown"
             for item in items:
                 assert item["properties"]["grid_partition"] == cell
                 dt = item["properties"].get("datetime")
-                actual_year = int(dt[:4]) if dt else None
+                actual_year = dt[:4] if dt else "unknown"
                 assert actual_year == year
 
     def test_all_rows_accounted_for(self, partitioner):
@@ -274,15 +274,15 @@ class TestGroupByPartition:
         rows = fan_out([item_2021, item_2024], p)
         groups = group_by_partition(rows)
         years_seen = {year for (_cell, year) in groups}
-        assert 2021 in years_seen
-        assert 2024 in years_seen
+        assert "2021" in years_seen
+        assert "2024" in years_seen
 
-    def test_no_datetime_maps_to_none_year(self, partitioner):
-        """Items without datetime must land in year=None groups."""
+    def test_no_datetime_maps_to_unknown(self, partitioner):
+        """Items without datetime must land in the ``unknown`` group."""
         no_dt = {**BASE_ITEM, "id": "nodatetime", "properties": {}}
         rows = fan_out([no_dt], partitioner)
         groups = group_by_partition(rows)
-        assert any(year is None for (_cell, year) in groups)
+        assert any(year == "unknown" for (_cell, year) in groups)
 
     def test_within_group_sorted_by_platform_then_datetime(self):
         """Items inside each group must be sorted by (platform, datetime)."""

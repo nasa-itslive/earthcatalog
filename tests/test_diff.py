@@ -42,9 +42,7 @@ def _keys_of(parquet_path: str) -> set[str]:
 
 def test_resolve_files_from_txt_list(tmp_path):
     listing = tmp_path / "day.files"
-    listing.write_text(
-        "s3://bucket/data/a.parquet\n\ns3://bucket/data/b.parquet\n"
-    )
+    listing.write_text("s3://bucket/data/a.parquet\n\ns3://bucket/data/b.parquet\n")
     assert resolve_files(str(listing)) == [
         "s3://bucket/data/a.parquet",
         "s3://bucket/data/b.parquet",
@@ -107,9 +105,7 @@ def test_diff_against_index_mode(tmp_path):
 
     from earthcatalog.index import Index
 
-    day = _write_inventory(
-        tmp_path / "day.parquet", ["known.stac.json", "fresh.stac.json"]
-    )
+    day = _write_inventory(tmp_path / "day.parquet", ["known.stac.json", "fresh.stac.json"])
     index = Index(MemoryStore(), "idx.parquet")
     index.append(
         [

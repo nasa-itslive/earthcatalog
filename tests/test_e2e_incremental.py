@@ -27,6 +27,7 @@ from earthcatalog.config import GridConfig
 from earthcatalog.diff import run_diff
 from earthcatalog.index import Index
 from earthcatalog.inventory import iter_inventory_parquet
+from earthcatalog.schema import layout_of
 
 _LM = datetime(2026, 9, 5, 1, 0, tzinfo=UTC)
 
@@ -104,11 +105,19 @@ class TestEndToEndDaily:
         # changed), item-4 new, item-2 untouched.
         day1 = _write_day(
             tmp_path / "day1.parquet",
-            [("dir/item-1.stac.json", 100), ("dir/item-2.stac.json", 200), ("dir/item-3.stac.json", 300)],
+            [
+                ("dir/item-1.stac.json", 100),
+                ("dir/item-2.stac.json", 200),
+                ("dir/item-3.stac.json", 300),
+            ],
         )
         day2 = _write_day(
             tmp_path / "day2.parquet",
-            [("dir/item-2.stac.json", 200), ("dir/item-3.stac.json", 999), ("dir/item-4.stac.json", 400)],
+            [
+                ("dir/item-2.stac.json", 200),
+                ("dir/item-3.stac.json", 999),
+                ("dir/item-4.stac.json", 400),
+            ],
         )
 
         # --- Phase 1: day-1 run ingested the full snapshot -----------------
@@ -178,6 +187,7 @@ class TestEndToEndDaily:
             index=Index(store, "warehouse_index.parquet"),
             warehouse_prefix="warehouse/",
             head_fn=lambda k: k not in {"s3://data-bucket/dir/item-1.stac.json"},
+            layout=layout_of(table.properties),
         )
         assert gc_result["confirmed"] == 1, gc_result
         assert gc_result["orphaned"] == 1, gc_result

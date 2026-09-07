@@ -42,6 +42,7 @@ from pybloom_live import ScalableBloomFilter
 
 from earthcatalog.index import Index
 from earthcatalog.inventory import _iter_inventory
+from earthcatalog.schema import partition_prefix
 
 _DEFAULT_ERROR_RATE = 0.0001
 _DEFAULT_CONCURRENCY = 64
@@ -112,17 +113,31 @@ def confirm_deletions(
 
 
 def _list_partition_files(
-    store: ObjectStore, warehouse_prefix: str, cell: str, year: int | None
+    store: ObjectStore,
+    warehouse_prefix: str,
+    cell: str,
+    year: int | None,
+    layout: tuple[str, str, str] | None = None,
 ) -> list[str]:
-    """List GeoParquet keys in one (cell, year) partition, newest first."""
+    """List GeoParquet keys in one (cell, year) partition, newest first.
+
+    When *layout* (``(grid, level, time_bin)`` from the table properties) is
+    given, the schema-driven ``grid=/level=/tile=/{bin}=`` prefix is listed
+    *in addition to* the legacy ``grid_partition=.../year=...`` one — a
+    warehouse migrated mid-life can hold both layouts for the same partition.
+    """
     year_str = str(year) if year is not None else "unknown"
-    prefix = f"{warehouse_prefix}grid_partition={cell}/year={year_str}/"
+    prefixes = [f"{warehouse_prefix}grid_partition={cell}/year={year_str}/"]
+    if layout is not None:
+        grid, level, time_bin = layout
+        prefixes.append(partition_prefix(warehouse_prefix, grid, level, cell, time_bin, year_str))
     keys = []
-    for batch in obstore.list(store, prefix=prefix):
-        for obj in batch:
-            k: str = obj["path"]
-            if k.endswith(".parquet"):
-                keys.append(k)
+    for prefix in prefixes:
+        for batch in obstore.list(store, prefix=prefix):
+            for obj in batch:
+                k: str = obj["path"]
+                if k.endswith(".parquet"):
+                    keys.append(k)
     keys.sort(reverse=True)
     return keys
 
@@ -166,6 +181,7 @@ def execute_cleanup(
     index: Index,
     warehouse_prefix: str = "",
     dry_run: bool = False,
+    layout: tuple[str, str, str] | None = None,
 ) -> dict:
     """Rewrite warehouse files to drop orphans and mark them deleted in the index."""
     if not orphans:
@@ -179,7 +195,7 @@ def execute_cleanup(
     old_keys: list[str] = []
 
     for (cell, year), stac_ids in sorted(by_partition.items()):
-        file_keys = _list_partition_files(store, warehouse_prefix, cell, year)
+        file_keys = _list_partition_files(store, warehouse_prefix, cell, year, layout=layout)
         for file_key in file_keys:
             raw = bytes(obstore.get(store, file_key).bytes())
             tbl = pq.ParquetFile(io.BytesIO(raw)).read()
@@ -234,6 +250,7 @@ def run_garbage_collection(
     head_concurrency: int = _DEFAULT_CONCURRENCY,
     bloom_error_rate: float = _DEFAULT_ERROR_RATE,
     dry_run: bool = False,
+    layout: tuple[str, str, str] | None = None,
 ) -> dict:
     """Run the full GC cycle against a unified Index."""
     bloom = build_inventory_bloom(inventory_path, error_rate=bloom_error_rate)
@@ -245,5 +262,6 @@ def run_garbage_collection(
         index=index,
         warehouse_prefix=warehouse_prefix,
         dry_run=dry_run,
+        layout=layout,
     )
     return {"candidates": len(candidates), "confirmed": len(orphans), **summary}

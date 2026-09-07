@@ -7,6 +7,8 @@ on lifecycle and the EarthCatalog facade.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pyiceberg.partitioning import PartitionField, PartitionSpec
@@ -31,6 +33,7 @@ PROP_GRID_BOUNDARIES_PATH = "earthcatalog.grid.boundaries_path"
 PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
 PROP_INDEX_PATH = "earthcatalog.index_path"
 PROP_HASH_INDEX_PATH = "earthcatalog.hash_index_path"
+PROP_TIME_BIN = "earthcatalog.time_bin"
 
 # The warehouse layout is schema-driven: grid type, grid level, tile id and
 # the temporal bin all come from the catalog configuration.
@@ -82,6 +85,63 @@ def partition_prefix(
         f"tile={tile}/{time_bin}={bin_value}/"
     )
 
+
+def bin_value(value: str | datetime | None, time_bin: str = "year") -> str:
+    """Format a temporal value for the hive path: ``2025`` / ``2025-12`` /
+    ``2025-12-20``.
+
+    Accepts the ISO strings STAC items carry or a datetime.  Missing or
+    unparseable values map to ``"unknown"`` — files without a datetime live
+    in the ``unknown`` partition and index rows must agree.
+    """
+    if time_bin not in TIME_BINS:
+        raise ValueError(f"unknown time bin: {time_bin!r}")
+    if value is None:
+        return "unknown"
+    if isinstance(value, datetime):
+        value = value.astimezone(UTC).isoformat()
+    s = str(value)
+    y, m, d = s[:4], s[5:7], s[8:10]
+    if not (y.isdigit() and len(y) == 4):
+        return "unknown"
+    if time_bin == "year":
+        return y
+    if m.isdigit() and len(m) == 2:
+        if time_bin == "month":
+            return f"{y}-{m}"
+        if d.isdigit() and len(d) == 2:
+            return f"{y}-{m}-{d}"
+    return "unknown"
+
+
+def layout_of(props: Mapping[str, str]) -> tuple[str, str, str]:
+    """``(grid, level, time_bin)`` from table properties; defaults h3/1/year.
+
+    The single source of truth for how new warehouse keys are built —
+    writers pass this plain tuple around (worker-safe) instead of the table.
+    """
+    grid = props.get(PROP_GRID_TYPE, "h3")
+    level = props.get(PROP_GRID_RESOLUTION, "1")
+    time_bin = props.get(PROP_TIME_BIN, "year")
+    return grid, level, time_bin
+
+
+def partition_year(bin_name: str, ordinal: int) -> int:
+    """Calendar year from a temporal-transform partition ordinal.
+
+    Iceberg stores YearTransform as years-since-1970, MonthTransform as
+    months-since-1970 and DayTransform as days-since-1970; stats caches and
+    the search prune need the calendar year back.
+    """
+    if bin_name == "year":
+        return ordinal + 1970
+    if bin_name == "month":
+        return 1970 + ordinal // 12
+    if bin_name == "day":
+        return (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(days=ordinal)).year
+    raise ValueError(f"unknown time bin: {bin_name!r}")
+
+
 ICEBERG_SCHEMA = Schema(
     NestedField(1, "id", StringType(), required=False),
     NestedField(2, "grid_partition", StringType(), required=False),
@@ -112,6 +172,7 @@ ICEBERG_SCHEMA = Schema(
     NestedField(27, "longitude", DoubleType(), required=False),
     NestedField(28, "bbox", StringType(), required=False),
 )
+
 
 def build_partition_spec(time_bin: str = "year") -> PartitionSpec:
     """Partition spec for a temporal binning: identity on ``grid_partition``

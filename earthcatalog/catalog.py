@@ -36,8 +36,11 @@ from .schema import (
     PROP_GRID_TYPE,
     PROP_HASH_INDEX_PATH,  # noqa: F401  (re-export: consumers import from catalog)
     PROP_INDEX_PATH,
+    PROP_TIME_BIN,
     TABLE_NAME,  # noqa: F401  (re-export: consumers import from catalog)
     build_partition_spec,
+    layout_of,
+    partition_year,
 )
 
 HIVE_RE = _HIVE_RE
@@ -83,10 +86,11 @@ def _parse_dt(value: str | datetime) -> datetime:
 
 def _build_stats_cache(table) -> list[dict]:
     """Aggregate per-(partition, year) stats from Iceberg manifests. No Parquet I/O."""
+    time_bin = table.properties.get(PROP_TIME_BIN, "year")
     agg: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0, 0])
     for task in table.scan().plan_files():
         f = task.file
-        key = (f.partition[0], f.partition[1] + 1970)
+        key = (f.partition[0], partition_year(time_bin, f.partition[1]))
         agg[key][0] += f.record_count
         agg[key][1] += 1
         agg[key][2] += f.file_size_in_bytes
@@ -180,10 +184,11 @@ class CatalogInfo:
 
         start_year = q_start.year - year_lookback if q_start is not None else None
         end_year = q_end.year + 1 if q_end is not None else None
+        time_bin = table.properties.get(PROP_TIME_BIN, "year")
 
         paths = []
         for task in table.scan(row_filter=expr).plan_files():
-            year = task.file.partition[1] + 1970
+            year = partition_year(time_bin, task.file.partition[1])
             if start_year is not None and year < start_year:
                 continue
             if end_year is not None and year > end_year:
@@ -382,6 +387,7 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> Table:
             props[PROP_GRID_BOUNDARIES_PATH] = str(grid_config.boundaries_path)
         if grid_config.id_field is not None:
             props[PROP_GRID_ID_FIELD] = str(grid_config.id_field)
+        props[PROP_TIME_BIN] = grid_config.time_bin
 
     warehouse = catalog.properties.get("warehouse", "")
     if warehouse:
@@ -923,6 +929,7 @@ class EarthCatalog:
             index=Index(self._store, index_key),
             warehouse_prefix=warehouse_prefix,
             dry_run=dry_run,
+            layout=layout_of(self._table.properties),
         )
 
         # After files have been physically rewritten the Iceberg table still

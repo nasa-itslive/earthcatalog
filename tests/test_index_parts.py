@@ -112,15 +112,25 @@ def test_items_per_day(tmp_path):
     idx = Index(store, "warehouse_index.parquet")
     idx.append(
         [
-            {"stac_id": f"a{i}", "s3_key": f"s3://b/a{i}.stac.json",
-             "grid_partition": "c", "year": 2020, "ingested_at": "2026-09-05T01:00:00+00:00"}
+            {
+                "stac_id": f"a{i}",
+                "s3_key": f"s3://b/a{i}.stac.json",
+                "grid_partition": "c",
+                "year": 2020,
+                "ingested_at": "2026-09-05T01:00:00+00:00",
+            }
             for i in range(3)
         ]
     )
     idx.append(
         [
-            {"stac_id": "b", "s3_key": "s3://b/b.stac.json",
-             "grid_partition": "c", "year": 2020, "ingested_at": "2026-09-06T01:00:00+00:00"}
+            {
+                "stac_id": "b",
+                "s3_key": "s3://b/b.stac.json",
+                "grid_partition": "c",
+                "year": 2020,
+                "ingested_at": "2026-09-06T01:00:00+00:00",
+            }
         ],
         part="run2/0000",
     )

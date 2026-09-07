@@ -22,9 +22,11 @@ def _list_warehouse_keys(
     """
     import re
 
-    hive_re = re.compile(
-        r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+    # v2 (schema-driven) and v1 (legacy) hive layouts are both registered.
+    hive_re_v2 = re.compile(
+        r"grid=[^/]+/level=[^/]+/tile=[^/]+/(?:year|month|day)=[^/]+/(?P<file>[^/]+\.parquet)$"
     )
+    hive_re_v1 = re.compile(r"grid_partition=[^/]+/year=[^/]+/(?P<file>[^/]+\.parquet)$")
     root = warehouse_root.rstrip("/")
 
     # For S3 stores the list prefix is the warehouse path within the bucket.
@@ -38,7 +40,7 @@ def _list_warehouse_keys(
     for batch in obstore.list(warehouse_store, prefix=prefix):
         for obj in batch:
             k: str = obj["path"]
-            if k.endswith(".parquet") and hive_re.search(k):
+            if k.endswith(".parquet") and (hive_re_v2.search(k) or hive_re_v1.search(k)):
                 paths.append(f"{root}/{k}")
     return paths
 

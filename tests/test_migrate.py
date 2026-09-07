@@ -37,7 +37,9 @@ def test_resolver_conventional_fallback():
 def test_resolver_ignores_legacy_property():
     """hash_index_path names the retired id_hashes file — never follow it."""
     t = _Props({PROP_HASH_INDEX_PATH: "s3://b/warehouse_id_hashes.parquet"})
-    assert resolve_index_path(t, "s3://b/warehouse_index.parquet") == "s3://b/warehouse_index.parquet"
+    assert (
+        resolve_index_path(t, "s3://b/warehouse_index.parquet") == "s3://b/warehouse_index.parquet"
+    )
 
 
 def _write_parquet(path: Path, table: pa.Table) -> None:
@@ -95,9 +97,7 @@ def test_migrate_merges_legacy_indices(tmp_path):
     def hid(s):
         return xxhash.xxh3_128(s.encode(), seed=42).digest()
 
-    hashes = pa.table(
-        {"id_hash": pa.array([hid("a"), hid("c")], type=pa.binary(16))}
-    )
+    hashes = pa.table({"id_hash": pa.array([hid("a"), hid("c")], type=pa.binary(16))})
     _write_parquet(wh / "warehouse_id_hashes.parquet", hashes)
 
     report = migrate_indices(cat, store, str(wh))
@@ -152,6 +152,7 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
     class _FakeTable:
         def __init__(self):
             self.files: list[str] = []
+            self.properties: dict[str, str] = {}
 
         def add_files(self, paths):
             self.files.extend(paths)
@@ -206,20 +207,14 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
 
     from earthcatalog.ingest_config import IngestConfig
 
-    summary = IngestPipeline(ec, config=IngestConfig()).run(
-        str(inv_path), mode="full"
-    )
+    summary = IngestPipeline(ec, config=IngestConfig()).run(str(inv_path), mode="full")
 
     # The new index object was empty → nothing suppressed the re-run.
     fresh = Index(store, "warehouse_index.parquet")
     assert len(fresh.known_source_keys()) == 0
     assert captured["considered"] == len(keys)
     assert summary["items"] == len(keys)
-    leftovers = [
-        obj["path"]
-        for batch in store.list(prefix="warehouse/_staging")
-        for obj in batch
-    ]
+    leftovers = [obj["path"] for batch in store.list(prefix="warehouse/_staging") for obj in batch]
     assert leftovers == [], leftovers
 
 

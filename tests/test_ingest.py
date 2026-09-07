@@ -49,6 +49,7 @@ def _run(
     class _FakeTable:
         def __init__(self):
             self.files: list[str] = []
+            self.properties: dict[str, str] = {}
 
         def add_files(self, paths):
             self.files.extend(paths)
@@ -113,6 +114,7 @@ class TestResume:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -169,6 +171,7 @@ class TestDaskIngester:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -231,6 +234,7 @@ class TestDaskIngesterShardSpecs:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -258,6 +262,7 @@ class TestDaskIngesterShardSpecs:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -308,6 +313,7 @@ class TestScatterMapReduce:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -401,7 +407,7 @@ class TestNdjsonCompaction:
         items = [_make_item(k) for k in keys]
         _put_ndjson(
             store,
-            f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl",
+            f"{prefix}/grid=h3/level=1/tile=cellA/year=2020/staging.jsonl",
             items,
         )
         return store, prefix
@@ -410,7 +416,12 @@ class TestNdjsonCompaction:
         from earthcatalog.ingest import _compact_bucket
 
         return _compact_bucket(
-            store, prefix, "warehouse", ("cellA", "2020"), delta=delta
+            store,
+            prefix,
+            "warehouse",
+            ("cellA", "2020"),
+            delta=delta,
+            layout=("h3", "1", "year"),
         )
 
     def _part_files(self, store):
@@ -446,7 +457,7 @@ class TestNdjsonCompaction:
             items.append(it)
         _put_ndjson(
             store,
-            f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl",
+            f"{prefix}/grid=h3/level=1/tile=cellA/year=2020/staging.jsonl",
             items,
         )
 
@@ -463,7 +474,7 @@ class TestNdjsonCompaction:
         dropped (unlike a Bloom filter, which would lose ~0.1% of items)."""
 
         store, prefix = self._stage(["a.stac.json", "b.stac.json"])
-        key = f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl"
+        key = f"{prefix}/grid=h3/level=1/tile=cellA/year=2020/staging.jsonl"
         dup = bytes(store.get(key).bytes())
         store.put(key, dup + dup)  # double every line
 
@@ -500,7 +511,9 @@ class TestNdjsonCompaction:
             return _SpyResult(real_get(store_obj, key))
 
         with patch.object(_obstore_mod, "get", side_effect=_fake_get):
-            _compact_bucket(store, prefix, "warehouse", ("cellA", "2020"))
+            _compact_bucket(
+                store, prefix, "warehouse", ("cellA", "2020"), layout=("h3", "1", "year")
+            )
 
         assert stream_used["yes"], "compaction did not read NDJSON via stream()"
 
@@ -513,7 +526,7 @@ class TestDeterministicPartNaming:
         prefix = "warehouse/staging/ndjson"
         _put_ndjson(
             store,
-            f"{prefix}/grid_partition=cellA/year=2020/staging.jsonl",
+            f"{prefix}/grid=h3/level=1/tile=cellA/year=2020/staging.jsonl",
             [_make_item(k) for k in keys],
         )
         return store, prefix
@@ -522,7 +535,12 @@ class TestDeterministicPartNaming:
         from earthcatalog.ingest import _compact_bucket
 
         return _compact_bucket(
-            store, prefix, "warehouse", ("cellA", "2020"), delta=delta
+            store,
+            prefix,
+            "warehouse",
+            ("cellA", "2020"),
+            delta=delta,
+            layout=("h3", "1", "year"),
         )
 
     def test_full_mode_names_parts_deterministically(self):
@@ -538,8 +556,8 @@ class TestDeterministicPartNaming:
         """Delta compaction appends after existing part_N files, never clobbers."""
         store, prefix = self._stage(["a.stac.json", "b.stac.json", "c.stac.json"])
         # Pre-existing partition files from a prior full ingest.
-        store.put("warehouse/grid_partition=cellA/year=2020/part_000000.parquet", b"x")
-        store.put("warehouse/grid_partition=cellA/year=2020/part_000001.parquet", b"x")
+        store.put("warehouse/grid=h3/level=1/tile=cellA/year=2020/part_000000.parquet", b"x")
+        store.put("warehouse/grid=h3/level=1/tile=cellA/year=2020/part_000001.parquet", b"x")
 
         np_, ir, rows, _ = self._compact(store, prefix, delta=True)
         names = [p.rsplit("/", 1)[-1] for p in np_]
@@ -569,6 +587,7 @@ class TestPerBucketCommitSkip:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -670,6 +689,7 @@ class TestHeadPreFilter:
     class _FakeTable:
         def __init__(self):
             self.files: list[str] = []
+            self.properties: dict[str, str] = {}
 
         def add_files(self, paths):
             self.files.extend(paths)
@@ -693,8 +713,12 @@ class TestHeadPreFilter:
 
         index.append(
             [
-                {"stac_id": "a", "s3_key": "s3://data-bucket/a.stac.json",
-                 "grid_partition": "cellA", "year": 2020}
+                {
+                    "stac_id": "a",
+                    "s3_key": "s3://data-bucket/a.stac.json",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                }
             ]
         )
         client = self._RecordingClient()
@@ -715,8 +739,12 @@ class TestHeadPreFilter:
 
         index.append(
             [
-                {"stac_id": k.rsplit(".", 1)[0], "s3_key": f"s3://data-bucket/{k}",
-                 "grid_partition": "cellA", "year": 2020}
+                {
+                    "stac_id": k.rsplit(".", 1)[0],
+                    "s3_key": f"s3://data-bucket/{k}",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                }
                 for k in keys
             ]
         )
@@ -742,6 +770,7 @@ class TestUnknownYearSentinel:
         class _FakeTable:
             def __init__(self):
                 self.files: list[str] = []
+                self.properties: dict[str, str] = {}
 
             def add_files(self, paths):
                 self.files.extend(paths)
@@ -764,7 +793,8 @@ class TestUnknownYearSentinel:
 
         # Physically in year=unknown/.
         unknown_files = [
-            k for k in _list_files(store, "warehouse/")
+            k
+            for k in _list_files(store, "warehouse/")
             if "year=unknown" in k and k.endswith(".parquet")
         ]
         assert unknown_files, _list_files(store, "warehouse/")

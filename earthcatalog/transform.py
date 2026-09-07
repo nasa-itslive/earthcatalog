@@ -78,17 +78,6 @@ class FileMetadata:
     file_size_bytes: int
 
 
-def _year_from_item(item: dict) -> int | None:
-    """Extract the 4-digit year from a STAC item's datetime property, or None."""
-    dt_str = item.get("properties", {}).get("datetime")
-    if dt_str:
-        try:
-            return int(dt_str[:4])
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
 def _sort_key(item: dict) -> tuple[str, str]:
     """Sort key for within-partition ordering: (platform, datetime)."""
     props = item.get("properties", {})
@@ -129,19 +118,20 @@ def fan_out(
 
 def group_by_partition(
     fan_out_items: list[dict],
-) -> dict[tuple[str, int | None], list[dict]]:
+    time_bin: str = "year",
+) -> dict[tuple[str, str], list[dict]]:
     """
-    Group fan-out items by ``(grid_partition, year)`` and sort each group by
-    ``(platform, datetime)``.
+    Group fan-out items by ``(grid_partition, <time_bin> value)`` and sort
+    each group by ``(platform, datetime)``.
 
     Each resulting group satisfies both Iceberg partition constraints:
 
     * ``IdentityTransform`` on ``grid_partition`` — every item in the group
       has the same ``grid_partition`` value, so Parquet column statistics give
       a single min == max that ``add_files()`` can use unambiguously.
-    * ``YearTransform`` on ``datetime`` — every item in the group has a
-      ``datetime`` in the same calendar year, so the year-level Parquet
-      statistics are also unambiguous.
+    * the temporal transform on ``datetime`` (year/month/day per *time_bin*)
+      — every item in the group has the same bin value, so the partition-level
+      Parquet statistics are also unambiguous.
 
     The within-group sort by ``(platform, datetime)`` maximises Parquet
     row-group min/max statistics for predicate pushdown on those columns.
@@ -151,17 +141,25 @@ def group_by_partition(
     fan_out_items:
         Output of :func:`fan_out` — each item has exactly one
         ``grid_partition`` value in its ``properties``.
+    time_bin:
+        ``"year"`` (default), ``"month"`` or ``"day"`` — must match the
+        table's partition spec.
 
     Returns
     -------
-    dict mapping ``(cell_id, year)`` → sorted list of synthetic STAC items.
-    ``year`` is ``None`` for items that carry no ``datetime`` property.
+    dict mapping ``(cell_id, bin_value)`` → sorted list of synthetic STAC
+    items.  ``bin_value`` is the formatted hive value (``"2025"`,
+    ``"2025-12"``, ``"2025-12-20"``) or ``"unknown"`` for items that carry
+    no ``datetime`` property.
     """
-    groups: dict[tuple[str, int | None], list[dict]] = {}
+    from .schema import bin_value
+
+    groups: dict[tuple[str, str], list[dict]] = {}
     for item in fan_out_items:
-        cell = item["properties"].get("grid_partition", "__none__")
-        year = _year_from_item(item)
-        key = (cell, year)
+        props = item["properties"]
+        cell = props.get("grid_partition", "__none__")
+        bv = bin_value(props.get("datetime"), time_bin)
+        key = (cell, bv)
         groups.setdefault(key, []).append(item)
 
     # Sort within each group for optimal Parquet column statistics
