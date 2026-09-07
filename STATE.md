@@ -110,24 +110,81 @@ assertion (no journal created), re-verify live.
 **Also decide:** should the daily CLI default `--stage direct` explicitly
 (it is the documented daily profile; ndjson remains the PGSTAC/bulk option)?
 
+## Decisions
+
+- **RPI-2 (S3Lock wiring) CANCELLED — 2026-09-07.** There are no intra-run
+  races to lock: each worker fans out its own shard, each worker compacts its
+  own (cell, year) partition, and only the head commits to Iceberg/index.
+  Across runs, the daily workflow's `concurrency` group is the guard. The
+  residual hole — two *manual* simultaneous dispatches — is documented here
+  rather than locked. The `S3Lock` module stays for consolidation, which has
+  always used it. The lock wiring that was briefly added to ingest/GC was
+  reverted.
+
+## Realignment vs. the Rust/DuckDB/Iceberg architecture plan (2026-09-07)
+
+Assessed `plan` (hash-bucketed normalized inventories → ItemIndex +
+MaterializationIndex → one Iceberg transaction per run). Verdict:
+
+**The daily ingest is NOT off the rails — it already implements the plan's
+core.** Out-of-core diff (our DuckDB EXCEPT ≈ their bucketed ANTI JOIN;
+benchmarked 432 s for a 2×43.2M-row day pair under a 10 GB cap), append-only
+Iceberg path (small delta part files added by `add_files`, no rewrite of
+400k-row bases), derived index separate from Iceberg, spatial×temporal
+fan-out with multi-materialization, sorted per-partition GeoParquet,
+runner-sized. Real-data verified end to end (see table above).
+
+**Deliberate deltas (keep as-is):**
+- One unified Index instead of ItemIndex + MaterializationIndex split — at
+  50M rows one Parquet with `s3_key/stac_id/grid_partition/year` serves
+  resume (ItemIndex role) *and* GC (Materialization role); splitting is an
+  optimization without a current failure mode.
+- Per-batch commit + journal instead of ONE commit per run — bounds crash
+  re-work to one batch on the runner; the plan's whole-run commit trades that
+  away for simplicity we don't need.
+- `size + last_modified` identity instead of `etag` — the ITS_Live inventory
+  schema has no etag column (manifest fileSchema: bucket, key, size,
+  last_modified_date, storage_class, IT tier).
+- Changed keys are reported, not re-ingested (user decision); full
+  modification handling (swap old+new materializations) deferred until
+  changes actually occur in practice.
+
+**Adopt later, only on evidence:**
+- Persisted hash-bucketed normalized inventories (`dt=/bucket=000..1023`):
+  buys resumable/multi-day bucket diffs and sub-day increments; costs a daily
+  ~5 GB normalized rewrite. Our one-query EXCEPT is 7 min/day — adopt only if
+  the runner budget breaks or multi-day catch-ups become routine.
+- Iceberg equality deletes for GC (current weekly file-rewrite GC is fine
+  while deletes are rare).
+
+**Where the refactor DID go too far (the distributed side):**
+- The ndjson stage gives the Ingester a 2×2 matrix (direct/ndjson ×
+  serial/dask); the stage-scope journal bug (RPI-1) was a symptom. ndjson
+  exists for PGSTAC interchange — if nothing consumes it in production,
+  retire it or confine it to the bulk profile behind `--stage ndjson`.
+- The bulk/scatter profile should be scoped to what the plan says Dask is
+  for: high-volume fan-out, large compactions, historical rebuilds — not the
+  daily path (which it no longer touches).
+
 ## Backlog (RPI candidates, in priority order)
 
-- **RPI-2 · Single-writer enforcement** — workflow `concurrency` group is in
-  `daily_delta.yml`; the `S3Lock` wrap for ingest/GC entry points is **not**
-  wired yet (`EarthCatalog.lock()` still has zero callers). Plan §2.7 half-done.
-- **RPI-3 · Changed-keys report** — the diff parquet carries
-  `(size, last_modified)`; count/flag re-uploaded-but-known keys explicitly
-  in `_last_run.json` (user decision: report, don't re-ingest).
+- **RPI-2 · Simplification pass on the ingest matrix** — one first-class
+  serial path (direct); decide ndjson's fate (retire vs bulk-only); delete
+  whatever has no production consumer.
+- **RPI-3 · Changed-keys report** — count/flag re-uploaded-but-known keys in
+  `_last_run.json` (diff rows whose key is already indexed).
 - **RPI-4 · Consolidation `--audit`** — per-partition row counts vs
   `Index.count_active()` into `_last_run.json` (crash-orphan visibility,
   plan §5).
-- **RPI-5 · Production backlog** — the real index at `catalog/` is 394,964
-  keys behind; decide: run `migrate-indices` + a catch-up diff ingest there,
-  or rebuild the test warehouse under refactoring first. Needs a user call.
+- **RPI-5 · Production backlog decision** — the real index at `catalog/` is
+  394,964 keys behind; decide: run `migrate-indices` + a catch-up diff ingest
+  there, or rebuild the test warehouse under refactoring first. Needs a user
+  call.
 - **RPI-6 · Enable workflows** — only after AWS secrets exist in the repo and
-  RPI-1/2 land; first run in `--dry-run`.
+  RPI-1 lands; first run in `--dry-run`.
 - **RPI-7 · Optional** — ndjson-stage fault cells (de-scoped by design),
-  `earthcatalog delta` naming bikeshed, reverse diff (index↛inventory) for GC.
+  reverse diff (index↛inventory) for GC, hash-bucketed normalized inventories
+  (see Adopt-later).
 
 ## Verification commands (resume here)
 
