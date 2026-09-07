@@ -196,10 +196,12 @@ uv run earthcatalog ingest --inventory s3://bucket/inventory/full.parquet \
 uv run earthcatalog ingest --inventory s3://…/staging/shards/<run_id>/scatter.json \
     --mode delta --scheduler coiled
 
-# Resume a failed run — already-ingested source keys are skipped automatically.
-# Stage-only (compact later) or compact staged NDJSON:
-uv run earthcatalog ingest --inventory … --mode delta --skip-compact
-uv run earthcatalog ingest --inventory … --mode delta --skip-fetch
+# Resume a failed run — already-ingested source keys are skipped automatically
+# via the unified-index anti-join; staged NDJSON (bulk profile) re-compacts.
+
+# Bulk-only stage control (Dask profile):
+uv run earthcatalog ingest --inventory … --mode delta --scheduler coiled --skip-compact
+uv run earthcatalog ingest --inventory … --mode delta --scheduler coiled --skip-fetch
 ```
 
 Use `uv run earthcatalog ingest --help` for the full option list.
