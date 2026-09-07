@@ -324,12 +324,27 @@ class DaskIngester(Ingester):
     *client* must expose ``map(fn, shards)`` (a Dask ``Client`` works).
     """
 
+    def _prefilter_shards(self, inventory: list) -> list:
+        """Head-side pre-filter: drop keys the index already has before
+        shipping shards to workers, so a re-run never re-fetches.  A shard
+        whose keys are all known vanishes entirely; shard specs stream at
+        the head (cheap parquet reads) and ship as plain pair lists.
+        """
+        known = self._index.known_key_hashes()
+        shipped: list = []
+        for shard in inventory:
+            pairs = shard.iter_pairs() if hasattr(shard, "iter_pairs") else iter(shard)
+            kept = list(iter_new_keys(pairs, known))
+            if kept:
+                shipped.append(kept)
+        return shipped
+
     def run(self, inventory, *, client=None) -> dict:  # type: ignore[override]
         """Ingest each shard in *inventory* in parallel; workers stream their own pairs."""
         if client is None:
             raise ValueError("DaskIngester.run requires a client exposing map(fn, shards)")
         if self._stage == "ndjson":
-            return self._run_ndjson(inventory, client=client)
+            return self._run_ndjson(self._prefilter_shards(list(inventory)), client=client)
 
         # Ship only plain state to workers (not the Iceberg table/index) via a
         # module-level function, so it pickles/tokenizes deterministically.
@@ -341,7 +356,8 @@ class DaskIngester(Ingester):
             self._warehouse_prefix,
             fetch_concurrency=self._fetch_concurrency,
         )
-        results = _collect(client, write_fn, list(inventory), desc="Write GeoParquet")
+        shards = self._prefilter_shards(list(inventory))
+        results = _collect(client, write_fn, shards, desc="Write GeoParquet")
 
         new_paths: list[str] = []
         index_rows: list[dict] = []

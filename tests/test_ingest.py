@@ -993,3 +993,107 @@ class TestPerBucketCommitSkip:
 
         assert summary["rows"] == 2  # only cellB's 2 items
         assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
+
+
+class TestHeadPreFilter:
+    """Bulk profile: the head filters shards against the index before
+    client.map, so re-runs never re-fetch known keys (A5)."""
+
+    def _scatter(self, tmp_path, store, keys, chunk=2):
+        import pyarrow as pa
+
+        from earthcatalog.inventory import write_inventory_shards
+
+        inv = tmp_path / "inv.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "bucket": pa.array(["data-bucket"] * len(keys), type=pa.string()),
+                    "key": pa.array(keys, type=pa.string()),
+                }
+            ),
+            str(inv),
+        )
+        return write_inventory_shards(
+            str(inv),
+            store,
+            staging_prefix="warehouse/staging/shards/run1",
+            chunk_size=chunk,
+            suffix=".stac.json",
+        )
+
+    class _RecordingClient:
+        def __init__(self):
+            self.tasks: list = []
+            self.fetched: list = []
+
+        def map(self, fn, args):
+            self.tasks.append(args)
+            out = []
+            for a in args:
+                pairs = a.iter_pairs() if hasattr(a, "iter_pairs") else a
+                self.fetched.extend(pairs)
+                out.append(fn(a))
+            return out
+
+        def gather(self, results):
+            return results
+
+    class _FakeTable:
+        def __init__(self):
+            self.files: list[str] = []
+
+        def add_files(self, paths):
+            self.files.extend(paths)
+
+    def _dask(self, store, index, table):
+        return DaskIngester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="direct",
+            warehouse_prefix="warehouse",
+        )
+
+    def test_prefilters_known_keys(self, tmp_path):
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+        table = self._FakeTable()
+        keys = ["a.stac.json", "b.stac.json", "c.stac.json"]
+        shards = self._scatter(tmp_path, store, keys)
+
+        index.append(
+            [
+                {"stac_id": "a", "s3_key": "s3://data-bucket/a.stac.json",
+                 "grid_partition": "cellA", "year": 2020}
+            ]
+        )
+        client = self._RecordingClient()
+        summary = self._dask(store, index, table).run(shards, client=client)
+
+        # 'a' was known: workers never saw it; the other two shipped.
+        shipped = [k for _, k in client.fetched]
+        assert shipped == ["b.stac.json", "c.stac.json"]
+        assert summary["items"] == 2
+        assert index.known_source_keys() == {f"s3://data-bucket/{k}" for k in keys}
+
+    def test_fully_known_ships_nothing(self, tmp_path):
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+        table = self._FakeTable()
+        keys = ["a.stac.json", "b.stac.json"]
+        shards = self._scatter(tmp_path, store, keys)
+
+        index.append(
+            [
+                {"stac_id": k.rsplit(".", 1)[0], "s3_key": f"s3://data-bucket/{k}",
+                 "grid_partition": "cellA", "year": 2020}
+                for k in keys
+            ]
+        )
+        client = self._RecordingClient()
+        summary = self._dask(store, index, table).run(shards, client=client)
+
+        assert client.fetched == []
+        assert summary["items"] == 0
