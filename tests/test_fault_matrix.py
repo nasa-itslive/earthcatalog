@@ -59,10 +59,10 @@ class _FailAppendIndex:
     def known_source_keys(self):
         return self._inner.known_source_keys()
 
-    def append(self, rows):
+    def append(self, rows, part=None):
         if self._fail:
             raise RuntimeError("injected crash in index.append")
-        return self._inner.append(rows)
+        return self._inner.append(rows, part=part)
 
 
 class _FailOnceTable(_FakeTable):

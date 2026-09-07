@@ -256,9 +256,13 @@ class Ingester:
         )
         new_paths, index_rows, rows = self._write_direct(items, on_file=on_file)
         if new_paths:
+            # Iceberg commits first, the index part second: a crash between
+            # the two leaves the rows in the journal, and recovery writes
+            # exactly this part (deterministic {run_id}/{seq} name).
             self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
-                self._index.append(index_rows)
+                part = f"{journal.run_id}/{seq:04d}" if journal is not None else None
+                self._index.append(index_rows, part=part)
         if journal is not None:
             journal.finish_batch(seq)
         return rows

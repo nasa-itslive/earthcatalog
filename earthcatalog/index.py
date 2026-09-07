@@ -1,9 +1,14 @@
 """
-Unified warehouse index — merges the legacy hash index and source index.
+Unified warehouse index — provenance, dedup, and soft-delete state.
 
-A single Parquet file (``warehouse_index.parquet``) tracking every STAC item's
-provenance, its hash for fast dedup, and a soft-delete flag used by garbage
-collection.
+Layout: a set of *immutable Parquet parts* under ``{base}/`` (one written
+per ingest batch, after the Iceberg commit succeeds) plus, for warehouses
+that predate parts, the legacy single file ``{base}.parquet``.  Appends
+never read existing parts (O(delta) — the daily cost is the delta, not the
+catalog); reads stream every location; soft deletes rewrite only the parts
+they touch.  The whole index is derived state: it can be rebuilt from the
+catalog's GeoParquet item ids plus the source inventory, and the weekly
+consolidation audit reconciles it.
 
 Schema
 ------
@@ -11,40 +16,32 @@ id_hash         fixed_size_binary[16]  xxh3_128(stac_id, seed=42)
 stac_id         string
 s3_key          string                 provenance; the resume checkpoint
 grid_partition  string                 locates the GeoParquet file for GC
-year            int32
+year            int32 (nullable)       as stored in the partition path
 ingested_at     string
-deleted         bool                   soft-delete flag set by GC
+deleted         bool                   soft-delete flag set by garbage collection
 
 Public API
 ----------
 Index(store, key)
-    Open (or create-on-write) the index file.
+    Open the index.  *key* is the conventional ``{warehouse}_index.parquet``
+    path; the ``.parquet`` suffix is stripped to derive the parts prefix.
 
-append(rows) -> int
-    Append provenance rows; create the file on first use.
+append(rows, part=None) -> int
+    Write one new part (never reads existing parts).  *part* is a
+    deterministic sub-path (``{run_id}/{seq:04d}`` in production) so crash
+    recovery can rewrite the exact part it owes.
 
-known_source_keys() -> set[str]
-    All ``s3_key`` values — cheap cross-run resume checkpoint.
-
-contains_source_key(s3_key) -> bool
-    Membership test for resume.
-
-stream_active() -> Iterator[dict]
-    Yield non-deleted rows as dicts (for GC).
-
-mark_deleted(stac_ids) -> int
-    Set ``deleted=True`` for matching ``stac_id`` rows.
-
-compact() -> int
-    Physically drop deleted rows and rewrite the file.
-
+locations() -> list[str], exists() -> bool
+known_source_keys() -> set[str], contains_source_key(s3_key) -> bool
+stream_active() -> Iterator[dict], count_active() -> int
+mark_deleted(stac_ids) -> int, compact() -> int
 hash_set() -> set[bytes]
-    The set of ``id_hash`` values (legacy dedup-set compat).
 """
 
 from __future__ import annotations
 
 import io
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -96,36 +93,71 @@ def resolve_index_path(table: object | None, default_index_path: str) -> str:
 
 
 class Index:
-    """Provenance + dedup index backed by a single Parquet file in *store*."""
+    """Provenance + dedup index, stored as immutable Parquet parts."""
 
     def __init__(self, store: object, key: str) -> None:
         self._store = store
-        self._key = key
+        self._base = key.removesuffix(".parquet")
+        # Legacy single-file location — where pre-parts warehouses kept the
+        # index and where compaction merges to.  Always ``{base}.parquet``.
+        self._legacy_key = f"{self._base}.parquet"
 
-    # -- reads ---------------------------------------------------------------
+    # -- locations -----------------------------------------------------------
 
-    def _read(self) -> pa.Table | None:
+    def _part_prefix(self) -> str:
+        return f"{self._base}/"
+
+    def locations(self) -> list[str]:
+        """Every Parquet location: the legacy file (if present) + all parts."""
+        locs: list[str] = []
+        if self._legacy_exists():
+            locs.append(self._legacy_key)
+        parts: list[str] = []
         try:
-            raw = bytes(obstore.get(self._store, self._key).bytes())
-        except FileNotFoundError:
-            return None
-        return pq.ParquetFile(io.BytesIO(raw)).read()
+            for listing in obstore.list(self._store, prefix=self._part_prefix()):
+                for obj in listing:
+                    k: str = obj["path"]
+                    if k.endswith(".parquet"):
+                        parts.append(k)
+        except Exception:
+            pass
+        return locs + sorted(parts)
 
-    def _write(self, tbl: pa.Table) -> None:
-        buf = io.BytesIO()
-        pq.write_table(tbl, buf, compression="zstd")
-        obstore.put(self._store, self._key, buf.getvalue())
+    def _legacy_exists(self) -> bool:
+        try:
+            obstore.head(self._store, self._legacy_key)
+            return True
+        except Exception:
+            return False
 
-    # -- public API ----------------------------------------------------------
+    def exists(self) -> bool:
+        """True if the index (legacy file or any part) exists in the store."""
+        if self._legacy_exists():
+            return True
+        try:
+            for listing in obstore.list(self._store, prefix=self._part_prefix()):
+                for obj in listing:
+                    if obj["path"].endswith(".parquet"):
+                        return True
+        except Exception:
+            pass
+        return False
 
-    def append(self, rows: list[dict]) -> int:
-        """Append provenance rows; return total row count (0 if empty no-op)."""
+    # -- writes ---------------------------------------------------------------
+
+    def append(self, rows: list[dict], part: str | None = None) -> int:
+        """Write one new part; return the number of rows written.
+
+        Never reads existing parts — the daily cost is the delta, not the
+        catalog.  *part* is a deterministic sub-path (production:
+        ``{run_id}/{seq:04d}``, so crash recovery can rewrite exactly the
+        part it owes); omitted, an opaque id is generated.
+        """
         if not rows:
-            tbl = self._read()
-            return tbl.num_rows if tbl is not None else 0
+            return 0
 
         now = datetime.now(UTC).isoformat()
-        new = pa.table(
+        tbl = pa.table(
             {
                 "id_hash": pa.array([hash_id(r["stac_id"]) for r in rows], type=pa.binary(16)),
                 "s3_key": [r["s3_key"] for r in rows],
@@ -141,115 +173,143 @@ class Index:
             schema=_SCHEMA,
         )
 
-        existing = self._read()
-        merged = pa.concat_tables([existing, new]) if existing is not None else new
-        self._write(merged)
-        return merged.num_rows
+        part_id = part or f"_auto/{uuid.uuid4().hex}"
+        buf = io.BytesIO()
+        pq.write_table(tbl, buf, compression="zstd")
+        obstore.put(self._store, f"{self._base}/{part_id}.parquet", buf.getvalue())
+        return len(rows)
+
+    def mark_deleted(self, stac_ids: set[str]) -> int:
+        """Set ``deleted=True`` for rows whose ``stac_id`` is in *stac_ids*.
+
+        Rewrites only the parts that actually contain matches.
+        """
+        total = 0
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            tbl = pq.ParquetFile(io.BytesIO(raw)).read()
+            marked = pc.is_in(tbl.column("stac_id"), pa.array(list(stac_ids)))
+            if not pc.any(marked).as_py():
+                continue
+            deleted_col = pc.or_(tbl.column("deleted"), marked)
+            tbl = tbl.set_column(
+                tbl.schema.get_field_index("deleted"), "deleted", deleted_col
+            )
+            buf = io.BytesIO()
+            pq.write_table(tbl, buf, compression="zstd")
+            obstore.put(self._store, loc, buf.getvalue())
+            total += int(pc.sum(marked).as_py())
+        return total
+
+    def compact(self) -> int:
+        """Merge every location into the legacy single file; drop the parts.
+
+        Physically removes soft-deleted rows.
+        """
+        tbl = self._read_all()
+        active = tbl.filter(pc.invert(tbl.column("deleted")))
+        buf = io.BytesIO()
+        pq.write_table(active, buf, compression="zstd")
+        obstore.put(self._store, self._legacy_key, buf.getvalue())
+        for loc in self.locations():
+            if loc != self._legacy_key:
+                try:
+                    obstore.delete(self._store, loc)
+                except Exception:
+                    pass
+        return active.num_rows
+
+    # -- reads ----------------------------------------------------------------
+
+    def _read_all(self) -> pa.Table:
+        tables = []
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            tables.append(pq.ParquetFile(io.BytesIO(raw)).read())
+        return pa.concat_tables(tables) if tables else _SCHEMA.empty_table()
+
+    def num_rows(self) -> int:
+        """Total row count (including soft-deleted) from Parquet metadata."""
+        total = 0
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            total += pq.ParquetFile(io.BytesIO(raw)).metadata.num_rows
+        return total
 
     def known_source_keys(self) -> set[str]:
         """All ``s3_key`` values in the index (used as a resume checkpoint)."""
-        tbl = self._read()
-        if tbl is None:
-            return set()
         keys: set[str] = set()
-        for batch in tbl.column("s3_key").chunks:
-            keys.update(str(k) for k in batch.to_pylist() if k)
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            pf = pq.ParquetFile(io.BytesIO(raw))
+            for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["s3_key"]):
+                keys.update(str(k) for k in batch.column("s3_key").to_pylist() if k)
         return keys
 
     def contains_source_key(self, s3_key: str) -> bool:
         """True if *s3_key* is already indexed."""
         return s3_key in self.known_source_keys()
 
-    def exists(self) -> bool:
-        """True if the index object exists in the store."""
-        try:
-            obstore.head(self._store, self._key)
-            return True
-        except Exception:
-            return False
-
     def stream_active(self) -> Iterator[dict]:
         """Yield non-deleted rows as dicts: ``{s3_key, stac_id, grid_partition, year}``."""
-        tbl = self._read()
-        if tbl is None:
-            return
-        keep = tbl.filter(pc.invert(tbl.column("deleted")))
-        for batch in keep.to_batches():
-            s3_keys = batch.column("s3_key").to_pylist()
-            stac_ids = batch.column("stac_id").to_pylist()
-            cells = batch.column("grid_partition").to_pylist()
-            years = batch.column("year").to_pylist()
-            for s3_key, stac_id, cell, year in zip(s3_keys, stac_ids, cells, years):
-                if not s3_key:
-                    continue
-                yield {
-                    "s3_key": s3_key,
-                    "stac_id": stac_id,
-                    "grid_partition": cell,
-                    "year": year,
-                }
-
-    def mark_deleted(self, stac_ids: set[str]) -> int:
-        """Set ``deleted=True`` for every row whose ``stac_id`` is in *stac_ids*."""
-        if not stac_ids:
-            return 0
-        existing = self._read()
-        if existing is None:
-            return 0
-
-        marked = pc.is_in(existing.column("stac_id"), pa.array(list(stac_ids)))
-        if not pc.any(marked).as_py():
-            return 0
-
-        deleted_col = pc.or_(existing.column("deleted"), marked)
-        existing = existing.set_column(
-            existing.schema.get_field_index("deleted"),
-            "deleted",
-            deleted_col,
-        )
-        self._write(existing)
-        return int(pc.sum(marked).as_py())
-
-    def compact(self) -> int:
-        """Physically remove ``deleted=True`` rows; return active row count."""
-        existing = self._read()
-        if existing is None:
-            return 0
-        active = existing.filter(pc.invert(existing.column("deleted")))
-        self._write(active)
-        return active.num_rows
-
-    def hash_set(self) -> set[bytes]:
-        """``id_hash`` values for active (non-deleted) rows — for dedup.
-
-        Deleted rows are excluded so that a re-added item can be re-ingested
-        after GC marks it deleted.
-        """
-        tbl = self._read()
-        if tbl is None:
-            return set()
-        active = tbl.filter(pc.invert(tbl.column("deleted")))
-        hashes: set[bytes] = set()
-        for batch in active.column("id_hash").chunks:
-            for h in batch.to_pylist():
-                if h is not None:
-                    hashes.add(bytes(h))
-        return hashes
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            pf = pq.ParquetFile(io.BytesIO(raw))
+            for batch in pf.iter_batches(batch_size=_BATCH_SIZE):
+                keep = pc.invert(batch.column("deleted"))
+                active = batch.filter(keep)
+                for row in active.to_pylist():
+                    if not row["s3_key"]:
+                        continue
+                    yield {
+                        "s3_key": row["s3_key"],
+                        "stac_id": row["stac_id"],
+                        "grid_partition": row["grid_partition"],
+                        "year": row["year"],
+                    }
 
     def count_active(self) -> int:
-        """Number of non-deleted rows (unique ingested items), streamed.
+        """Number of non-deleted rows, streamed per location."""
+        total = 0
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            pf = pq.ParquetFile(io.BytesIO(raw))
+            for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["deleted"]):
+                total += int(pc.sum(pc.invert(batch.column("deleted")).cast(pa.int32())).as_py())
+        return total
 
-        Streams the ``deleted`` column in batches so it stays memory-bounded
-        regardless of index size, and excludes soft-deleted rows (unlike a raw
-        Parquet footer row count).
-        """
-        try:
-            raw = bytes(obstore.get(self._store, self._key).bytes())
-        except FileNotFoundError:
-            return 0
-        pf = pq.ParquetFile(io.BytesIO(raw))
-        active = 0
-        for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["deleted"]):
-            deleted = batch.column("deleted")
-            active += int(pc.sum(pc.invert(deleted).cast(pa.int32())).as_py())
-        return active
+    def hash_set(self) -> set[bytes]:
+        """``id_hash`` values for active (non-deleted) rows — for dedup."""
+        hashes: set[bytes] = set()
+        for loc in self.locations():
+            try:
+                raw = bytes(obstore.get(self._store, loc).bytes())
+            except FileNotFoundError:
+                continue
+            pf = pq.ParquetFile(io.BytesIO(raw))
+            for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["id_hash", "deleted"]):
+                active = pc.filter(
+                    batch.column("id_hash"), pc.invert(batch.column("deleted"))
+                )
+                for h in active.to_pylist():
+                    if h is not None:
+                        hashes.add(bytes(h))
+        return hashes

@@ -122,7 +122,8 @@ def test_diff_against_index_mode(tmp_path):
     )
     # Materialise the index to a local parquet the diff engine can read.
     idx_path = str(tmp_path / "index.parquet")
-    raw = bytes(index._store.get("idx.parquet").bytes())
+    part = index.locations()[0]  # parts model: data lives under {base}/
+    raw = bytes(index._store.get(part).bytes())
     Path(idx_path).write_bytes(raw)
 
     out = str(tmp_path / "new.parquet")

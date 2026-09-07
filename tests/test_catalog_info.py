@@ -483,7 +483,7 @@ class TestCatalogInfoStatsMethods:
 
         # Set the index path in table properties.
         with tbl.transaction() as tx:
-            tx.set_properties(**{"earthcatalog.hash_index_path": index_path})
+            tx.set_properties(**{"earthcatalog.index_path": index_path})
 
         info = _catalog_info(tbl)
         count = info.unique_item_count(tbl, store=None)

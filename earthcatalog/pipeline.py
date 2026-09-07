@@ -156,20 +156,26 @@ class IngestPipeline:
                 obstore.delete(cat._store, index_key)
             except FileNotFoundError:
                 pass
-            staging = f"{warehouse_prefix.rstrip('/')}/_staging"
-            try:
-                for listing in obstore.list(cat._store, prefix=staging):
-                    for obj in listing:
-                        obstore.delete(cat._store, obj["path"])
-            except FileNotFoundError:
-                pass
+            for prefix in (
+                f"{index_key.removesuffix('.parquet')}/",  # index parts
+                f"{warehouse_prefix.rstrip('/')}/_staging",  # journals + NDJSON
+            ):
+                try:
+                    for listing in obstore.list(cat._store, prefix=prefix):
+                        for obj in listing:
+                            obstore.delete(cat._store, obj["path"])
+                except FileNotFoundError:
+                    pass
 
-        # Resume filter: DuckDB anti-join against the unified index when it
-        # exists; absent index (first run) → everything is new.
-        index_uri = f"{warehouse_root.rstrip('/')}_index.parquet"
-        dedupe = None
-        if index.exists():
-            dedupe = partial(anti_join, index_uri=index_uri)
+        # Resume filter: DuckDB anti-join against the unified index (every
+        # location: legacy single file + all parts) when it exists; absent
+        # index (first run) → everything is new.
+        if warehouse_root.startswith("s3://"):
+            bucket = warehouse_root.removeprefix("s3://").split("/", 1)[0]
+            index_uris = [f"s3://{bucket}/{loc}" for loc in index.locations()]
+        else:
+            index_uris = [f"{warehouse_root.rstrip('/')}/{loc}" for loc in index.locations()]
+        dedupe = partial(anti_join, index_uri=index_uris) if index_uris else None
         direct_left = (
             source
             if dedupe is not None and source.endswith((".parquet", ".json"))

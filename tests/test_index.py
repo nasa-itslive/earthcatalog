@@ -26,24 +26,20 @@ def _read_table(store, key: str) -> pa.Table:
 
 
 class TestAppend:
-    def test_append_creates_file(self):
+    def test_append_creates_part(self):
         store = MemoryStore()
         idx = Index(store, "index.parquet")
         n = idx.append([_row("s3://b/a.stac.json", "a")])
         assert n == 1
-        tbl = _read_table(store, "index.parquet")
-        assert tbl.column("s3_key").to_pylist() == ["s3://b/a.stac.json"]
-        assert tbl.column("stac_id").to_pylist() == ["a"]
-        assert tbl.column("deleted").to_pylist() == [False]
+        assert idx.known_source_keys() == {"s3://b/a.stac.json"}
 
     def test_append_extends_existing(self):
         store = MemoryStore()
         idx = Index(store, "index.parquet")
         idx.append([_row("s3://b/a.stac.json", "a")])
         n = idx.append([_row("s3://b/b.stac.json", "b")])
-        assert n == 2
-        tbl = _read_table(store, "index.parquet")
-        assert set(tbl.column("s3_key").to_pylist()) == {
+        assert n == 1  # rows written by THIS append (parts are O(delta))
+        assert idx.known_source_keys() == {
             "s3://b/a.stac.json",
             "s3://b/b.stac.json",
         }

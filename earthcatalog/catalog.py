@@ -222,7 +222,8 @@ class CatalogInfo:
                 return Index(store, obstore_key).count_active()
 
             p = Path(index_path)
-            if not p.exists():
+            # Parts layout: data under ``{base}/``; legacy: ``{base}.parquet``.
+            if not p.exists() and not p.with_suffix("").is_dir():
                 return 0
             return Index(LocalStore(str(p.parent)), p.name).count_active()
         except Exception:

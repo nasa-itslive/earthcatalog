@@ -70,6 +70,10 @@ class BatchJournal:
         self._run_id = run_id
         self._seq = 0
 
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
     def start_batch(self, source_keys: list[str]) -> int:
         """Record the batch's source keys before fetching; returns the seq."""
         seq = self._seq
@@ -189,14 +193,18 @@ def recover_journals(
             full_path(f["key"]) in registered for f in files
         )
         if files_registered:
-            # Crash inside the window: add_files done, append not.
+            # Crash inside the window: add_files done, index part not
+            # written.  Recovery writes the exact part the crashed run owed
+            # (deterministic {run_id}/{seq} name) and drops the journal.
             if rows:
                 # An item spanning multiple cells is journaled once per file;
                 # the normal path appends one row per source key.
                 unique: dict[str, dict] = {}
                 for r in rows:
                     unique.setdefault(r["s3_key"], r)
-                index.append(list(unique.values()))
+                run_id = jkey.rsplit("/", 2)[-2]
+                seq = jkey.rsplit("/", 1)[-1].removesuffix(".json")
+                index.append(list(unique.values()), part=f"{run_id}/{seq}")
                 report["rows_appended"] += len(unique)
             obstore.delete(store, jkey)
         else:

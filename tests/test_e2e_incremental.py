@@ -77,12 +77,13 @@ def _read_warehouse_ids(store) -> set[str]:
 
 
 def _find_index_key(store) -> str:
+    """The index base — parts live under it; Index() handles both layouts."""
     for batch in store.list(prefix=""):
         for obj in batch:
             k: str = obj["path"]
-            if "index.parquet" in k:
+            if "warehouse_index" in k:
                 return k
-    raise AssertionError("no index file found")
+    raise AssertionError("no index found")
 
 
 class TestEndToEndDaily:
@@ -173,18 +174,17 @@ class TestEndToEndDaily:
             for k in live_keys:
                 w.writerow(["data-bucket", k])
 
-        index_key = _find_index_key(store)
         gc_result = run_garbage_collection(
             str(inv_csv),
             store=store,
-            index=Index(store, index_key),
+            index=Index(store, "warehouse_index.parquet"),
             warehouse_prefix="warehouse/",
             head_fn=lambda k: k not in {f"s3://data-bucket/dir/item-1.stac.json"},
         )
         assert gc_result["confirmed"] == 1, gc_result
         assert gc_result["orphaned"] == 1, gc_result
         assert _read_warehouse_ids(store) == {"item-2", "item-3", "item-4"}
-        active = {r["stac_id"] for r in Index(store, index_key).stream_active()}
+        active = {r["stac_id"] for r in Index(store, "warehouse_index.parquet").stream_active()}
         assert active == {"item-2", "item-3", "item-4"}
 
         # --- Phase 5: re-running the same diff is a no-op -------------------
