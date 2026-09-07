@@ -14,7 +14,7 @@ Outputs are ``(bucket, key, size, last_modified_date)`` Parquet files:
 * ``old``: the reverse direction — keys that disappeared; GC input later.
 
 ``ingest --diff`` then anti-joins the ``new`` file against the unified
-index (``keydiff.iter_new_keys``), so already-ingested keys are skipped
+index (``diff.anti_join``), so already-ingested keys are skipped
 and only truly unknown keys are fetched.
 """
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 DEFAULT_REGION = "us-west-2"
@@ -122,6 +123,104 @@ def _read_parquet(files: list[str], suffix: str) -> str:
         f"SELECT {_DIFF_COLUMNS} FROM read_parquet({files!r}) "
         f"WHERE key LIKE '%{suffix}'"
     )
+
+
+def anti_join(
+    left: object,
+    index_uri: str | list[str],
+    *,
+    suffix: str = ".stac.json",
+    limit: int | None = None,
+    since: object | None = None,
+    batch_size: int = 10_000,
+    con: object | None = None,
+) -> Iterator[tuple[str, str]]:
+    """Yield the ``(bucket, key)`` pairs from *left* the index does not know.
+
+    The resume checkpoint: the unified index is the single source of truth
+    for "already ingested", and this anti-join is exact — string comparison
+    against ``s3_key``, soft-deleted rows excluded so a GC'd-then-re-added
+    item diffs as new.  Streams the result in *batch_size* chunks; neither
+    side is materialised in RAM.
+
+    *left* is a Parquet/CSV path, glob, list of paths, or an iterable of
+    ``(bucket, key)`` pairs (registered via Arrow — tests and small inputs;
+    iterables are materialised, prefer paths).  *index_uri* is the index
+    Parquet path/URI/glob/list.  *since* (parquet/CSV left only) filters on
+    ``last_modified_date``.  The caller guarantees the index exists.
+    """
+    import pyarrow as pa
+
+    # Eager validation: callers must see a bad *left* immediately, before
+    # the first pair is pulled.
+    left_files: list[str] | None = None
+    if isinstance(left, str):
+        left_files = resolve_files(left)
+    elif isinstance(left, list) and left and all(isinstance(x, str) for x in left):
+        left_files = left
+    elif not hasattr(left, "__iter__"):
+        raise ValueError("left must be a path/glob/list-of-paths or a pair iterable")
+
+    if con is None:
+        s3 = any(f.startswith("s3://") for f in (left_files or []))
+        con = _connect(region=DEFAULT_REGION, max_memory=DEFAULT_MAX_MEMORY,
+                       temp_directory=tempfile.gettempdir(), s3=s3)
+    return _anti_join_stream(left, index_uri, suffix, limit, since, batch_size, con)
+
+
+def _anti_join_stream(
+    left: object,
+    index_uri: str | list[str],
+    suffix: str,
+    limit: int | None,
+    since: object | None,
+    batch_size: int,
+    con: object,
+) -> Iterator[tuple[str, str]]:
+    import pyarrow as pa
+
+    if isinstance(left, str) or (isinstance(left, list) and (not left or isinstance(left[0], str))):
+        files = resolve_files(left) if isinstance(left, str) else left
+        if any(str(f).endswith(".csv") for f in files):
+            left_rel = (
+                f"SELECT bucket, key FROM read_csv_auto({files!r}) "
+                f"WHERE key LIKE '%{suffix}'"
+            )
+        else:
+            left_rel = _read_parquet(files, suffix)
+    elif hasattr(left, "__iter__"):
+        pairs = [(b, k) for b, k in left]
+        tbl = pa.table(
+            {
+                "bucket": pa.array([b for b, _ in pairs], type=pa.string()),
+                "key": pa.array([k for _, k in pairs], type=pa.string()),
+            }
+        )
+        con.register("left_pairs", tbl)  # type: ignore[attr-defined]
+        left_rel = (
+            f"SELECT bucket, key FROM left_pairs WHERE key LIKE '%{suffix}'"
+        )
+    else:
+        raise ValueError("left must be a path/glob/list-of-paths or a pair iterable")
+
+    index_list = [index_uri] if isinstance(index_uri, str) else index_uri
+    sql = (
+        f"SELECT l.bucket, l.key FROM ({left_rel}) l "
+        f"ANTI JOIN (SELECT s3_key FROM read_parquet({index_list!r}) WHERE NOT deleted) i "
+        f"ON i.s3_key = 's3://' || l.bucket || '/' || l.key"
+    )
+    params: list[object] = []
+    if since is not None:
+        sql += " AND l.last_modified_date >= ?"
+        params.append(since)
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+
+    reader = con.execute(sql, params).fetch_record_batch(batch_size)  # type: ignore[attr-defined]
+    for batch in reader:
+        buckets = batch.column("bucket").to_pylist()
+        keys = batch.column("key").to_pylist()
+        yield from zip(buckets, keys)
 
 
 def _connect(region: str, max_memory: str, temp_directory: str, *, s3: bool):

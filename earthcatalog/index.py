@@ -48,14 +48,11 @@ import io
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
-import numpy as np
 import obstore
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import xxhash
-
-from .keydiff import KEY_HASH_DTYPE, key_hash
 
 _HASH_SEED = 42
 _BATCH_SIZE = 100_000
@@ -163,26 +160,13 @@ class Index:
         """True if *s3_key* is already indexed."""
         return s3_key in self.known_source_keys()
 
-    def known_key_hashes(self) -> np.ndarray:
-        """Sorted hashes of every active ``s3_key`` — the resume membership array.
-
-        One GET, one column-streamed pass: 16 B/row (~0.7 GB at 45M rows),
-        built for :func:`earthcatalog.keydiff.iter_new_keys`.  Callers load
-        this once per run; nothing may re-read the index per item.
-        """
+    def exists(self) -> bool:
+        """True if the index object exists in the store."""
         try:
-            raw = bytes(obstore.get(self._store, self._key).bytes())
-        except FileNotFoundError:
-            return np.empty(0, dtype=KEY_HASH_DTYPE)
-        pf = pq.ParquetFile(io.BytesIO(raw))
-        buf = bytearray()
-        for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=["s3_key", "deleted"]):
-            active = pc.filter(batch.column("s3_key"), pc.invert(batch.column("deleted")))
-            for k in active.to_pylist():
-                if k:
-                    buf.extend(key_hash(k))
-        arr = np.frombuffer(bytes(buf), dtype=">u8").reshape(-1, 2).view(KEY_HASH_DTYPE)
-        return np.sort(arr.ravel())
+            obstore.head(self._store, self._key)
+            return True
+        except Exception:
+            return False
 
     def stream_active(self) -> Iterator[dict]:
         """Yield non-deleted rows as dicts: ``{s3_key, stac_id, grid_partition, year}``."""

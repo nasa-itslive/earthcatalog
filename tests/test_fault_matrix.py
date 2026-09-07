@@ -56,8 +56,8 @@ class _FailAppendIndex:
         self._inner = inner
         self._fail = fail
 
-    def known_key_hashes(self):
-        return self._inner.known_key_hashes()
+    def known_source_keys(self):
+        return self._inner.known_source_keys()
 
     def append(self, rows):
         if self._fail:

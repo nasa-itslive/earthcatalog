@@ -176,7 +176,7 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
     store.put("warehouse/_staging/ndjson/grid_partition=cellA/year=2020/x.jsonl", b"{}\n")
 
     # Patch the Ingester: the contract under test is the reset, not the
-    # re-ingest (which keydiff tests already pin down).
+    # re-ingest (which the membership tests already pin down).
     import earthcatalog.ingest as ing_mod
 
     captured: dict = {}
@@ -214,7 +214,7 @@ def test_full_mode_resets_index_and_staging(tmp_path, monkeypatch):
 
     # The new index object was empty → nothing suppressed the re-run.
     fresh = Index(store, "warehouse_index.parquet")
-    assert len(fresh.known_key_hashes()) == 0
+    assert len(fresh.known_source_keys()) == 0
     assert captured["considered"] == len(keys)
     assert summary["items"] == len(keys)
     leftovers = [

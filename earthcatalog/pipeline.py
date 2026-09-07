@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 from datetime import UTC
 from datetime import datetime as _dt
+from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING
 
@@ -52,6 +53,7 @@ class IngestPipeline:
         """
         from .catalog import get_or_create
         from .config import GridConfig
+        from .diff import anti_join
         from .grids import build_partitioner
         from .index import Index, resolve_index_path
         from .ingest import DaskIngester, Ingester
@@ -162,18 +164,38 @@ class IngestPipeline:
             except FileNotFoundError:
                 pass
 
-        if cfg.dry_run:
-            from .keydiff import iter_new_keys
+        # Resume filter: DuckDB anti-join against the unified index when it
+        # exists; absent index (first run) → everything is new.
+        index_uri = f"{warehouse_root.rstrip('/')}_index.parquet"
+        dedupe = None
+        if index.exists():
+            dedupe = partial(anti_join, index_uri=index_uri)
+        direct_left = (
+            source
+            if dedupe is not None and source.endswith((".parquet", ".json"))
+            else None
+        )
 
-            known = index.known_key_hashes()
-            pairs = (
-                (b, k)
-                for b, k in iter_inventory(source, since=cfg.since)
-                if k.endswith(".stac.json")
-            )
-            if cfg.limit is not None:
-                pairs = islice(pairs, cfg.limit)
+        def dedupe_pairs(pairs):
+            return dedupe(pairs)
+
+        def dedupe_source():
+            return dedupe(direct_left, suffix=".stac.json", limit=cfg.limit, since=cfg.since)
+
+        if cfg.dry_run:
             considered = 0
+
+            if direct_left:
+                pairs = dedupe_source()
+            else:
+                base = (
+                    (b, k)
+                    for b, k in iter_inventory(source, since=cfg.since)
+                    if k.endswith(".stac.json")
+                )
+                if cfg.limit is not None:
+                    base = islice(base, cfg.limit)
+                pairs = dedupe_pairs(base) if dedupe else base
 
             def _counted():
                 nonlocal considered
@@ -181,7 +203,7 @@ class IngestPipeline:
                     considered += 1
                     yield pair
 
-            new = sum(1 for _ in iter_new_keys(_counted(), known))
+            new = sum(1 for _ in _counted())
             return {
                 "dry_run": True,
                 "source": source,
@@ -205,6 +227,8 @@ class IngestPipeline:
             fetch_workers=cfg.fetch_workers,
             delta=delta,
         )
+        if dedupe is not None:
+            kwargs["dedupe"] = dedupe_pairs
 
         if cfg.scatter_only or cfg.create_client is not None:
             # Scatter step (head-only, no cluster needed).  The head streams
@@ -285,15 +309,29 @@ class IngestPipeline:
                 deleted = delete_scatter(cat._store, staging_prefix, shards)
                 print(f"Scatter cleanup: removed {deleted} object(s) under {staging_prefix}")
         else:
-            # Serial: filter .stac.json + limit, same as the scatter does.
-            pairs = (
-                (b, k)
-                for b, k in iter_inventory(source, since=cfg.since)
-                if k.endswith(".stac.json")
-            )
-            if cfg.limit is not None:
-                pairs = islice(pairs, cfg.limit)
-            summary = Ingester(**kwargs).run(pairs)
+            # Serial (the daily path): the anti-join IS the resume check.
+            if direct_left:
+                pairs = dedupe_source()
+            elif dedupe is not None:
+                base = (
+                    (b, k)
+                    for b, k in iter_inventory(source, since=cfg.since)
+                    if k.endswith(".stac.json")
+                )
+                if cfg.limit is not None:
+                    base = islice(base, cfg.limit)
+                pairs = dedupe_pairs(base)
+            else:
+                pairs = (
+                    (b, k)
+                    for b, k in iter_inventory(source, since=cfg.since)
+                    if k.endswith(".stac.json")
+                )
+                if cfg.limit is not None:
+                    pairs = islice(pairs, cfg.limit)
+            serial_kwargs = dict(kwargs)
+            serial_kwargs.pop("dedupe", None)  # pairs already filtered
+            summary = Ingester(**serial_kwargs).run(pairs)
 
         summary["source"] = source
         summary["mode"] = mode

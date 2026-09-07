@@ -156,8 +156,7 @@ def recover_journals(
     if not keys:
         return report
 
-    known = index.known_key_hashes()
-    from .keydiff import contains, key_hash
+    known = index.known_source_keys()
 
     for jkey in keys:
         doc = _read_journal(store, jkey)
@@ -169,9 +168,7 @@ def recover_journals(
         src_keys = doc.get("keys", [])
         files = doc.get("files", [])
 
-        all_in = bool(src_keys) and all(
-            contains(known, key_hash(k)) for k in src_keys
-        )
+        all_in = bool(src_keys) and all(k in known for k in src_keys)
 
         if all_in:
             # Commit completed; the crash hit before finish_batch.

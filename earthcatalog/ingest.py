@@ -28,7 +28,7 @@ import json
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from functools import partial
 
 import obstore
@@ -36,7 +36,6 @@ import obstore
 from earthcatalog import inventory as _inventory
 from earthcatalog.index import Index
 from earthcatalog.journal import BatchJournal, new_run_id, recover_journals
-from earthcatalog.keydiff import iter_new_keys, pair_key
 from earthcatalog.transform import (
     _sort_key,
     fan_out,
@@ -65,6 +64,7 @@ class Ingester:
         fetch_concurrency: int = 256,
         fetch_workers: int = 1,
         delta: bool = False,
+        dedupe: Callable[[Iterator], Iterator] | None = None,
     ) -> None:
         self._store = store
         self._index = index
@@ -80,6 +80,10 @@ class Ingester:
         self._fetch_concurrency = fetch_concurrency
         self._fetch_workers = fetch_workers
         self._delta = delta
+        self._dedupe = dedupe
+        # Resume filter: pairs -> pairs with known keys removed.  Production
+        # runs inject the DuckDB anti-join (diff.anti_join); without one the
+        # run falls back to a set-based filter against the index.
         self._ndjson_prefix = (
             f"{self._warehouse_prefix}/staging/ndjson"
             if self._warehouse_prefix
@@ -137,11 +141,12 @@ class Ingester:
                 yield pair
 
         if not self._skip_fetch:
-            # The index is the resume checkpoint: one read per run, never
-            # per item (keydiff.iter_new_keys streams the inventory against
-            # the sorted hash array in bounded batches).
-            known = self._index.known_key_hashes()
-            new_pairs = iter_new_keys(_counted(), known)
+            # The index is the resume checkpoint: it is consulted once per
+            # pair-stream, never per item.  Production injects the DuckDB
+            # anti-join (diff.anti_join); the fallback set-filter is exact
+            # but loads the index into RAM — tests and small runs only.
+            dedupe = self._dedupe or self._set_dedupe()
+            new_pairs = dedupe(_counted())
             if self._fetch_workers > 1:
                 # Daily-path bounded fetch pool: one batch is fully fetched
                 # before it is flushed, so batch semantics (and the crash
@@ -153,7 +158,7 @@ class Ingester:
                     if not chunk:
                         break
                     seq = (
-                        journal.start_batch([pair_key(b, k) for b, k in chunk])
+                        journal.start_batch([f"s3://{b}/{k}" for b, k in chunk])
                         if journal is not None
                         else None
                     )
@@ -191,6 +196,17 @@ class Ingester:
         if recovery["journals"]:
             summary["recovery"] = recovery
         return summary
+
+    def _set_dedupe(self) -> Callable[[Iterator], Iterator]:
+        """Fallback resume filter: set membership against the whole index."""
+        known = self._index.known_source_keys()
+
+        def _filter(pairs: Iterator) -> Iterator:
+            for bucket, key in pairs:
+                if f"s3://{bucket}/{key}" not in known:
+                    yield bucket, key
+
+        return _filter
 
     def _discover_staged_buckets(self) -> set[tuple[str, str]]:
         """List every (cell, year) bucket that has staged NDJSON files."""
@@ -345,11 +361,11 @@ class DaskIngester(Ingester):
         whose keys are all known vanishes entirely; shard specs stream at
         the head (cheap parquet reads) and ship as plain pair lists.
         """
-        known = self._index.known_key_hashes()
+        dedupe = self._dedupe or self._set_dedupe()
         shipped: list = []
         for shard in inventory:
             pairs = shard.iter_pairs() if hasattr(shard, "iter_pairs") else iter(shard)
-            kept = list(iter_new_keys(pairs, known))
+            kept = list(dedupe(pairs))
             if kept:
                 shipped.append(kept)
         return shipped
