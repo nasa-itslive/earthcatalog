@@ -8,9 +8,11 @@ name: Daily Catalog Update
 #              unknown STAC items with a bounded pool, commits, and writes
 #              {warehouse}/_last_run.json (uploaded as an artifact).
 #
-# The `concurrency` group is the primary single-writer guard (the S3Lock is
-# advisory backup).  DISABLED (workflow_dispatch only) until the AWS
-# credentials secrets are injected.  No schedule yet.
+# Every write path (warehouse, catalog db, lock, diffs) is a dispatch input;
+# the defaults are the refactoring/ SCRATCH area.  Flipping the defaults to
+# the production catalog paths and adding a schedule is a separate, explicit
+# decision.  The `concurrency` group is the single-writer guard.  Dispatch
+# only — no schedule yet.
 
 on:
   workflow_dispatch:
@@ -23,6 +25,30 @@ on:
         description: "Previous inventory manifest.json (defaults to day before)"
         required: false
         default: ""
+      warehouse:
+        description: "Warehouse root (write target)"
+        required: false
+        default: "s3://its-live-data/test-space/stac/refactoring/warehouse"
+      catalog_key:
+        description: "Object key the run's earthcatalog.db is uploaded to"
+        required: false
+        default: "test-space/stac/refactoring/warehouse/earthcatalog.db"
+      lock_key:
+        description: "Object key for the advisory lock file"
+        required: false
+        default: "test-space/stac/refactoring/.lock"
+      diffs_prefix:
+        description: "Where the diff parquet is written"
+        required: false
+        default: "s3://its-live-data/test-space/stac/refactoring/diffs"
+      dry_run:
+        description: "Count only — no warehouse writes at all"
+        required: false
+        default: "false"
+      limit:
+        description: "Cap the number of items ingested (empty = no cap)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -32,13 +58,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-west-2
+  AWS_REGION:        us-west-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  WAREHOUSE:       s3://its-live-data/test-space/stac/catalog/warehouse
-  CATALOG_KEY:     test-space/stac/catalog/earthcatalog.db
-  DIFFS_PREFIX:    s3://its-live-data/test-space/stac/catalog/diffs
-  INVENTORY_BASE:  s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
+  WAREHOUSE:         ${{ github.event.inputs.warehouse || 's3://its-live-data/test-space/stac/refactoring/warehouse' }}
+  CATALOG_KEY:       ${{ github.event.inputs.catalog_key || 'test-space/stac/refactoring/warehouse/earthcatalog.db' }}
+  LOCK_KEY:          ${{ github.event.inputs.lock_key || 'test-space/stac/refactoring/.lock' }}
+  DIFFS_PREFIX:      ${{ github.event.inputs.diffs_prefix || 's3://its-live-data/test-space/stac/refactoring/diffs' }}
+  DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
+  LIMIT:             ${{ github.event.inputs.limit }}
+  INVENTORY_BASE:    s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
 
 jobs:
   daily:
@@ -83,14 +112,20 @@ jobs:
 
       - name: Ingest the diff
         run: |
+          ARGS=""
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "$LIMIT" ]; then ARGS="$ARGS --limit $LIMIT"; fi
           uv run earthcatalog ingest \
             --diff          "${{ steps.days.outputs.diff_out }}" \
             --catalog       /tmp/earthcatalog.db \
-            --warehouse     ${{ env.WAREHOUSE }} \
+            --warehouse     "$WAREHOUSE" \
+            --catalog-key   "$CATALOG_KEY" \
+            --lock-key      "$LOCK_KEY" \
             --mode          delta \
             --scheduler     synchronous \
             --fetch-workers 16 \
-            --chunk-size    10000
+            --chunk-size    10000 \
+            $ARGS
 
       - name: Download run summary
         if: always()
@@ -108,6 +143,8 @@ jobs:
         if: always()
         run: |
           echo "### Daily Update" >> "$GITHUB_STEP_SUMMARY"
+          echo "Warehouse: \`${WAREHOUSE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: \`${DRY_RUN}\`  Limit: \`${LIMIT:-none}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Current: \`${{ steps.days.outputs.current }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Previous: \`${{ steps.days.outputs.previous }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Diff: \`${{ steps.days.outputs.diff_out }}\`" >> "$GITHUB_STEP_SUMMARY"
