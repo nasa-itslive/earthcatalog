@@ -42,6 +42,8 @@ ITEMS = [
         },
         "properties": {
             "datetime": f"202{i % 4 + 1}-0{i % 9 + 1}-15T00:00:00Z",
+            "start_datetime": f"202{i % 4 + 1}-01-01T00:00:00Z",
+            "end_datetime": f"202{i % 4 + 1}-12-31T23:59:59Z",
             "platform": "NISAR",
         },
         "links": [],

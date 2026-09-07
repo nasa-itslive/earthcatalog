@@ -317,7 +317,12 @@ def _build_multiyear_warehouse(tmp_path, years):
                     "type": "Polygon",
                     "coordinates": [[[-50, 65], [-48, 65], [-48, 68], [-50, 68], [-50, 65]]],
                 },
-                "properties": {"datetime": f"{year}-06-15T00:00:00Z", "platform": "NISAR"},
+                "properties": {
+                    "datetime": f"{year}-06-15T00:00:00Z",
+                    "start_datetime": f"{year}-01-01T00:00:00Z",
+                    "end_datetime": f"{year}-12-31T23:59:59Z",
+                    "platform": "NISAR",
+                },
                 "links": [],
                 "assets": {},
             }

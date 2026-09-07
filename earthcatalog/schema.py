@@ -7,10 +7,11 @@ on lifecycle and the EarthCatalog facade.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.transforms import IdentityTransform, YearTransform
+from pyiceberg.transforms import DayTransform, IdentityTransform, MonthTransform, YearTransform
 from pyiceberg.types import (
     BinaryType,
     DoubleType,
@@ -31,9 +32,55 @@ PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
 PROP_INDEX_PATH = "earthcatalog.index_path"
 PROP_HASH_INDEX_PATH = "earthcatalog.hash_index_path"
 
+# The warehouse layout is schema-driven: grid type, grid level, tile id and
+# the temporal bin all come from the catalog configuration.
+#
+#   current (v2):  grid=h3/level=1/tile=810fbffffffffff/year=2025/part_000000.parquet
+#                  grid=lat_lon/level=2/tile=…/month=2026-03/…
+#                  grid=s2/level=4/tile=…/day=2026-03-05/…
+#   legacy (v1):   grid_partition=810fbffffffffff/year=2025/part_xxx.parquet
+#
+# Both layouts remain readable everywhere (gc / rebuild / discovery parse
+# either); new data is always written in the v2 layout.
 _HIVE_RE = re.compile(
     r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
 )
+_HIVE_RE_V2 = re.compile(
+    r"grid=(?P<grid>[^/]+)/level=(?P<level>[^/]+)/tile=(?P<tile>[^/]+)/"
+    r"year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+)
+
+TIME_BINS = ("year", "month", "day")
+
+_PROP_BY_BIN = {"year": "year", "month": "month", "day": "day"}
+_TRANSFORM_BY_BIN: dict[str, Any] = {
+    "year": lambda: YearTransform(),
+    "month": lambda: MonthTransform(),
+    "day": lambda: DayTransform(),
+}
+
+
+def partition_prefix(
+    warehouse_prefix: str,
+    grid: str,
+    level: str,
+    tile: str,
+    time_bin: str,
+    bin_value: str,
+) -> str:
+    """Hive prefix for one tile/temporal-bin partition, schema-driven:
+
+    ``{warehouse}/grid={grid}/level={level}/tile={tile}/{time_bin}={value}/``
+
+    *time_bin* is ``"year"``, ``"month"`` or ``"day"``; *bin_value* is the
+    formatted value (``2025``, ``2026-03``, ``2026-03-05``).
+    """
+    if time_bin not in TIME_BINS:
+        raise ValueError(f"unknown time bin: {time_bin!r}")
+    return (
+        f"{warehouse_prefix.rstrip('/')}/grid={grid}/level={level}/"
+        f"tile={tile}/{time_bin}={bin_value}/"
+    )
 
 ICEBERG_SCHEMA = Schema(
     NestedField(1, "id", StringType(), required=False),
@@ -66,7 +113,25 @@ ICEBERG_SCHEMA = Schema(
     NestedField(28, "bbox", StringType(), required=False),
 )
 
-PARTITION_SPEC = PartitionSpec(
-    PartitionField(source_id=2, field_id=100, transform=IdentityTransform(), name="grid_partition"),
-    PartitionField(source_id=4, field_id=101, transform=YearTransform(), name="year"),
-)
+def build_partition_spec(time_bin: str = "year") -> PartitionSpec:
+    """Partition spec for a temporal binning: identity on ``grid_partition``
+    plus a temporal transform (Year/Month/Day) on ``datetime``.  The
+    transform field is named after the bin (``year`` / ``month`` / ``day``).
+    """
+    if time_bin not in TIME_BINS:
+        raise ValueError(f"unknown time bin: {time_bin!r}")
+    return PartitionSpec(
+        PartitionField(
+            source_id=2, field_id=100, transform=IdentityTransform(), name="grid_partition"
+        ),
+        PartitionField(
+            source_id=4,
+            field_id=101,
+            transform=_TRANSFORM_BY_BIN[time_bin](),
+            name=time_bin,
+        ),
+    )
+
+
+PARTITION_SPEC = build_partition_spec("year")
+# Legacy alias — new code passes the bin explicitly (see build_partition_spec).

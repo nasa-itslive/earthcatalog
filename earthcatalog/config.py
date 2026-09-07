@@ -45,6 +45,25 @@ class GridConfig:
     resolution: int | None = None  # H3 / S2 resolution level
     boundaries_path: str | None = None  # GeoJSON partitioner: path to boundaries file
     id_field: str | None = None  # GeoJSON partitioner: property to use as key
+    time_bin: str = "year"  # "year" | "month" | "day" — temporal binning
+
+
+@dataclass
+class TemporalConfig:
+    """Temporal binning — a catalog-level choice, like the spatial grid.
+
+    ``bin`` selects how items are partitioned over time and what the hive
+    path looks like:
+
+    * ``"year"``  (default) → ``…/year=2025/…``,  bin value ``2025``
+    * ``"month"``           → ``…/month=2026-03/…``, bin value ``2026-03``
+    * ``"day"``             → ``…/day=2026-03-05/…``, bin value ``2026-03-05``
+
+    Items whose observation window spans bin boundaries are materialized
+    into every bin they overlap.
+    """
+
+    bin: str = "year"
 
 
 @dataclass

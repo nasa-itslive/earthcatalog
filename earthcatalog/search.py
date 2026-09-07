@@ -462,19 +462,23 @@ def _format_bytes(n: int) -> str:
 
 
 def _item_in_datetime_range(item: dict, start: str | None, end: str | None) -> bool:
-    """Check if a STAC item's ``properties.datetime`` falls within *start*..*end*.
+    """Check if a STAC item's temporal extent overlaps *start*..*end*.
 
-    Both bounds are inclusive.  ``None`` means unbounded on that side.
-    If both are ``None`` (no temporal filter), all items pass.
+    Items may carry a range (``start_datetime`` / ``end_datetime``, e.g.
+    velocity pairs that span a year boundary) or a single ``datetime``.
+    Overlap semantics: the item matches when its extent intersects the query
+    interval.  Unbounded query sides match everything.
     """
     if start is None and end is None:
         return True
-    dt = item.get("properties", {}).get("datetime")
-    if dt is None:
+    props = item.get("properties", {})
+    item_start = props.get("start_datetime") or props.get("datetime")
+    item_end = props.get("end_datetime") or props.get("datetime")
+    if item_start is None and item_end is None:
         return False
-    if start is not None and dt < start:
+    if start is not None and (item_end or item_start) < start:
         return False
-    if end is not None and dt > end:
+    if end is not None and (item_start or item_end) > end:
         return False
     return True
 
@@ -555,9 +559,9 @@ def build_query(
     if geom is not None:
         conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
     if start_dt is not None:
-        conditions.append(f"datetime >= '{start_dt}'")
+        conditions.append(f"end_datetime >= '{start_dt}'")
     if end_dt is not None:
-        conditions.append(f"datetime <= '{end_dt}'")
+        conditions.append(f"start_datetime <= '{end_dt}'")
     if raw_filter is not None:
         conditions.append(_cql2_to_sql(raw_filter))
     where = " AND ".join(conditions) if conditions else "TRUE"

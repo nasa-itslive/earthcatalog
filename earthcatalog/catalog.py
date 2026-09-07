@@ -29,7 +29,7 @@ from .schema import (
     FULL_NAME,
     ICEBERG_SCHEMA,
     NAMESPACE,
-    PARTITION_SPEC,
+    PARTITION_SPEC,  # noqa: F401  (re-export: default year spec)
     PROP_GRID_BOUNDARIES_PATH,
     PROP_GRID_ID_FIELD,
     PROP_GRID_RESOLUTION,
@@ -37,6 +37,7 @@ from .schema import (
     PROP_HASH_INDEX_PATH,  # noqa: F401  (re-export: consumers import from catalog)
     PROP_INDEX_PATH,
     TABLE_NAME,  # noqa: F401  (re-export: consumers import from catalog)
+    build_partition_spec,
 )
 
 HIVE_RE = _HIVE_RE
@@ -140,9 +141,25 @@ class CatalogInfo:
         geom,
         start_datetime: str | datetime | None = None,
         end_datetime: str | datetime | None = None,
+        year_lookback: int = 2,
     ) -> list[str]:
-        """Return Parquet file paths for partitions intersecting *geom*."""
-        from pyiceberg.expressions import And, GreaterThanOrEqual, In, LessThanOrEqual
+        """Return Parquet file paths for partitions overlapping *geom* and the
+        temporal range.
+
+        Overlap semantics: items carry a temporal extent
+        (``start_datetime``..``end_datetime`` — velocity pairs span ~500
+        days and routinely cross year boundaries), so a partition is
+        relevant when the item's *start* is not after the query end and its
+        *end* is not before the query start.  The partition-year window is
+        widened by *year_lookback* on the start side to reach midpoints that
+        fall before the query interval.
+        """
+        from pyiceberg.expressions import (
+            And,
+            GreaterThanOrEqual,
+            In,
+            LessThanOrEqual,
+        )
 
         cells = self.cells_for_geometry(geom)
         if not cells:
@@ -152,13 +169,17 @@ class CatalogInfo:
         # constructors, not these unbound ones (runtime accepts a plain
         # string term + python values) — hence the narrow ignores here.
         expr = In("grid_partition", cells)  # type: ignore[misc,arg-type,call-arg]
-        if start_datetime is not None:
-            expr = And(expr, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))  # type: ignore[misc,arg-type,call-arg,assignment]
-        if end_datetime is not None:
-            expr = And(expr, LessThanOrEqual("datetime", _parse_dt(end_datetime)))  # type: ignore[misc,arg-type,call-arg,assignment]
+        q_end = _parse_dt(end_datetime) if end_datetime is not None else None
+        q_start = _parse_dt(start_datetime) if start_datetime is not None else None
+        if q_end is not None:
+            # Item starts before the query ends.
+            expr = And(expr, LessThanOrEqual("start_datetime", q_end))  # type: ignore[misc,arg-type,call-arg,assignment]
+        if q_start is not None:
+            # Item ends after the query starts.
+            expr = And(expr, GreaterThanOrEqual("end_datetime", q_start))  # type: ignore[misc,arg-type,call-arg,assignment]
 
-        start_year = _parse_dt(start_datetime).year if start_datetime is not None else None
-        end_year = _parse_dt(end_datetime).year if end_datetime is not None else None
+        start_year = q_start.year - year_lookback if q_start is not None else None
+        end_year = q_end.year + 1 if q_end is not None else None
 
         paths = []
         for task in table.scan(row_filter=expr).plan_files():
@@ -366,6 +387,8 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> Table:
     if warehouse:
         props[PROP_INDEX_PATH] = f"{warehouse.rstrip('/')}_index.parquet"
 
+    time_bin = grid_config.time_bin if grid_config is not None else "year"
+
     try:
         table = catalog.load_table(FULL_NAME)
         missing = {k: v for k, v in props.items() if k not in table.properties}
@@ -381,7 +404,7 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> Table:
         return catalog.create_table(
             identifier=FULL_NAME,
             schema=ICEBERG_SCHEMA,
-            partition_spec=PARTITION_SPEC,
+            partition_spec=build_partition_spec(time_bin),
             properties=props,
         )
 

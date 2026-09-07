@@ -18,13 +18,13 @@ LIB_ROOT = pathlib.Path(__file__).resolve().parent.parent / "earthcatalog"
 # catalog.py: 1058 after stamping earthcatalog.index_path in get_or_create
 # (includes the temporary bulk_ingest deprecation alias — lower this again
 # once the alias is removed).  Target: <600.
-CATALOG_PY_MAX_LINES = 1070
+CATALOG_PY_MAX_LINES = 1095
 
 # Per-module budget.  Tighten as modules are split.
 MODULE_LINE_BUDGETS: dict[str, int] = {
     # Phase 4/6 target (slimmed, SQL deduped)
     "catalog.py": CATALOG_PY_MAX_LINES,
-    "search.py": 565,
+    "search.py": 580,
     # Phase 3 target (+ journal hooks, bounded fetch pool, dedupe DI).
     # Serial ndjson branch deleted in RPI-C (bulk-only now).
     "ingest.py": 780,

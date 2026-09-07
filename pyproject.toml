@@ -91,6 +91,7 @@ python_version = "3.12"
 [[tool.mypy.overrides]]
 # Third-party libs without py.typed markers — runtime-verified, stub-less.
 module = [
+  "pyarrow.*",
   "shapely.*",
   "shapely",
   "shapely.geometry",
