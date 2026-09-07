@@ -114,7 +114,9 @@ class Ingester:
         touched: set[tuple[str, str]] = set()
 
         # Close any crash window left by a previous run (no-op list when
-        # there are no journals), then journal this run's own batches.
+        # there are no journals), then journal this run's own batches.  The
+        # journal is a direct-stage mechanism: ndjson's staged buckets are
+        # re-compactable on their own, so ndjson runs journal nothing.
         recovery = recover_journals(
             self._store,
             self._warehouse_prefix,
@@ -122,7 +124,11 @@ class Ingester:
             self._table,
             full_path=self._full_path,
         )
-        journal = BatchJournal(self._store, self._warehouse_prefix, new_run_id())
+        journal = (
+            BatchJournal(self._store, self._warehouse_prefix, new_run_id())
+            if self._stage == "direct"
+            else None
+        )
 
         def _counted():
             nonlocal considered
@@ -146,7 +152,11 @@ class Ingester:
                     chunk = list(islice(new_pairs, self._batch_size))
                     if not chunk:
                         break
-                    seq = journal.start_batch([pair_key(b, k) for b, k in chunk])
+                    seq = (
+                        journal.start_batch([pair_key(b, k) for b, k in chunk])
+                        if journal is not None
+                        else None
+                    )
                     pending = _fetch_many(chunk, self._fetch_fn, self._fetch_workers)
                     total += len(pending)
                     if pending:
@@ -172,7 +182,12 @@ class Ingester:
                 touched = self._discover_staged_buckets()
             rows += self._compact_all(touched)
 
-        summary = {"items": total, "rows": rows, "considered": considered}
+        summary = {
+            "items": total,
+            "rows": rows,
+            "considered": considered,
+            "stage": self._stage,
+        }
         if recovery["journals"]:
             summary["recovery"] = recovery
         return summary

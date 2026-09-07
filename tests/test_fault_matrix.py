@@ -309,3 +309,47 @@ class TestFaultMatrix:
         summary = _run(keys, store, index, table, fetch_calls=calls)
         assert calls["outer"]["n"] == 4  # nothing had committed
         _assert_converged(store, index, table, keys, allow_orphans=1)
+
+
+class TestJournalStageScope:
+    def test_ndjson_run_creates_no_journal(self):
+        """The journal is a direct-stage mechanism: an ndjson run must not
+        leave one behind for the next run's recovery to clean."""
+        from earthcatalog.journal import list_journals
+
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+        table = _FakeTable()
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="ndjson",
+            warehouse_prefix="warehouse",
+            warehouse_root=WAREHOUSE_ROOT,
+            batch_size=4,
+            fetch_workers=4,  # pooled path starts journals pre-fetch in direct
+        )
+        summary = ing.run(_inventory(["a.stac.json", "b.stac.json"]))
+        assert summary["stage"] == "ndjson"
+        assert list_journals(store, "warehouse") == []
+
+    def test_direct_run_leaves_no_journal_after_success(self):
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+        table = _FakeTable()
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=table,
+            fetch_fn=lambda b, k: _make_item(k),
+            stage="direct",
+            warehouse_prefix="warehouse",
+            warehouse_root=WAREHOUSE_ROOT,
+            batch_size=4,
+            fetch_workers=4,
+        )
+        summary = ing.run(_inventory(["a.stac.json", "b.stac.json"]))
+        assert summary["stage"] == "direct"
+        assert list_journals(store, "warehouse") == []

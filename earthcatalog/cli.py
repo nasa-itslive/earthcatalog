@@ -117,6 +117,11 @@ def ingest(
         "--fetch-workers",
         help="Bounded fetch pool for the serial (daily) path.",
     ),
+    stage: str = typer.Option(
+        "direct",
+        "--stage",
+        help="'direct' (daily default, journaled) or 'ndjson' (PGSTAC interchange).",
+    ),
     grid: str = typer.Option(
         "h3",
         "--grid",
@@ -198,6 +203,7 @@ def ingest(
         scatter_only=scatter_only,
         fetch_concurrency=fetch_concurrency,
         fetch_workers=fetch_workers,
+        stage=stage,
         grid=grid_cfg,
     )
     if result and result.get("dry_run"):
