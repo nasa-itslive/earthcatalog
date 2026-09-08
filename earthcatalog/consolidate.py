@@ -167,18 +167,38 @@ def consolidate_partition(
         try:
             raw = bytes(obstore.get(store, _key(uri, warehouse_prefix)).bytes())
         except FileNotFoundError:
-            # A previous run committed the delete but crashed before its db
-            # upload — the metadata still lists the object.  Its rows only
-            # survive if this run's predecessor already merged them; count
-            # what actually exists and let the verification below speak.
+            # A previous run may have gotten partway through this partition
+            # before dying; what matters is whether its merged output exists.
             already_missing += 1
             continue
         tables.append(pq.ParquetFile(io.BytesIO(raw)).read())
 
+    # Missing files are the signature of a crash window: the previous run's
+    # merged output — which holds MORE than the surviving files — may sit in
+    # the directory, unregistered.  If so, adopt it; never merge from fewer
+    # rows when the fuller file is right there.
+    orphan_key: str | None = None
+    if already_missing:
+        listed = {
+            obj["path"]
+            for listing in obstore.list(store, prefix=dir_key)
+            for obj in listing
+            if obj["path"].endswith(".parquet")
+        }
+        candidates = sorted(listed - {_key(u, warehouse_prefix) for u in plan.files})
+        orphan_key = candidates[0] if candidates else None
+
     new_uri: str | None = None
     new_key: str | None = None
     rows = 0
-    if tables:
+    removed_dupes = 0
+    if orphan_key:
+        new_key = orphan_key
+        new_uri = plan.files[0].rsplit("/", 1)[0] + "/" + orphan_key.rsplit("/", 1)[1]
+        rows = pq.ParquetFile(
+            io.BytesIO(bytes(obstore.get(store, new_key).bytes()))
+        ).metadata.num_rows
+    elif tables:
         merged = pa.concat_tables(tables)
         if dedupe and merged.num_rows:
             seen: set[str] = set()
@@ -199,23 +219,9 @@ def consolidate_partition(
             obstore.delete(store, new_key)
             raise RuntimeError(f"consolidation verification failed for {dir_key}")
         new_uri = plan.files[0].rsplit("/", 1)[0] + f"/part_{seq:06d}.parquet"
-    else:
-        # Every listed object is already gone — the previous run merged and
-        # deleted but never uploaded its db.  Adopt the orphaned output if
-        # it is there; otherwise this is a pure phantom cleanup.
-        listed = {
-            obj["path"]
-            for listing in obstore.list(store, prefix=dir_key)
-            for obj in listing
-            if obj["path"].endswith(".parquet")
-        }
-        orphans = sorted(listed - {_key(u, warehouse_prefix) for u in plan.files})
-        if orphans:
-            new_key = orphans[0]
-            new_uri = plan.files[0].rsplit("/", 1)[0] + "/" + new_key.rsplit("/", 1)[1]
-            rows = pq.ParquetFile(
-                io.BytesIO(bytes(obstore.get(store, new_key).bytes()))
-            ).metadata.num_rows
+        removed_dupes = sum(t.num_rows for t in tables) - rows
+    # else: every listed object is gone and no orphan exists — a pure
+    # phantom cleanup (predicate-delete only, nothing appended).
 
     # The delete producer must be created (and its parent snapshot pinned)
     # before the append is staged, so it computes against the old manifests.
@@ -246,7 +252,7 @@ def consolidate_partition(
         "files_before": len(plan.files),
         "files_after": 1 if new_uri else 0,
         "rows": rows,
-        "rows_removed_dupes": sum(t.num_rows for t in tables) - rows,
+        "rows_removed_dupes": removed_dupes,
         "old_files_deleted": removed,
         "already_missing": already_missing,
         "new_file": new_key,

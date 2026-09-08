@@ -176,6 +176,41 @@ def test_consolidate_adopts_orphaned_output(warehouse):
     assert _table_ids(table) == [f"item-{i}.stac.json" for i in range(5)]
 
 
+def test_consolidate_prefers_orphan_over_survivor_merge(warehouse):
+    """The exact production incident: a crashed run left its fuller merged
+    output on S3 plus SOME old objects deleted.  Consolidation must adopt
+    the orphan (all rows), never merge just the survivors (fewer rows)."""
+    store, table, _ = warehouse
+    from earthcatalog.consolidate import _key
+
+    plans = plan(table, min_files=3)
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def read(uri):
+        return pq.ParquetFile(io.BytesIO(bytes(store.get(_key(uri, "warehouse")).bytes()))).read()
+
+    merged = pa.concat_tables([read(u) for u in plans[0].files])
+    buf = io.BytesIO()
+    pq.write_table(merged, buf, compression="zstd")
+    orphan_key = "warehouse/grid=h3/level=2/tile=cellA/year=2020/part_000009.parquet"
+    # Crash signature: SOME old objects deleted, orphan written, db not uploaded.
+    for u in plans[0].files[:2]:
+        store.delete(_key(u, "warehouse"))
+    store.put(orphan_key, buf.getvalue())
+
+    reports = run(store, table, "warehouse", min_files=3)
+
+    assert reports[0]["already_missing"] == 2
+    assert reports[0]["new_file"] == orphan_key
+    assert reports[0]["rows"] == 5  # the orphan's full row count
+    assert table.scan().count() == 5
+    assert _table_ids(table) == [f"item-{i}.stac.json" for i in range(5)]
+    assert _part_file_count(store) == 1
+
+
 def test_dry_run_writes_nothing(warehouse):
     store, table, _ = warehouse
     reports = run(store, table, "warehouse", min_files=3, dry_run=True)
