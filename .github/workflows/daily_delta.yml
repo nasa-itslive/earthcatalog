@@ -9,12 +9,14 @@ name: Daily Catalog Update
 #              {warehouse}/_last_run.json (uploaded as an artifact).
 #
 # Every write path (warehouse, catalog db, lock, diffs) is a dispatch input;
-# the defaults are the refactoring/ SCRATCH area.  Flipping the defaults to
-# the production catalog paths and adding a schedule is a separate, explicit
-# decision.  The `concurrency` group is the single-writer guard.  Dispatch
-# only — no schedule yet.
+# the defaults are the PRODUCTION catalog paths.  Override them to point a
+# run at the refactoring/ scratch pad instead.  The `concurrency` group is
+# the single-writer guard.  Scheduled daily at 14:00 UTC (inventory manifests
+# are stamped T01-00Z, so 13h of buffer guarantees yesterday's manifest).
 
 on:
+  schedule:
+    - cron: "0 14 * * *"
   workflow_dispatch:
     inputs:
       current_manifest:
@@ -28,19 +30,19 @@ on:
       warehouse:
         description: "Warehouse root (write target)"
         required: false
-        default: "s3://its-live-data/test-space/stac/refactoring/warehouse"
+        default: "s3://its-live-data/test-space/stac/catalog/warehouse"
       catalog_key:
         description: "Object key the run's earthcatalog.db is uploaded to"
         required: false
-        default: "test-space/stac/refactoring/warehouse/earthcatalog.db"
+        default: "test-space/stac/catalog/earthcatalog.db"
       lock_key:
         description: "Object key for the advisory lock file"
         required: false
-        default: "test-space/stac/refactoring/.lock"
+        default: "test-space/stac/catalog/.lock"
       diffs_prefix:
         description: "Where the diff parquet is written"
         required: false
-        default: "s3://its-live-data/test-space/stac/refactoring/diffs"
+        default: "s3://its-live-data/test-space/stac/catalog/diffs"
       dry_run:
         description: "Count only — no warehouse writes at all"
         required: false
@@ -61,10 +63,10 @@ env:
   AWS_REGION:        us-west-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  WAREHOUSE:         ${{ github.event.inputs.warehouse || 's3://its-live-data/test-space/stac/refactoring/warehouse' }}
-  CATALOG_KEY:       ${{ github.event.inputs.catalog_key || 'test-space/stac/refactoring/warehouse/earthcatalog.db' }}
-  LOCK_KEY:          ${{ github.event.inputs.lock_key || 'test-space/stac/refactoring/.lock' }}
-  DIFFS_PREFIX:      ${{ github.event.inputs.diffs_prefix || 's3://its-live-data/test-space/stac/refactoring/diffs' }}
+  WAREHOUSE:         ${{ github.event.inputs.warehouse || 's3://its-live-data/test-space/stac/catalog/warehouse' }}
+  CATALOG_KEY:       ${{ github.event.inputs.catalog_key || 'test-space/stac/catalog/earthcatalog.db' }}
+  LOCK_KEY:          ${{ github.event.inputs.lock_key || 'test-space/stac/catalog/.lock' }}
+  DIFFS_PREFIX:      ${{ github.event.inputs.diffs_prefix || 's3://its-live-data/test-space/stac/catalog/diffs' }}
   DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
   LIMIT:             ${{ github.event.inputs.limit }}
   INVENTORY_BASE:    s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory

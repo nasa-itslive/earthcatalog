@@ -66,11 +66,18 @@ download before open, unconditionally; the pipeline only fetches when no
 local db exists.  The same bug would have forked the production catalog db
 during the catch-up — fix first, then catch up.
 
-**Next (needs explicit GO — writes outside the scratch pad):** run the
-catch-up against the real catalog (`catchup-vs-catalog-20260906.parquet`,
-394,964 keys, ~1.5–2 h), then flip `daily_delta.yml` defaults from
-`refactoring/` to `catalog/` and decide on a schedule.  Gap grows ~27k/day
-while the real catalog idles.
+**Catch-up — DONE and verified (2026-09-08).** All 394,964 keys ingested into
+the real catalog in 8 durable 50k chunks (4h11m, per-batch catalog-db
+uploads).  Final dry-run: `considered 394,964 · new 0`.  Catalog: 43,245,133
+unique items (exact), Iceberg 68,067,891 rows / 11,822 files.  Pre-catch-up
+db backed up at `refactoring/backups/earthcatalog-pre-catchup-20260907.db`.
+
+**Production flip — applied (2026-09-08, user GO).** `daily_delta.yml`
+defaults now target `catalog/` (warehouse, catalog db, lock, diffs) and run
+on a daily 14:00 UTC schedule (manifests are stamped T01-00Z; 13h buffer).
+The schedule takes effect once this branch merges to main.  Remaining
+non-blockers: consolidate.py v2-layout refresh + GC real-data deletion
+validation (both dry-run first).
 
 ## What landed (this cycle)
 
