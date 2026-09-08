@@ -41,7 +41,13 @@ def _list_warehouse_keys(
         for obj in batch:
             k: str = obj["path"]
             if k.endswith(".parquet") and (hive_re_v2.search(k) or hive_re_v1.search(k)):
-                paths.append(f"{root}/{k}")
+                # obstore keys are bucket-relative on S3 (they already include
+                # the warehouse path); joining the full root would double it.
+                if warehouse_root.startswith("s3://"):
+                    bucket = warehouse_root.removeprefix("s3://").split("/", 1)[0]
+                    paths.append(f"s3://{bucket}/{k}")
+                else:
+                    paths.append(f"{root}/{k}")
     return paths
 
 
