@@ -9,7 +9,35 @@ from earthcatalog.search import (
     _extract_datetime_range,
     _extract_geometry,
     _FileSearchEngine,
+    build_query,
 )
+
+
+class TestBuildQuery:
+    def test_where_true_when_no_filters(self):
+        sql = build_query(["s3://b/p1.parquet"])
+        assert sql == "SELECT * FROM read_parquet(['s3://b/p1.parquet']) WHERE TRUE"
+
+    def test_geometry_filter(self):
+        from shapely.geometry import Point
+
+        sql = build_query(["p.parquet"], geom=Point(0, 0))
+        assert "ST_Intersects(geometry, ST_GeomFromText(" in sql
+
+    def test_datetime_filters(self):
+        sql = build_query(["p.parquet"], start_dt="2020-01-01", end_dt="2020-12-31")
+        assert "datetime >= '2020-01-01'" in sql
+        assert "datetime <= '2020-12-31'" in sql
+
+    def test_cql2_filter(self):
+        import cql2
+
+        sql = build_query(["p.parquet"], raw_filter=cql2.parse_text("id = 'x'").to_json())
+        assert "id" in sql
+
+    def test_select_column_subset(self):
+        sql = build_query(["p.parquet"], select="id, assets")
+        assert sql.startswith("SELECT id, assets FROM read_parquet(")
 
 
 class TestExtractGeometry:

@@ -1,66 +1,50 @@
 # Configuration
 
-earthcatalog can be configured with a YAML file passed via `--config` or
-with individual CLI flags.  A config file is recommended for reproducibility.
+earthcatalog is configured with CLI flags on the `ingest` command (or the
+`IngestConfig` dataclass when called from Python).  There is no YAML config
+file; flags are preferred for reproducibility in CI.
 
 ---
 
-## YAML config file
-
-```yaml
-# config/h3_r1.yaml
-
-catalog:
-  db_path:   /tmp/earthcatalog.db          # local path to the SQLite catalog
-  warehouse: /tmp/earthcatalog_warehouse   # local path to the Parquet warehouse
-
-grid:
-  type:       h3
-  resolution: 1    # H3 resolution (0–15); 1 = production default
-
-ingest:
-  chunk_size:       500    # STAC items per ThreadPoolExecutor batch
-  max_workers:      16     # concurrent S3 fetch threads
-  batch_add_files:  false  # true = one Iceberg snapshot for entire run (backfill)
-```
-
-Pass it with:
+## CLI usage
 
 ```bash
-earthcatalog incremental --config config/h3_r1.yaml --inventory /tmp/delta.csv
+uv run earthcatalog ingest \
+  --inventory s3://bucket/inventory/full.parquet \
+  --warehouse s3://my-bucket/catalog/warehouse \
+  --mode full \
+  --scheduler local \
+  --workers 4 \
+  --chunk-size 100000
 ```
 
----
-
-## Config sections
-
-### `catalog`
-
-| Key | Type | Required | Default | Description |
-|---|---|:---:|---|---|
-| `db_path` | string | yes | — | Local filesystem path to `catalog.db` (SQLite) |
-| `warehouse` | string | yes | — | Local filesystem path to the Parquet warehouse root |
-
-### `grid`
-
-| Key | Type | Required | Default | Description |
-|---|---|:---:|---|---|
-| `type` | `h3` \| `geojson` | yes | — | Partitioner type |
-| `resolution` | int | no | `1` | H3 resolution (0–15).  Only used when `type = h3` |
-| `boundaries_path` | string | no | — | Path to GeoJSON file.  Only used when `type = geojson` |
-| `id_field` | string | no | `"id"` | Feature property to use as partition key for GeoJSON |
-
-### `ingest`
-
-| Key | Type | Required | Default | Description |
-|---|---|:---:|---|---|
-| `chunk_size` | int | no | `500` | Items fetched per batch |
-| `max_workers` | int | no | `8` | Parallel S3 fetch threads |
-| `batch_add_files` | bool | no | `false` | Accumulate all file paths and register in one Iceberg snapshot at the end of the run.  Recommended for backfill. |
+Grid selection for a fresh full build (`--grid h3|s2|utm|geojson`,
+`--resolution`, `--boundaries`, `--id-field`) is passed on the command line.
 
 ---
 
-## H3 resolution guide
+## Ingest flags reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--inventory` | — | S3 Inventory file path (CSV, Parquet, or manifest.json) |
+| `--catalog` | `/tmp/earthcatalog.db` | catalog.db path |
+| `--warehouse` | `s3://its-live-data/test-space/stac/catalog/warehouse` | Warehouse root path |
+| `--mode` | `auto` | `full` \| `delta` \| `auto` (default: `auto`) |
+| `--scheduler` | `synchronous` | Dask scheduler: `synchronous` \| `local` \| `coiled` |
+| `--workers` | `4` | Dask local-cluster worker count |
+| `--limit` | — | Cap on STAC items to ingest |
+| `--chunk-size` | `100000` | Items per fetch chunk |
+| `--skip-fetch` | — | Resume: skip fetch + NDJSON staging, only compact staged NDJSON |
+| `--skip-compact` | — | Only fetch + stage NDJSON; compact later |
+| `--grid` | `h3` | `h3` \| `s2` \| `utm` \| `geojson` (for fresh full builds) |
+| `--resolution` | — | Grid resolution (h3/s2; default: h3=1, s2=2) |
+| `--boundaries` | — | GeoJSON boundaries path (required for `--grid geojson`) |
+| `--id-field` | — | GeoJSON feature property used as the partition key |
+| `--catalog-key` | `EARTHCATALOG_CATALOG_KEY` | Object key for the uploaded catalog.db |
+| `--lock-key` | `EARTHCATALOG_LOCK_KEY` | Object key for the distributed lock file |
+
+Use `uv run earthcatalog ingest --help` for the full list.
 
 | Resolution | Avg. cell area | Global cells | Recommendation |
 |:---:       |:---:           |:---:         |---             |
@@ -120,8 +104,8 @@ its-live-data,path/to/item.stac.json,2026-04-28T01:00:00.000Z
 ### Delta files
 
 Delta parquets use the **same schema** as the full inventory — only the rows
-differ (new/modified items only). Both `ec.ingest()` and `ec.bulk_ingest()`
-read any supported format.
+differ (new/modified items only). `ec.ingest_inventory()` reads any
+supported format.
 
 ### Manifest (AWS S3 Inventory)
 
@@ -162,17 +146,21 @@ For the **public ITS_LIVE bucket** no credentials are needed
 --resolution   H3 resolution (default: 1)
 ```
 
-### `earthcatalog backfill`
+### `earthcatalog ingest`
 
 ```
 --inventory       S3 Inventory file path
 --catalog         catalog.db path
 --warehouse       Warehouse root path
+--mode            full | delta | auto (default: auto)
 --scheduler       dask scheduler: synchronous | local | coiled (default: synchronous)
 --workers         Dask local-cluster worker count (default: 4)
 --limit           Cap on STAC items to ingest
---chunk-size      Items per Dask task (default: 500)
---coiled-n-workers    Coiled cluster size
---coiled-software     Coiled software environment name
---coiled-region       AWS region for Coiled cluster
+--chunk-size      Items per fetch chunk (default: 100000)
+--skip-fetch      Resume: skip fetch + NDJSON staging, only compact staged NDJSON
+--skip-compact    Only fetch + stage NDJSON; compact later
+--grid            h3 | s2 | utm | geojson (for fresh full builds; default: h3)
+--resolution      Grid resolution (h3/s2; default: h3=1, s2=2)
+--boundaries      GeoJSON boundaries path (required for --grid geojson)
+--id-field        GeoJSON feature property used as the partition key
 ```

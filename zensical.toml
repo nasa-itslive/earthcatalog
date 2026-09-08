@@ -84,18 +84,11 @@ Configuration = "configuration.md"
 
 [nav.Pipelines]
 Architecture = "pipelines/architecture.md"
-Incremental = "pipelines/incremental.md"
-Backfill = "pipelines/backfill.md"
-
-[nav.Maintenance]
-Compaction = "maintenance/compact.md"
 
 [nav."API Reference"]
 Overview = "api/index.md"
 Core = "api/core.md"
 Grids = "api/grids.md"
-Pipelines = "api/pipelines.md"
-Maintenance = "api/maintenance.md"
 
 [nav.Operations]
 "Ingest Guide" = "operations/ingest_guide.md"

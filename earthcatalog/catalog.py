@@ -7,95 +7,43 @@ discovery into a single object.
 
 from __future__ import annotations
 
-import io
-import re
-import struct
 from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import obstore
+from obstore.store import ObjectStore
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
-from pyiceberg.partitioning import PartitionField, PartitionSpec
-from pyiceberg.schema import Schema
-from pyiceberg.transforms import IdentityTransform, YearTransform
-from pyiceberg.types import (
-    BinaryType,
-    DoubleType,
-    LongType,
-    NestedField,
-    StringType,
-    TimestamptzType,
-)
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table
 
+    from .ingest_config import IngestConfig
+
 from . import store_config
-
-# Regex for matching hive-style warehouse partition paths.
-_HIVE_RE = re.compile(
-    r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
+from .schema import (
+    _HIVE_RE,
+    FULL_NAME,
+    ICEBERG_SCHEMA,
+    NAMESPACE,
+    PARTITION_SPEC,  # noqa: F401  (re-export: default year spec)
+    PROP_GRID_BOUNDARIES_PATH,
+    PROP_GRID_ID_FIELD,
+    PROP_GRID_RESOLUTION,
+    PROP_GRID_TYPE,
+    PROP_HASH_INDEX_PATH,  # noqa: F401  (re-export: consumers import from catalog)
+    PROP_INDEX_PATH,
+    PROP_TIME_BIN,
+    TABLE_NAME,  # noqa: F401  (re-export: consumers import from catalog)
+    build_partition_spec,
+    layout_of,
+    partition_year,
 )
 
-# ---------------------------------------------------------------------------
-# Iceberg catalog constants
-# ---------------------------------------------------------------------------
-
-NAMESPACE = "earthcatalog"
-TABLE_NAME = "stac_items"
-FULL_NAME = f"{NAMESPACE}.{TABLE_NAME}"
-
-# Iceberg table property keys for grid metadata.
-# Written at table-creation time so downstream readers don't need a priori
-# knowledge of the grid system or resolution used during ingest.
-PROP_GRID_TYPE = "earthcatalog.grid.type"
-PROP_GRID_RESOLUTION = "earthcatalog.grid.resolution"
-PROP_GRID_BOUNDARIES_PATH = "earthcatalog.grid.boundaries_path"
-PROP_GRID_ID_FIELD = "earthcatalog.grid.id_field"
-PROP_HASH_INDEX_PATH = "earthcatalog.hash_index_path"
-
-# PyIceberg schema — matches normalized rustac stac-geoparquet output.
-ICEBERG_SCHEMA = Schema(
-    NestedField(1, "id", StringType(), required=False),
-    NestedField(2, "grid_partition", StringType(), required=False),
-    NestedField(3, "geometry", BinaryType(), required=False),
-    NestedField(4, "datetime", TimestamptzType(), required=False),
-    NestedField(5, "platform", StringType(), required=False),
-    NestedField(6, "percent_valid_pixels", LongType(), required=False),
-    NestedField(7, "date_dt", LongType(), required=False),
-    NestedField(8, "proj:code", StringType(), required=False),
-    NestedField(9, "assets", StringType(), required=False),
-    NestedField(10, "links", StringType(), required=False),
-    NestedField(11, "stac_version", StringType(), required=False),
-    NestedField(12, "type", StringType(), required=False),
-    NestedField(13, "start_datetime", TimestamptzType(), required=False),
-    NestedField(14, "version", StringType(), required=False),
-    NestedField(15, "sat:orbit_state", StringType(), required=False),
-    NestedField(16, "scene_1_id", StringType(), required=False),
-    NestedField(17, "scene_2_id", StringType(), required=False),
-    NestedField(18, "scene_1_frame", StringType(), required=False),
-    NestedField(19, "scene_2_frame", StringType(), required=False),
-    NestedField(20, "mid_datetime", StringType(), required=False),
-    NestedField(21, "created", TimestamptzType(), required=False),
-    NestedField(22, "updated", TimestamptzType(), required=False),
-    NestedField(23, "end_datetime", TimestamptzType(), required=False),
-    NestedField(24, "stac_extensions", StringType(), required=False),
-    NestedField(25, "collection", StringType(), required=False),
-    NestedField(26, "latitude", DoubleType(), required=False),
-    NestedField(27, "longitude", DoubleType(), required=False),
-    NestedField(28, "bbox", StringType(), required=False),
-)
-
-# Partition spec: grid cell (identity) + year of acquisition.
-PARTITION_SPEC = PartitionSpec(
-    PartitionField(source_id=2, field_id=100, transform=IdentityTransform(), name="grid_partition"),
-    PartitionField(source_id=4, field_id=101, transform=YearTransform(), name="year"),
-)
+HIVE_RE = _HIVE_RE
 
 
 # ---------------------------------------------------------------------------
@@ -136,40 +84,13 @@ def _parse_dt(value: str | datetime) -> datetime:
     )
 
 
-def _parquet_row_count_from_store(store, obstore_key: str) -> int:
-    """Read row count from a remote Parquet file's footer only — no full download."""
-    import pyarrow.parquet as pq
-
-    head_result = obstore.head(store, obstore_key)
-    file_size = head_result["size"] if isinstance(head_result, dict) else head_result.size
-
-    suffix = obstore.get_range(store, obstore_key, start=file_size - 8, end=file_size)
-    if hasattr(suffix, "to_bytes"):
-        suffix = suffix.to_bytes()
-    elif not isinstance(suffix, bytes):
-        suffix = bytes(suffix)
-    metadata_len = struct.unpack("<i", suffix[:4])[0]
-
-    footer = obstore.get_range(
-        store,
-        obstore_key,
-        start=file_size - 8 - metadata_len,
-        end=file_size,
-    )
-    if hasattr(footer, "to_bytes"):
-        footer = footer.to_bytes()
-    elif not isinstance(footer, bytes):
-        footer = bytes(footer)
-
-    return pq.ParquetFile(io.BytesIO(footer)).metadata.num_rows
-
-
 def _build_stats_cache(table) -> list[dict]:
     """Aggregate per-(partition, year) stats from Iceberg manifests. No Parquet I/O."""
+    time_bin = table.properties.get(PROP_TIME_BIN, "year")
     agg: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0, 0])
     for task in table.scan().plan_files():
         f = task.file
-        key = (f.partition[0], f.partition[1] + 1970)
+        key = (f.partition[0], partition_year(time_bin, f.partition[1]))
         agg[key][0] += f.record_count
         agg[key][1] += 1
         agg[key][2] += f.file_size_in_bytes
@@ -224,26 +145,50 @@ class CatalogInfo:
         geom,
         start_datetime: str | datetime | None = None,
         end_datetime: str | datetime | None = None,
+        year_lookback: int = 2,
     ) -> list[str]:
-        """Return Parquet file paths for partitions intersecting *geom*."""
-        from pyiceberg.expressions import And, GreaterThanOrEqual, In, LessThanOrEqual
+        """Return Parquet file paths for partitions overlapping *geom* and the
+        temporal range.
+
+        Overlap semantics: items carry a temporal extent
+        (``start_datetime``..``end_datetime`` — velocity pairs span ~500
+        days and routinely cross year boundaries), so a partition is
+        relevant when the item's *start* is not after the query end and its
+        *end* is not before the query start.  The partition-year window is
+        widened by *year_lookback* on the start side to reach midpoints that
+        fall before the query interval.
+        """
+        from pyiceberg.expressions import (
+            And,
+            GreaterThanOrEqual,
+            In,
+            LessThanOrEqual,
+        )
 
         cells = self.cells_for_geometry(geom)
         if not cells:
             return []
 
-        expr = In("grid_partition", cells)
-        if start_datetime is not None:
-            expr = And(expr, GreaterThanOrEqual("datetime", _parse_dt(start_datetime)))
-        if end_datetime is not None:
-            expr = And(expr, LessThanOrEqual("datetime", _parse_dt(end_datetime)))
+        # NB: pyiceberg 0.11's inline stubs describe the *bound* predicate
+        # constructors, not these unbound ones (runtime accepts a plain
+        # string term + python values) — hence the narrow ignores here.
+        expr = In("grid_partition", cells)  # type: ignore[misc,arg-type,call-arg]
+        q_end = _parse_dt(end_datetime) if end_datetime is not None else None
+        q_start = _parse_dt(start_datetime) if start_datetime is not None else None
+        if q_end is not None:
+            # Item starts before the query ends.
+            expr = And(expr, LessThanOrEqual("start_datetime", q_end))  # type: ignore[misc,arg-type,call-arg,assignment]
+        if q_start is not None:
+            # Item ends after the query starts.
+            expr = And(expr, GreaterThanOrEqual("end_datetime", q_start))  # type: ignore[misc,arg-type,call-arg,assignment]
 
-        start_year = _parse_dt(start_datetime).year if start_datetime is not None else None
-        end_year = _parse_dt(end_datetime).year if end_datetime is not None else None
+        start_year = q_start.year - year_lookback if q_start is not None else None
+        end_year = q_end.year + 1 if q_end is not None else None
+        time_bin = table.properties.get(PROP_TIME_BIN, "year")
 
         paths = []
         for task in table.scan(row_filter=expr).plan_files():
-            year = task.file.partition[1] + 1970
+            year = partition_year(time_bin, task.file.partition[1])
             if start_year is not None and year < start_year:
                 continue
             if end_year is not None and year > end_year:
@@ -283,30 +228,31 @@ class CatalogInfo:
         """Total Parquet file count from Iceberg snapshot manifests."""
         return sum(s["file_count"] for s in self._ensure_stats(table))
 
-    def unique_item_count(self, table, store, default_hash_index_path: str | None = None) -> int:
-        """Row count of the hash-index Parquet file (footer read only)."""
-        import pyarrow.parquet as pq
+    def unique_item_count(self, table, store, default_index_path: str | None = None) -> int:
+        """Number of active (non-deleted) items in the unified index."""
+        from obstore.store import LocalStore
 
-        hash_index_path = table.properties.get("earthcatalog.hash_index_path")
-        if hash_index_path is None:
-            hash_index_path = default_hash_index_path
-        if not hash_index_path:
+        from earthcatalog.index import Index, resolve_index_path
+
+        index_path = resolve_index_path(table, default_index_path or "")
+        if not index_path:
             return 0
 
         try:
-            if hash_index_path.startswith("s3://"):
+            if index_path.startswith("s3://"):
                 if not store:
                     return 0
-                _, _, rest = hash_index_path.partition("s3://")
+                _, _, rest = index_path.partition("s3://")
                 obstore_key = rest.split("/", 1)[1] if "/" in rest else ""
                 if not obstore_key:
                     return 0
-                return _parquet_row_count_from_store(store, obstore_key)
+                return Index(store, obstore_key).count_active()
 
-            if not Path(hash_index_path).exists():
+            p = Path(index_path)
+            # Parts layout: data under ``{base}/``; legacy: ``{base}.parquet``.
+            if not p.exists() and not p.with_suffix("").is_dir():
                 return 0
-            return pq.ParquetFile(hash_index_path).metadata.num_rows
-
+            return Index(LocalStore(str(p.parent)), p.name).count_active()
         except Exception:
             return 0
 
@@ -386,7 +332,7 @@ def _open_sqlite(db_path: str, warehouse_path: str) -> SqlCatalog:
 
 def download_catalog(
     local_path: str,
-    store: object | None = None,
+    store: ObjectStore | None = None,
     catalog_key: str | None = None,
 ) -> None:
     """Pull catalog.db from *store* to *local_path* before a job starts."""
@@ -403,7 +349,7 @@ def download_catalog(
 
 def upload_catalog(
     local_path: str,
-    store: object | None = None,
+    store: ObjectStore | None = None,
     catalog_key: str | None = None,
 ) -> None:
     """Push the updated catalog.db to *store* after all writes."""
@@ -414,7 +360,7 @@ def upload_catalog(
     print(f"Catalog uploaded: {local_path} -> {catalog_key}")
 
 
-def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
+def get_or_create(catalog: SqlCatalog, grid_config=None) -> Table:
     """Return the stac_items table, creating it (and the namespace) if needed.
 
     Parameters
@@ -441,19 +387,30 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
             props[PROP_GRID_BOUNDARIES_PATH] = str(grid_config.boundaries_path)
         if grid_config.id_field is not None:
             props[PROP_GRID_ID_FIELD] = str(grid_config.id_field)
+        props[PROP_TIME_BIN] = grid_config.time_bin
+
+    warehouse = catalog.properties.get("warehouse", "")
+    if warehouse:
+        props[PROP_INDEX_PATH] = f"{warehouse.rstrip('/')}_index.parquet"
+
+    time_bin = grid_config.time_bin if grid_config is not None else "year"
 
     try:
         table = catalog.load_table(FULL_NAME)
         missing = {k: v for k, v in props.items() if k not in table.properties}
+        # A legacy warehouse carries earthcatalog.hash_index_path; leave the
+        # index property alone until migrate_indices() stamps it.
+        if table.properties.get(PROP_HASH_INDEX_PATH):
+            missing.pop(PROP_INDEX_PATH, None)
         if missing:
             with table.transaction() as tx:
-                tx.set_properties(**missing)
+                tx.set_properties(**missing)  # type: ignore[arg-type]
         return table
     except NoSuchTableError:
         return catalog.create_table(
             identifier=FULL_NAME,
             schema=ICEBERG_SCHEMA,
-            partition_spec=PARTITION_SPEC,
+            partition_spec=build_partition_spec(time_bin),
             properties=props,
         )
 
@@ -464,7 +421,7 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> object:
 
 
 def open(
-    store: object,
+    store: ObjectStore,
     base: str,
     *,
     anonymous: bool | None = None,
@@ -482,7 +439,7 @@ def open(
         - ``earthcatalog.db``   (SQLite Iceberg catalog)
         - ``warehouse/``        (GeoParquet files)
         Optionally:
-        - ``warehouse_id_hashes.parquet`` (hash index)
+        - ``warehouse_index.parquet`` (unified index)
     anonymous:
         Force anonymous S3 access when the warehouse path is ``s3://``.
         Auto-detected for stores with ``skip_signature=True``.
@@ -540,56 +497,6 @@ def open(
     )
 
 
-def ingest(
-    inventory_path: str,
-    *,
-    store: object | None = None,
-    base: str | None = None,
-    mode: str = "auto",
-    chunk_size: int = 10000,
-    limit: int | None = None,
-    since: datetime | None = None,
-    update_hash_index: bool = False,
-) -> dict:
-    """Open an EarthCatalog and ingest STAC items from an inventory.
-
-    Convenience wrapper around ``EarthCatalog.ingest()`` for callers that
-    only have a store and base path.
-
-    Parameters
-    ----------
-    inventory_path:
-        Path or ``s3://`` URI to an S3 Inventory file.
-    store:
-        An obstore-compatible store (``S3Store``, ``LocalStore``, etc.).
-    base:
-        Base path containing ``earthcatalog.db`` and ``warehouse/``.
-    mode:
-        ``"auto"``, ``"full"``, or ``"delta"``.  See ``EarthCatalog.ingest``.
-    chunk_size:
-        Items per fetch batch.
-    limit:
-        Max items to process.
-    since:
-        Only process items modified after this datetime.
-    update_hash_index:
-        Update the warehouse hash index after ingest.
-
-    Returns
-    -------
-    dict with keys ``items_processed``, ``rows_written``, ``files_registered``.
-    """
-    ec = open(store=store, base=base)
-    return ec.ingest(
-        inventory_path=inventory_path,
-        mode=mode,
-        chunk_size=chunk_size,
-        limit=limit,
-        since=since,
-        update_hash_index=update_hash_index,
-    )
-
-
 # ---------------------------------------------------------------------------
 # EarthCatalog — main facade
 # ---------------------------------------------------------------------------
@@ -616,10 +523,10 @@ class EarthCatalog:
 
     def __init__(
         self,
-        catalog: object,
+        catalog: SqlCatalog,
         table: Table,
         info: CatalogInfo,
-        store: object | None = None,
+        store: ObjectStore | None = None,
         *,
         catalog_key: str | None = None,
     ):
@@ -726,7 +633,7 @@ class EarthCatalog:
         import duckdb
         from shapely.geometry import shape
 
-        from .search import _extract_datetime_range
+        from .search import _extract_datetime_range, build_query
 
         # --- geometry ---
         geom = None
@@ -752,23 +659,8 @@ class EarthCatalog:
             return pd.DataFrame({"id": [], "uri": []})
 
         # --- build SQL (read only id + assets) ---
-        path_list = ", ".join(repr(p) for p in paths)
-        conditions: list[str] = []
-        if geom is not None:
-            conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
-        if start_dt is not None:
-            conditions.append(f"datetime >= '{start_dt}'")
-        if end_dt is not None:
-            conditions.append(f"datetime <= '{end_dt}'")
-        raw_filter = kwargs.get("filter")
-        if raw_filter is not None:
-            from .search import _cql2_to_sql
-
-            conditions.append(_cql2_to_sql(raw_filter))
-        where = " AND ".join(conditions) if conditions else "TRUE"
         max_items = kwargs.get("max_items")
-
-        sql = f"""SELECT id, assets FROM read_parquet([{path_list}]) WHERE {where}"""
+        sql = build_query(paths, geom, start_dt, end_dt, kwargs.get("filter"), select="id, assets")
 
         # --- execute (Arrow → list is faster than pandas iterrows) ---
         con = duckdb.connect()
@@ -822,7 +714,7 @@ class EarthCatalog:
         import duckdb
         from shapely.geometry import shape
 
-        from .search import _cql2_to_sql, _extract_datetime_range
+        from .search import _extract_datetime_range, build_query
 
         geom = None
         if "intersects" in kwargs:
@@ -842,22 +734,9 @@ class EarthCatalog:
 
             return pd.DataFrame()
 
-        path_list = ", ".join(repr(p) for p in paths)
-        conditions: list[str] = []
-        if geom is not None:
-            conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
-        if start_dt is not None:
-            conditions.append(f"datetime >= '{start_dt}'")
-        if end_dt is not None:
-            conditions.append(f"datetime <= '{end_dt}'")
-        raw_filter = kwargs.get("filter")
-        if raw_filter is not None:
-            conditions.append(_cql2_to_sql(raw_filter))
-
-        where = " AND ".join(conditions) if conditions else "TRUE"
         max_items = kwargs.get("max_items")
         # LIMIT omitted — triggers 7× slower plan for multi-file reads
-        sql = f"SELECT * FROM read_parquet([{path_list}]) WHERE {where}"
+        sql = build_query(paths, geom, start_dt, end_dt, kwargs.get("filter"))
 
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
@@ -916,280 +795,67 @@ class EarthCatalog:
         return self._info.stats(self._table)
 
     def unique_item_count(self) -> int:
-        """Return the count of unique STAC items from the hash index."""
-        default_hash_index_path = None
+        """Return the count of active (non-deleted) items from the unified index."""
+        default_index_path = None
         if self._catalog is not None:
             warehouse = self._catalog.properties.get("warehouse", "")
             if warehouse:
-                default_hash_index_path = warehouse.rstrip("/") + "_id_hashes.parquet"
+                default_index_path = warehouse.rstrip("/") + "_index.parquet"
 
-        return self._info.unique_item_count(self._table, self._store, default_hash_index_path)
+        return self._info.unique_item_count(self._table, self._store, default_index_path)
 
     def info(self) -> CatalogInfo:
         """Return the grid metadata and catalog statistics object."""
         return self._info
 
-    def ingest(
+    def ingest_inventory(
         self,
         inventory_path: str,
         *,
         mode: str = "auto",
-        chunk_size: int = 10000,
-        limit: int | None = None,
-        since: datetime | None = None,
-        update_hash_index: bool = False,
+        config: IngestConfig | None = None,
     ) -> dict:
-        """Ingest STAC items from an S3 Inventory into the catalog.
+        """Ingest an inventory using a (optionally distributed) Dask cluster.
 
-        Unified entry point replacing both ``backfill.run_backfill`` and
-        ``incremental.run``.  Handles full backfill (drop+recreate table)
-        and delta append (add files to existing table).
+        Delegates to :class:`earthcatalog.pipeline.IngestPipeline`.  *config*
+        (a :class:`earthcatalog.ingest_config.IngestConfig`) holds the tuning
+        knobs (chunk size, compact rows, stage, resume flags, create_client).
 
-        The caller is responsible for holding an S3Lock around this call
-        when running against a shared store (use ``self.lock()``).
+        There is one ingest operation: *mode* only controls table handling —
+        ``"full"`` drops and rebuilds the Iceberg table, ``"delta"`` appends,
+        ``"auto"`` appends iff the table has rows.  Input scope (complete
+        inventory vs. newer snapshot vs. precomputed delta parquet) is simply
+        which *inventory_path* you pass; the unified index dedups source
+        keys, so every run is resumable and idempotent.
+
+        With ``stage="ndjson"`` (default) items are staged to per-(cell,
+        year) NDJSON before a memory-bounded compaction to GeoParquet;
+        ``skip_fetch`` resumes from the staged NDJSON.  Distributed runs
+        shard the inventory by part file where possible — workers stream
+        their own files and only the head node commits.
+
+        Returns the run summary dict (``{"items": …, "rows": …}``).
         """
-        import os
-        import uuid
-        from concurrent.futures import ThreadPoolExecutor
+        from .pipeline import IngestPipeline
 
-        from earthcatalog.grids import build_partitioner
-        from earthcatalog.pipelines.incremental import _fetch_item, _iter_inventory
-
-        from .hash_index import (
-            merge_hashes_from_parquets,
-            read_hashes,
-            write_hashes,
-        )
-        from .transform import (
-            fan_out,
-            group_by_partition,
-            write_geoparquet_s3,
-        )
-
-        if not os.environ.get("AWS_ACCESS_KEY_ID"):
-            raise RuntimeError(
-                "No AWS credentials found in environment. "
-                "ingest() requires write access to S3. "
-                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
-            )
-
-        if mode == "auto":
-            try:
-                n = sum(s["row_count"] for s in self._info.stats(self._table))
-                mode = "delta" if n > 0 else "full"
-            except Exception:
-                mode = "full"
-
-        is_delta = mode == "delta"
-
-        from earthcatalog.config import GridConfig
-
-        grid_cfg = GridConfig(
-            type=self._info.grid_type,
-            resolution=self._info.grid_resolution,
-            boundaries_path=self._info.boundaries_path,
-            id_field=self._info.id_field,
-        )
-        partitioner = build_partitioner(grid_cfg)
-
-        warehouse_root = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///") if uri else "/tmp/earthcatalog.db"
-
-        if self._store and self._catalog_key:
-            self.download_catalog(local_db)
-
-        if not is_delta:
-            from pyiceberg.exceptions import NoSuchTableError
-
-            try:
-                self._catalog.drop_table(FULL_NAME)
-            except NoSuchTableError:
-                pass
-            try:
-                self._catalog.create_namespace(NAMESPACE)
-            except Exception:
-                pass
-            self._table = get_or_create(self._catalog, grid_config=grid_cfg)
-
-        total_items = 0
-        total_rows = 0
-        written_keys: list[str] = []
-        batch: list[tuple[str, str]] = []
-
-        def _flush(chunk: list[tuple[str, str]]) -> None:
-            nonlocal total_rows
-
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                items = list(filter(None, pool.map(lambda bc: _fetch_item(*bc), chunk)))
-
-            if not items:
-                return
-
-            fo = fan_out(items, partitioner)
-            if not fo:
-                return
-
-            for (cell, year), group_items in group_by_partition(fo).items():
-                year_str = str(year) if year is not None else "unknown"
-                part_tag = uuid.uuid4().hex[:8]
-                s3_key = f"grid_partition={cell}/year={year_str}/part_{part_tag}.parquet"
-                n, _ = write_geoparquet_s3(group_items, self._store, s3_key)
-                if n > 0:
-                    written_keys.append(s3_key)
-                    total_rows += n
-
-        print(f"Ingesting from: {inventory_path}")
-        for bucket, key in _iter_inventory(inventory_path, since=since):
-            if not key.endswith(".stac.json"):
-                continue
-            batch.append((bucket, key))
-            total_items += 1
-            if len(batch) >= chunk_size:
-                _flush(batch)
-                batch.clear()
-            if limit and total_items >= limit:
-                break
-
-        if batch:
-            _flush(batch)
-
-        if written_keys:
-            full_paths = [f"{warehouse_root.rstrip('/')}/{k}" for k in written_keys]
-            batch_sz = 2000
-            for i in range(0, len(full_paths), batch_sz):
-                self._table.add_files(full_paths[i : i + batch_sz])
-            print(f"Registered {len(full_paths)} files in Iceberg catalog.")
-
-        if update_hash_index and written_keys:
-            hash_index_path = self._table.properties.get("earthcatalog.hash_index_path")
-            if not hash_index_path:
-                hash_index_path = f"{warehouse_root.rstrip('/')}_id_hashes.parquet"
-                with self._table.transaction() as tx:
-                    tx.set_properties(**{"earthcatalog.hash_index_path": hash_index_path})
-
-            if hash_index_path.startswith("s3://"):
-                import re as _re
-
-                m = _re.match(r"s3://([^/]+)/(.+)", hash_index_path)
-                if m:
-                    hash_key = m.group(2)
-                    existing = read_hashes(self._store, hash_key)
-                    print(f"  Existing hashes: {len(existing):,}")
-                    updated, n_new = merge_hashes_from_parquets(
-                        full_paths, existing, store=self._store
-                    )
-                    print(f"  New hashes: {n_new:,} from {len(full_paths)} files")
-                    write_hashes(updated, self._store, hash_key)
-            else:
-                print("WARN: hash index update skipped — only s3:// paths supported")
-
-        if self._store and self._catalog_key:
-            self.upload_catalog(local_db)
-
-        result = {
-            "items_processed": total_items,
-            "rows_written": total_rows,
-            "files_registered": len(written_keys),
-        }
-        print(f"Done. {total_items} items -> {total_rows} rows in {len(written_keys)} files")
-        return result
+        return IngestPipeline(self, config).run(inventory_path, mode=mode)
 
     def bulk_ingest(
         self,
         inventory_path: str,
         *,
         mode: str = "auto",
-        chunk_size: int = 100_000,
-        compact_rows: int = 100_000,
-        limit: int | None = None,
-        since: datetime | None = None,
-        update_hash_index: bool = False,
-        staging_prefix: str | None = None,
-        create_client: Callable[[], object] | None = None,
-        skip_inventory: bool = False,
-        skip_ingest: bool = False,
-        retry_pending: bool = False,
-    ) -> None:
-        """Ingest large inventories using a distributed Dask cluster."""
-        import os
-        from datetime import UTC
-        from datetime import datetime as _dt
+        config: IngestConfig | None = None,
+    ) -> dict:
+        """Deprecated alias for :meth:`ingest_inventory`."""
+        import warnings
 
-        from earthcatalog.config import GridConfig
-        from earthcatalog.grids import build_partitioner
-        from earthcatalog.pipelines.backfill import run_backfill
-
-        if not os.environ.get("AWS_ACCESS_KEY_ID"):
-            raise RuntimeError(
-                "No AWS credentials found in environment. "
-                "bulk_ingest() requires write access to S3. "
-                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or use an IAM role."
-            )
-
-        warehouse_root = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///")
-
-        grid_cfg = GridConfig(
-            type=self._info.grid_type,
-            resolution=self._info.grid_resolution,
-            boundaries_path=self._info.boundaries_path,
-            id_field=self._info.id_field,
+        warnings.warn(
+            "EarthCatalog.bulk_ingest() is deprecated; use ingest_inventory()",
+            DeprecationWarning,
+            stacklevel=2,
         )
-        partitioner = build_partitioner(grid_cfg)
-
-        if staging_prefix is None:
-            date_str = _dt.now(UTC).strftime("%Y%m%d")
-            staging_prefix = f"bulk_ingest/{date_str}"
-
-        delta = True
-        if mode == "full":
-            delta = False
-        elif mode == "auto":
-            try:
-                n = sum(s["row_count"] for s in self._info.stats(self._table))
-                delta = n > 0
-            except Exception:
-                delta = False
-
-        if self._store and self._catalog_key:
-            self.download_catalog(local_db)
-
-        from . import store_config
-
-        old_store = store_config.get_store()
-        old_key = store_config.get_catalog_key()
-        try:
-            store_config.set_store(self._store)
-            if self._catalog_key:
-                store_config.set_catalog_key(self._catalog_key)
-
-            run_backfill(
-                inventory_path=inventory_path,
-                catalog_path=local_db,
-                staging_store=self._store,
-                staging_prefix=staging_prefix,
-                warehouse_store=self._store,
-                warehouse_root=warehouse_root,
-                partitioner=partitioner,
-                chunk_size=chunk_size,
-                compact_rows=compact_rows,
-                limit=limit,
-                since=since,
-                use_lock=False,
-                upload=True,
-                skip_inventory=skip_inventory,
-                skip_ingest=skip_ingest,
-                retry_pending=retry_pending,
-                delta=delta,
-                create_client=create_client,
-                update_hash_index=update_hash_index,
-                hash_index_path=self._table.properties.get("earthcatalog.hash_index_path"),
-            )
-        finally:
-            store_config.set_store(old_store)
-            store_config.set_catalog_key(old_key)
+        return self.ingest_inventory(inventory_path, mode=mode, config=config)
 
     def download_catalog(self, local_path: str) -> None:
         """Download catalog.db from the backing store to *local_path*."""
@@ -1199,40 +865,102 @@ class EarthCatalog:
         """Upload catalog.db from *local_path* to the backing store."""
         upload_catalog(local_path, store=self._store)
 
-    def compact(
+    def garbage_collect(
         self,
-        threshold: int = 2,
+        inventory_path: str,
+        *,
         dry_run: bool = False,
-    ) -> dict[str, int]:
-        """Compact over-threshold partition buckets and rebuild the Iceberg catalog.
+    ) -> dict:
+        """Remove orphaned STAC items whose source objects left the S3 Inventory.
 
-        Wraps :func:`earthcatalog.maintenance.compact.compact_warehouse` using this
-        catalog's warehouse path and local catalog database.
+        Wraps :func:`earthcatalog.gc.run_garbage_collection`
+        using this catalog's store, unified index, and warehouse path.
+
+        Detects deletions via a Bloom filter of the current inventory keys,
+        then rewrites only the affected GeoParquet files.  See the v2 GC
+        plan (``docs/delete_plan_v2.md``) for details.
+
+        After any files are rewritten the Iceberg catalog is rebuilt from the
+        current warehouse state so that subsequent searches reflect the changes.
 
         Parameters
         ----------
-        threshold:
-            Minimum number of part files in a bucket before it is compacted.
-            Default: 2 (compact any bucket with more than one part file).
+        inventory_path:
+            Path or ``s3://`` URI to the current S3 Inventory.
         dry_run:
-            When ``True``, report what *would* be compacted but make no changes.
+            When ``True``, detect and report orphans but make no changes.
 
         Returns
         -------
-        Summary dict with keys ``buckets_scanned``, ``buckets_compacted``,
-        ``files_before``, ``files_after``.
+        Summary dict: ``candidates``, ``confirmed``, ``orphaned``,
+        ``files_rewritten``, ``rows_removed``, ``partitions_affected``.
         """
-        from earthcatalog.maintenance.compact import compact_warehouse
+        import os
 
-        warehouse_path = self._catalog.properties.get("warehouse", "")
-        uri = self._catalog.properties.get("uri", "")
-        local_db = uri.removeprefix("sqlite:///")
-        return compact_warehouse(
-            warehouse_path=warehouse_path,
-            catalog_path=local_db,
-            threshold=threshold,
-            dry_run=dry_run,
+        from earthcatalog.gc import run_garbage_collection
+        from earthcatalog.index import Index
+
+        warehouse_root = self._catalog.properties.get("warehouse", "")
+
+        # Derive the key prefix *within the store* for _list_partition_files.
+        # self._store is a bucket-level S3Store, so keys inside it look like
+        # "test-space/stac/catalog/warehouse/grid_partition=.../year=.../...".
+        # Stripping "s3://bucket/" from warehouse_root gives us that prefix.
+        if warehouse_root.startswith("s3://"):
+            _, _, key_path = warehouse_root.removeprefix("s3://").partition("/")
+            warehouse_prefix = key_path.rstrip("/") + "/"
+        else:
+            warehouse_prefix = warehouse_root.rstrip("/") + "/"
+
+        def _strip(uri: str) -> str:
+            return uri.removeprefix("s3://").split("/", 1)[1] if uri.startswith("s3://") else uri
+
+        # Unified index — same path the ingest pipeline writes to.
+        from earthcatalog.index import resolve_index_path
+
+        index_key = _strip(
+            resolve_index_path(self._table, f"{warehouse_root.rstrip('/')}_index.parquet")
         )
+        assert self._store is not None
+
+        result = run_garbage_collection(
+            inventory_path=inventory_path,
+            store=self._store,
+            index=Index(self._store, index_key),
+            warehouse_prefix=warehouse_prefix,
+            dry_run=dry_run,
+            layout=layout_of(self._table.properties),
+        )
+
+        # After files have been physically rewritten the Iceberg table still
+        # points to the now-deleted part_*.parquet paths and has no knowledge
+        # of the new gc_*.parquet files.  Rebuild the table so searches work.
+        if not dry_run and result.get("files_rewritten", 0) > 0:
+            from earthcatalog.rebuild import rebuild_iceberg_from_warehouse
+
+            uri = self._catalog.properties.get("uri", "")
+            local_db = uri.removeprefix("sqlite:///") if uri else None
+
+            if local_db and os.path.exists(local_db) and self._store and self._catalog_key:
+                n = rebuild_iceberg_from_warehouse(
+                    catalog_path=local_db,
+                    warehouse_root=warehouse_root,
+                    warehouse_store=self._store,
+                    upload=False,  # we upload manually below with our store + key
+                )
+                obstore.put(
+                    self._store,
+                    self._catalog_key,
+                    Path(local_db).read_bytes(),
+                )
+                print(f"Iceberg catalog rebuilt and uploaded ({n:,} files).")
+            else:
+                print(
+                    "WARN: could not rebuild Iceberg catalog after GC — "
+                    "local_db or catalog_key unavailable."
+                )
+
+        return result
 
     def lock(self, owner: str, ttl_hours: int = 12):
         """Return an S3Lock that uses this EarthCatalog's store and key."""
@@ -1281,8 +1009,14 @@ class EarthCatalog:
         if warehouse_path:
             rows.append(("Warehouse", warehouse_path))
 
-        hash_idx = self._table.properties.get("earthcatalog.hash_index_path")
-        rows.append(("Hash index", "Available" if hash_idx else "Not available"))
+        from earthcatalog.index import resolve_index_path
+
+        index_path = (
+            resolve_index_path(self._table, f"{warehouse_path.rstrip('/')}_index.parquet")
+            if warehouse_path
+            else ""
+        )
+        rows.append(("Unique index", "Available" if index_path else "Not available"))
 
         table_html = "<table style='border-collapse: collapse; width: 100%; margin: 0;'>"
         for label, value in rows:
@@ -1299,7 +1033,7 @@ class EarthCatalog:
             total_files = self._info.total_files(self._table)
             total_rows = sum(s["row_count"] for s in stats)
             warehouse = self._catalog.properties.get("warehouse", "") if self._catalog else ""
-            default_hi = warehouse.rstrip("/") + "_id_hashes.parquet" if warehouse else None
+            default_hi = warehouse.rstrip("/") + "_index.parquet" if warehouse else None
             unique = self._info.unique_item_count(self._table, self._store, default_hi)
 
             stat_rows = [

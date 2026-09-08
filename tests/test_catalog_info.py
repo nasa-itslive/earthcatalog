@@ -317,7 +317,12 @@ def _build_multiyear_warehouse(tmp_path, years):
                     "type": "Polygon",
                     "coordinates": [[[-50, 65], [-48, 65], [-48, 68], [-50, 68], [-50, 65]]],
                 },
-                "properties": {"datetime": f"{year}-06-15T00:00:00Z", "platform": "NISAR"},
+                "properties": {
+                    "datetime": f"{year}-06-15T00:00:00Z",
+                    "start_datetime": f"{year}-01-01T00:00:00Z",
+                    "end_datetime": f"{year}-12-31T23:59:59Z",
+                    "platform": "NISAR",
+                },
                 "links": [],
                 "assets": {},
             }
@@ -454,28 +459,36 @@ class TestCatalogInfoStatsMethods:
             assert count == 0
 
     def test_unique_item_count_no_hash_index(self, h3_table):
-        """unique_item_count should return 0 when hash index not available."""
+        """unique_item_count should return 0 when no index is available."""
         info = _catalog_info(h3_table)
         count = info.unique_item_count(h3_table, store=None)
         assert count == 0
 
-    def test_unique_item_count_with_hash_index(self, tmp_path):
-        """unique_item_count should read from hash index parquet."""
-        import pyarrow.parquet as pq
+    def test_unique_item_count_with_index(self, tmp_path):
+        """unique_item_count should count active rows from the unified index."""
+        from obstore.store import LocalStore
+
+        from earthcatalog.index import Index
 
         tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
 
-        # Create a hash index file
-        hash_index_path = str(tmp_path / "warehouse_id_hashes.parquet")
-        import pyarrow as pa
+        index_path = str(tmp_path / "warehouse_index.parquet")
+        store = LocalStore(str(tmp_path))
+        Index(store, "warehouse_index.parquet").append(
+            [
+                {
+                    "s3_key": f"s3://b/k{i}.stac.json",
+                    "stac_id": f"item-{i}",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                }
+                for i in range(10)
+            ]
+        )
 
-        # Create a simple hash index with 10 unique items
-        table = pa.table({"item_id_hash": [i for i in range(10)]})
-        pq.write_table(table, hash_index_path)
-
-        # Set the hash index path in table properties
+        # Set the index path in table properties.
         with tbl.transaction() as tx:
-            tx.set_properties(**{"earthcatalog.hash_index_path": hash_index_path})
+            tx.set_properties(**{"earthcatalog.index_path": index_path})
 
         info = _catalog_info(tbl)
         count = info.unique_item_count(tbl, store=None)
@@ -485,7 +498,7 @@ class TestCatalogInfoStatsMethods:
         """unique_item_count should return 0 when file doesn't exist."""
         tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
 
-        # Set non-existent hash index path
+        # Set non-existent index path
         with tbl.transaction() as tx:
             tx.set_properties(
                 **{"earthcatalog.hash_index_path": str(tmp_path / "nonexistent.parquet")}
@@ -496,28 +509,40 @@ class TestCatalogInfoStatsMethods:
         assert count == 0
 
     def test_unique_item_count_uses_default_path(self, tmp_path):
-        """unique_item_count should use default_hash_index_path when table property is not set."""
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        """unique_item_count should use default_index_path when table property is not set."""
+        from obstore.store import LocalStore
+
+        from earthcatalog.index import Index
 
         tbl = _build_multiyear_warehouse(tmp_path, [2020, 2021, 2022])
 
-        # Create a hash index file at the default location
-        hash_index_path = str(tmp_path / "warehouse_id_hashes.parquet")
-        table = pa.table({"item_id_hash": [i for i in range(42)]})
-        pq.write_table(table, hash_index_path)
+        index_path = str(tmp_path / "warehouse_index.parquet")
+        Index(LocalStore(str(tmp_path)), "warehouse_index.parquet").append(
+            [
+                {
+                    "s3_key": f"s3://b/k{i}.stac.json",
+                    "stac_id": f"item-{i}",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                }
+                for i in range(42)
+            ]
+        )
 
-        # Don't set the table property - test default path
+        # get_or_create stamps earthcatalog.index_path automatically; drop it
+        # to simulate a warehouse with no known index location.
+        from earthcatalog.schema import PROP_INDEX_PATH
+
+        with tbl.transaction() as tx:
+            tx.remove_properties(PROP_INDEX_PATH)
         info = _catalog_info(tbl)
 
-        # Without default path, should return 0
+        # Without property or default path, should return 0
         count_no_default = info.unique_item_count(tbl, store=None)
         assert count_no_default == 0
 
         # With default path, should return the actual count
-        count_with_default = info.unique_item_count(
-            tbl, store=None, default_hash_index_path=hash_index_path
-        )
+        count_with_default = info.unique_item_count(tbl, store=None, default_index_path=index_path)
         assert count_with_default == 42
 
     def test_top_cells_sorted_and_cached(self, tmp_path):

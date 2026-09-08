@@ -14,7 +14,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import io
 import os
 import sys
 from pathlib import Path
@@ -30,7 +29,8 @@ parser.add_argument(
 parser.add_argument(
     "--hash-index",
     default=None,
-    help="Path to warehouse_id_hashes.parquet (local or s3://)",
+    help="Path to the unified index parquet (local or s3://). "
+    "Defaults to {warehouse}_index.parquet.",
 )
 args = parser.parse_args()
 
@@ -100,45 +100,33 @@ print(f"  Grid type     : {info.grid_type}")
 print(f"  Resolution    : {info.grid_resolution}")
 print(f"  Warehouse     : {args.warehouse}")
 
-hash_index_path = args.hash_index or table.properties.get(PROP_HASH_INDEX_PATH)
+index_path = args.hash_index or table.properties.get(PROP_HASH_INDEX_PATH)
+if not index_path:
+    index_path = f"{args.warehouse.rstrip('/')}_index.parquet"
 unique_items = None
-if hash_index_path:
-    print(f"  Hash index    : {hash_index_path}")
+if index_path:
+    print(f"  Unique index  : {index_path}")
     try:
-        import obstore
-        import pyarrow.parquet as pq
-        from obstore.store import S3Store
+        from obstore.store import LocalStore, S3Store
 
-        if hash_index_path.startswith("s3://"):
+        from earthcatalog.index import Index
+
+        if index_path.startswith("s3://"):
             region = (
                 os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
             )
-            no_scheme = hash_index_path.removeprefix("s3://")
+            no_scheme = index_path.removeprefix("s3://")
             h_bucket, h_key = no_scheme.split("/", 1)
             hstore = S3Store(bucket=h_bucket, region=region, skip_signature=True)
-            cred_id = os.environ.get("AWS_ACCESS_KEY_ID")
-            cred_secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-            if cred_id and cred_secret:
-                hstore = S3Store(
-                    bucket=h_bucket,
-                    region=region,
-                    aws_access_key_id=cred_id,
-                    aws_secret_access_key=cred_secret,
-                )
-            # Read only the footer (~64KB), not the full file
-            meta = hstore.head(h_key)
-            size = meta["size"]
-            tail = bytes(obstore.get_range(hstore, h_key, start=size - 65536, length=65536))
-            pf = pq.ParquetFile(io.BytesIO(tail))
-            unique_items = pf.metadata.num_rows
+            unique_items = Index(hstore, h_key).count_active()
         else:
-            pf = pq.ParquetFile(hash_index_path)
-            unique_items = pf.metadata.num_rows
-        print(f"  Unique items  : {unique_items:,} (from hash index)")
+            p = Path(index_path)
+            unique_items = Index(LocalStore(str(p.parent)), p.name).count_active()
+        print(f"  Unique items  : {unique_items:,} (active, from unified index)")
     except Exception as e:
-        print(f"  Unique items  : (could not read hash index: {e})")
+        print(f"  Unique items  : (could not read index: {e})")
 else:
-    print("  Hash index    : not registered")
+    print("  Unique index  : not registered")
 
 # ---------------------------------------------------------------------------
 # Iceberg metadata

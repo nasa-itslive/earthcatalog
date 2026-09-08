@@ -12,6 +12,15 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - README canonical search example uses `catalog.search()` returning pystac
   Items for clarity.
+- `run_backfill` no longer builds a prefix-scoped warehouse store (fixed
+  double-prefixed S3 keys on ingest).
+- Garbage collection now runs against the unified warehouse index
+  (`{warehouse}_index.parquet`) instead of the legacy hash/source index;
+  removed `earthcatalog.pipelines.delete`.
+- `unique_item_count()` / `scripts/info.py` / `cli info` report active items
+  from the unified index (soft-deleted rows excluded).
+- Consolidation and `compact_warehouse` support `s3://` warehouses and upload
+  the rebuilt catalog to the correct S3 key.
 
 ## [0.6.0] - 2026-05-03
 

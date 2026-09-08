@@ -26,15 +26,17 @@ contain that cell's centroid — is still assigned to the edge cell.
 This guarantees no data gap at cell boundaries regardless of item shape.
 """
 
+from typing import cast
+
 import h3
 import numpy as np
 from shapely import wkb
-from shapely.geometry import mapping
+from shapely.geometry import Polygon, mapping
 
 from earthcatalog.partitioner import AbstractPartitioner
 
 
-def _boundary_cells(geom: object, resolution: int) -> set[str]:
+def _boundary_cells(geom: Polygon, resolution: int) -> set[str]:
     """
     Return all H3 cells touched by the polygon's exterior boundary ring.
     Densify the ring so no cell is skipped between two vertices.
@@ -68,12 +70,14 @@ class H3Partitioner(AbstractPartitioner):
         self.resolution = resolution
 
     def get_intersecting_keys(self, geom_wkb: bytes) -> list[str]:
+        from shapely.geometry import Point, Polygon
+
         geom = wkb.loads(geom_wkb)
 
-        if geom.geom_type == "Point":
-            lon, lat = geom.x, geom.y
-            return [h3.latlng_to_cell(lat, lon, self.resolution)]
+        if isinstance(geom, Point):
+            return [h3.latlng_to_cell(geom.y, geom.x, self.resolution)]
 
-        interior = set(h3.geo_to_cells(mapping(geom), self.resolution))
-        boundary = _boundary_cells(geom, self.resolution)
+        polygon = cast(Polygon, geom)
+        interior = set(h3.geo_to_cells(mapping(polygon), self.resolution))
+        boundary = _boundary_cells(polygon, self.resolution)
         return list(interior | boundary)

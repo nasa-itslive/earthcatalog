@@ -348,10 +348,10 @@ class TestStoreIntegration:
 
 
 class TestBulkIngest:
-    """Minimal tests for EarthCatalog.bulk_ingest()."""
+    """Minimal tests for EarthCatalog.ingest_inventory()."""
 
     def test_bulk_ingest_derives_params(self, tmp_path, monkeypatch):
-        """bulk_ingest correctly resolves mode and passes params to run_backfill."""
+        """ingest_inventory builds an Index and runs a single-node Ingester."""
         from earthcatalog import EarthCatalog
         from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
         from earthcatalog.config import GridConfig
@@ -369,25 +369,279 @@ class TestBulkIngest:
             catalog_key="catalog.db",
         )
 
-        # Mock credentials — bulk_ingest() requires AWS_ACCESS_KEY_ID
+        # Mock credentials — ingest_inventory() requires AWS_ACCESS_KEY_ID
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
 
-        # Patch run_backfill to capture params instead of executing
+        # Patch the Ingester to capture construction instead of executing.
         captured = {}
 
-        def fake_run_backfill(**kwargs):
-            captured.update(kwargs)
-            return None
+        def fake_ingester_init(self, store, index, table, **kwargs):
+            captured["store"] = store
+            captured["index"] = index
+            captured["table"] = table
+            captured["kwargs"] = kwargs
+            self._store = store
 
-        import earthcatalog.pipelines.backfill as _bfmod
+        def fake_run(self, inventory):
+            captured["inventory"] = inventory
+            return {"items": 0, "rows": 0}
 
-        monkeypatch.setattr(_bfmod, "run_backfill", fake_run_backfill)
+        import earthcatalog.ingest as _ingmod
 
-        # Call bulk_ingest in full mode
-        ec.bulk_ingest("inventory.parquet", mode="full")
+        class _FakeIngester:
+            def __init__(self, store, index, table, **kwargs):
+                captured["store"] = store
+                captured["index"] = index
+                captured["table"] = table
+                captured["kwargs"] = kwargs
 
-        assert captured.get("delta") is False
-        assert captured.get("inventory_path") == "inventory.parquet"
-        assert captured.get("catalog_path") == db
-        assert captured.get("warehouse_root") == wh
-        assert captured.get("use_lock") is False
+            def run(self, inventory):
+                captured["inventory"] = inventory
+                return {"items": 0, "rows": 0}
+
+        monkeypatch.setattr(_ingmod, "Ingester", _FakeIngester)
+        monkeypatch.setattr(_ingmod, "DaskIngester", _FakeIngester)
+
+        # Call ingest_inventory in full mode
+        ec.ingest_inventory("inventory.parquet", mode="full")
+
+        assert captured.get("kwargs", {}).get("partitioner") is not None
+        assert captured.get("store") == store
+
+    def test_bulk_ingest_alias_is_deprecated(self, tmp_path, monkeypatch):
+        """The old bulk_ingest name still works but warns."""
+        from earthcatalog import EarthCatalog
+        from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
+        from earthcatalog.config import GridConfig
+
+        store = MemoryStore()
+        db = str(tmp_path / "catalog.db")
+        wh = str(tmp_path / "warehouse")
+        cat = _open_sqlite(db, wh)
+        tbl = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
+        ec = EarthCatalog(
+            catalog=cat,
+            table=tbl,
+            info=_catalog_info(tbl),
+            store=store,
+            catalog_key="catalog.db",
+        )
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+
+        import earthcatalog.pipeline as _pipemod
+
+        class _FakePipeline:
+            def __init__(self, catalog, config=None):
+                pass
+
+            def run(self, inventory_path, *, mode="auto"):
+                return {"items": 0, "rows": 0}
+
+        monkeypatch.setattr(_pipemod, "IngestPipeline", _FakePipeline)
+
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            ec.bulk_ingest("inventory.parquet", mode="full")
+
+        assert any(issubclass(x.category, DeprecationWarning) for x in w)
+
+    def test_scatter_only_then_resume_from_scatter_manifest(self, tmp_path, monkeypatch):
+        """Two-step distributed workflow: scatter_only writes shards + a
+        scatter.json and does NOT ingest; a second call pointing at the
+        scatter.json consumes the shards as-is (no re-read)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from earthcatalog import EarthCatalog
+        from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
+        from earthcatalog.config import GridConfig
+        from earthcatalog.ingest_config import IngestConfig
+        from earthcatalog.inventory import is_scatter_manifest
+
+        store = MemoryStore()
+        db = str(tmp_path / "catalog.db")
+        wh = str(tmp_path / "warehouse")
+        cat = _open_sqlite(db, wh)
+        tbl = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
+        ec = EarthCatalog(
+            catalog=cat,
+            table=tbl,
+            info=_catalog_info(tbl),
+            store=store,
+            catalog_key="catalog.db",
+        )
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+
+        keys = [f"k{i}.stac.json" for i in range(5)]
+        inv = tmp_path / "inv.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "bucket": pa.array(["b"] * 5, type=pa.string()),
+                    "key": pa.array(keys, type=pa.string()),
+                }
+            ),
+            str(inv),
+        )
+
+        class _FakeClient:
+            def map(self, fn, args):
+                return [fn(a) for a in args]
+
+        captured = {}
+
+        class _FakeDaskIngester:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def run(self, shards, *, client=None):
+                captured["shards"] = shards
+                captured["n_shards"] = len(shards)
+                return {"items": len(shards), "rows": len(shards)}
+
+        import earthcatalog.ingest as _ingmod
+
+        monkeypatch.setattr(_ingmod, "DaskIngester", _FakeDaskIngester)
+
+        # Step 1: scatter only — no cluster, no DaskIngester call.
+        cfg = IngestConfig(create_client=lambda: _FakeClient(), chunk_size=2, scatter_only=True)
+        result = ec.ingest_inventory(str(inv), mode="full", config=cfg)
+        assert "scatter" in result and is_scatter_manifest(result["scatter"])
+        assert "n_shards" not in captured, "scatter_only must not ingest"
+
+        # The scatter manifest + 3 shard files (5 keys, chunk_size=2) exist.
+        manifest_key = result["scatter"]
+        shard_dir = manifest_key.rsplit("/", 1)[0] + "/"
+        paths = [obj["path"] for batch in store.list(prefix=shard_dir) for obj in batch]
+        assert any(p.endswith("scatter.json") for p in paths), paths
+        assert sum(p.endswith(".parquet") for p in paths) == 3
+
+        # Step 2: point at the scatter.json — shards consumed, no re-read.
+        cfg2 = IngestConfig(create_client=lambda: _FakeClient(), chunk_size=2)
+        ec.ingest_inventory(manifest_key, mode="delta", config=cfg2)
+        assert captured["n_shards"] == 3
+        # Each loaded shard is file-backed and yields its rows.
+        assert all(not s.pairs and s.files for s in captured["shards"])
+
+        # Cleanup after success: the manifest is gone (shards too).
+        import obstore as _obstore
+
+        with pytest.raises(Exception):
+            _obstore.get(store, manifest_key).bytes()
+
+    def test_failed_ingest_keeps_shards_for_resume(self, tmp_path, monkeypatch):
+        """A failed map/reduce keeps the shard files so the run can be
+        resumed by re-pointing at the same scatter manifest."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from earthcatalog import EarthCatalog
+        from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
+        from earthcatalog.config import GridConfig
+        from earthcatalog.ingest_config import IngestConfig
+
+        store = MemoryStore()
+        db = str(tmp_path / "catalog.db")
+        wh = str(tmp_path / "warehouse")
+        cat = _open_sqlite(db, wh)
+        tbl = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
+        ec = EarthCatalog(
+            catalog=cat,
+            table=tbl,
+            info=_catalog_info(tbl),
+            store=store,
+            catalog_key="catalog.db",
+        )
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+
+        inv = tmp_path / "inv.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "bucket": pa.array(["b", "b"], type=pa.string()),
+                    "key": pa.array(["a.stac.json", "b.stac.json"], type=pa.string()),
+                }
+            ),
+            str(inv),
+        )
+
+        class _FakeClient:
+            def map(self, fn, args):
+                return [fn(a) for a in args]
+
+        class _FailingDaskIngester:
+            def __init__(self, **kwargs):
+                pass
+
+            def run(self, shards, *, client=None):
+                raise RuntimeError("simulated worker failure")
+
+        import earthcatalog.ingest as _ingmod
+
+        monkeypatch.setattr(_ingmod, "DaskIngester", _FailingDaskIngester)
+
+        cfg = IngestConfig(create_client=lambda: _FakeClient(), chunk_size=10)
+        with pytest.raises(RuntimeError, match="simulated"):
+            ec.ingest_inventory(str(inv), mode="full", config=cfg)
+
+        # Shards + manifest kept for resume (list everything — local-path
+        # keys are absolute under MemoryStore in tests).
+        all_paths = [obj["path"] for batch in store.list(prefix="") for obj in batch]
+        assert any(p.endswith("scatter.json") for p in all_paths), all_paths
+        assert any(p.endswith(".parquet") for p in all_paths), all_paths
+
+    def test_scatter_only_is_idempotent(self, tmp_path, monkeypatch):
+        """Re-running the scatter step with the same inventory reuses the
+        existing shards instead of re-reading the inventory."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from earthcatalog import EarthCatalog
+        from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
+        from earthcatalog.config import GridConfig
+        from earthcatalog.ingest_config import IngestConfig
+
+        store = MemoryStore()
+        db = str(tmp_path / "catalog.db")
+        wh = str(tmp_path / "warehouse")
+        cat = _open_sqlite(db, wh)
+        tbl = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
+        ec = EarthCatalog(
+            catalog=cat,
+            table=tbl,
+            info=_catalog_info(tbl),
+            store=store,
+            catalog_key="catalog.db",
+        )
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+
+        inv = tmp_path / "inv.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "bucket": pa.array(["b", "b"], type=pa.string()),
+                    "key": pa.array(["a.stac.json", "b.stac.json"], type=pa.string()),
+                }
+            ),
+            str(inv),
+        )
+
+        import earthcatalog.inventory as _invmod
+
+        calls = {"n": 0}
+        real_write = _invmod.write_inventory_shards
+
+        def counting_write(*args, **kwargs):
+            calls["n"] += 1
+            return real_write(*args, **kwargs)
+
+        monkeypatch.setattr(_invmod, "write_inventory_shards", counting_write)
+
+        cfg = IngestConfig(chunk_size=100, scatter_only=True)
+        r1 = ec.ingest_inventory(str(inv), mode="full", config=cfg)
+        r2 = ec.ingest_inventory(str(inv), mode="full", config=cfg)
+
+        assert calls["n"] == 1, "second scatter run must reuse, not re-scatter"
+        assert r1["scatter"] == r2["scatter"]

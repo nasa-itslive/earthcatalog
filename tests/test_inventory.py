@@ -17,13 +17,21 @@ from unittest.mock import patch
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from obstore.store import MemoryStore
 
-from earthcatalog.pipelines.incremental import (
+from earthcatalog.inventory import (
+    InventoryShard,
     _coerce_last_modified,
     _iter_inventory,
     _iter_inventory_csv,
     _iter_inventory_manifest,
     _iter_inventory_parquet,
+    delete_scatter,
+    delete_shard_files,
+    is_scatter_manifest,
+    load_inventory_shards,
+    scatter_manifest_path,
+    write_inventory_shards,
 )
 
 # ---------------------------------------------------------------------------
@@ -215,7 +223,7 @@ class TestS3CsvPath:
             raw = gzip.compress(raw)
         fake_path = f"s3://fake-bucket/inventory{suffix}"
         with patch(
-            "earthcatalog.pipelines.incremental._fetch_inventory_bytes",
+            "earthcatalog.inventory._fetch_inventory_bytes",
             return_value=raw,
         ):
             assert list(_iter_inventory_csv(fake_path)) == ROWS
@@ -239,7 +247,7 @@ class TestS3CsvPath:
         spy = _Spy(raw)
         fake_path = "s3://fake-bucket/inventory.csv"
         with patch(
-            "earthcatalog.pipelines.incremental._fetch_inventory_bytes",
+            "earthcatalog.inventory._fetch_inventory_bytes",
             return_value=spy,
         ):
             list(_iter_inventory_csv(fake_path))
@@ -473,9 +481,9 @@ class TestIterInventoryManifest:
             return _FakeResult()
 
         with (
-            patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get),
+            patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
             patch(
-                "earthcatalog.pipelines.incremental._get_authenticated_store",
+                "earthcatalog.inventory._get_authenticated_store",
                 return_value="fake-store",
             ),
         ):
@@ -521,11 +529,220 @@ class TestIterInventoryManifest:
             return _R()
 
         with (
-            patch("earthcatalog.pipelines.incremental.obstore.get", side_effect=fake_get),
+            patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
             patch(
-                "earthcatalog.pipelines.incremental._get_authenticated_store",
+                "earthcatalog.inventory.get_authenticated_store",
                 return_value="fake-store",
             ),
         ):
             result = list(_iter_inventory("s3://fake-log-bucket/inventory/manifest.json"))
         assert result == ROWS
+
+
+# ---------------------------------------------------------------------------
+# write_inventory_shards — distributed scatter
+# ---------------------------------------------------------------------------
+
+
+class TestWriteInventoryShards:
+    """Scatter: head streams the inventory and writes fixed-row shard
+    parquets; workers read them back via InventoryShard.iter_pairs()."""
+
+    def test_writes_exact_fixed_row_chunks(self, tmp_path):
+        """5 matching rows, chunk_size=2 → shards of 2, 2, 1 rows."""
+        rows = [("b", f"k{i}.stac.json") for i in range(5)]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        store = MemoryStore()
+        shards = write_inventory_shards(
+            str(p), store, staging_prefix="staging/shards/run1", chunk_size=2
+        )
+
+        assert len(shards) == 3
+        sizes = [len(list(s.iter_pairs())) for s in shards]
+        assert sizes == [2, 2, 1], sizes
+        # Sequential shard names under the run-scoped prefix.
+        assert [s.files[0] for s in shards] == [
+            "staging/shards/run1/shard_00000.parquet",
+            "staging/shards/run1/shard_00001.parquet",
+            "staging/shards/run1/shard_00002.parquet",
+        ]
+        assert [pair for s in shards for pair in s.iter_pairs()] == rows
+
+    def test_suffix_filter_applied_before_chunking(self, tmp_path):
+        """Non-matching keys are dropped before rows are counted into
+        chunks, so every shard is exactly chunk_size matching pairs."""
+        rows = [("b", "a.stac.json"), ("b", "notes.txt"), ("b", "c.stac.json")]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        store = MemoryStore()
+        shards = write_inventory_shards(
+            str(p), store, staging_prefix="staging/s", chunk_size=2, suffix=".stac.json"
+        )
+
+        assert len(shards) == 1
+        assert list(shards[0].iter_pairs()) == [("b", "a.stac.json"), ("b", "c.stac.json")]
+
+    def test_since_and_limit_applied(self, tmp_path):
+        """since drops old rows; limit truncates the matching stream."""
+        rows = [("b", "a.stac.json"), ("b", "b.stac.json"), ("b", "c.stac.json")]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows, lm_dates=[_OLD, _NEW, _NEW])
+
+        store = MemoryStore()
+        shards = write_inventory_shards(
+            str(p), store, staging_prefix="staging/s", chunk_size=10, since=_SINCE, limit=1
+        )
+
+        assert [pair for s in shards for pair in s.iter_pairs()] == [("b", "b.stac.json")]
+
+    def test_manifest_inventory_scattered_regardless_of_part_file_skew(self):
+        """Part files of 2 and 1 rows with chunk_size=2 → uniform 2-row
+        shards, rebalancing whatever skew the source files had."""
+        data1 = _make_parquet_bytes(ROWS[:2])
+        data2 = _make_parquet_bytes(ROWS[2:])
+        manifest_key = "inventory/manifest.json"
+        data_keys = ["inventory/data/part_0.parquet", "inventory/data/part_1.parquet"]
+        manifest = _make_manifest_json("fake-log-bucket", data_keys)
+
+        def fake_get(store, key):
+            class _R:
+                def bytes(self_):
+                    if key == manifest_key:
+                        return manifest
+                    idx = int(key.split("part_")[1].split(".")[0])
+                    return [data1, data2][idx]
+
+            return _R()
+
+        store = MemoryStore()
+        with (
+            patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
+            patch(
+                "earthcatalog.inventory.get_authenticated_store",
+                return_value="fake-store",
+            ),
+        ):
+            shards = write_inventory_shards(
+                "s3://fake-log-bucket/inventory/manifest.json",
+                store,
+                staging_prefix="staging/s",
+                chunk_size=2,
+            )
+
+        sizes = [len(list(s.iter_pairs())) for s in shards]
+        assert sizes == [2, 1], sizes
+
+    def test_delete_shard_files_removes_written_shards(self, tmp_path):
+        """Cleanup deletes exactly the shard files the scatter wrote."""
+        rows = [("b", f"k{i}.stac.json") for i in range(3)]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        store = MemoryStore()
+        shards = write_inventory_shards(str(p), store, staging_prefix="staging/s", chunk_size=2)
+        assert len(shards) == 2
+
+        deleted = delete_shard_files(store, shards)
+        assert deleted == 2
+
+        # delete_shard_files leaves the manifest; delete_scatter (tested
+        # separately) removes both.
+        remaining = [obj["path"] for batch in store.list(prefix="staging/") for obj in batch]
+        assert remaining == ["staging/s/scatter.json"]
+
+    def test_shard_limit_caps_pairs_at_iteration_time(self):
+        """A per-shard limit is applied by iter_pairs(), without needing the
+        head to materialise anything."""
+        shard = InventoryShard(
+            pairs=(("b", "a.stac.json"), ("b", "b.stac.json"), ("b", "c.stac.json")),
+            limit=2,
+        )
+        assert list(shard.iter_pairs()) == [("b", "a.stac.json"), ("b", "b.stac.json")]
+
+    def test_scatter_manifest_round_trip(self, tmp_path):
+        """write_inventory_shards writes a scatter.json that load_inventory_shards
+        reads back; the two-step workflow is a decoupled scatter then map/reduce."""
+        rows = [("b", f"k{i}.stac.json") for i in range(5)]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        store = MemoryStore()
+        shards = write_inventory_shards(
+            str(p), store, staging_prefix="staging/shards/run1", chunk_size=2
+        )
+        manifest_key = scatter_manifest_path("staging/shards/run1")
+        assert is_scatter_manifest(manifest_key)
+
+        # Head is done — scatter.json is the only thing step 2 needs.
+        reloaded = load_inventory_shards(manifest_key, store)
+        assert [s.files for s in reloaded] == [s.files for s in shards]
+        assert [pair for s in reloaded for pair in s.iter_pairs()] == rows
+
+        # Prefix also accepted (load appends scatter.json).
+        assert load_inventory_shards("staging/shards/run1", store)[0].files == shards[0].files
+
+    def test_delete_scatter_removes_shards_and_manifest(self, tmp_path):
+        rows = [("b", f"k{i}.stac.json") for i in range(3)]
+        p = tmp_path / "inv.parquet"
+        _write_parquet(p, rows)
+
+        store = MemoryStore()
+        shards = write_inventory_shards(str(p), store, staging_prefix="staging/s", chunk_size=2)
+        assert len(shards) == 2
+
+        deleted = delete_scatter(store, "staging/s", shards)
+        # 2 shard files + 1 manifest
+        assert deleted == 3
+        remaining = [obj["path"] for batch in store.list(prefix="staging/") for obj in batch]
+        assert remaining == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_items_async — concurrent STAC fetch (obstore.get_async)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchItemsAsync:
+    def test_fetches_concurrently_and_tags_source(self):
+        from earthcatalog.inventory import fetch_items_async
+
+        store = MemoryStore()
+        pairs = [("b", f"dir/item-{i}.stac.json") for i in range(5)]
+        for _, key in pairs:
+            store.put(key, json.dumps({"id": key, "type": "Feature"}).encode())
+
+        # Patch get_store so the async path reads from MemoryStore.
+        import earthcatalog.inventory as _invmod
+
+        original = _invmod.get_store
+        _invmod.get_store = lambda bucket: store
+        try:
+            items = fetch_items_async(pairs, concurrency=8)
+        finally:
+            _invmod.get_store = original
+
+        assert len(items) == 5
+        by_id = {it["id"]: it for it in items}
+        assert by_id["dir/item-3.stac.json"]["_source_bucket"] == "b"
+        assert by_id["dir/item-3.stac.json"]["_source_key"] == "dir/item-3.stac.json"
+
+    def test_skips_missing_keys(self):
+        from earthcatalog.inventory import fetch_items_async
+
+        store = MemoryStore()
+        pairs = [("b", "present.stac.json"), ("b", "missing.stac.json")]
+        store.put("present.stac.json", b'{"id": "present", "type": "Feature"}')
+
+        import earthcatalog.inventory as _invmod
+
+        original = _invmod.get_store
+        _invmod.get_store = lambda bucket: store
+        try:
+            items = fetch_items_async(pairs, concurrency=4)
+        finally:
+            _invmod.get_store = original
+
+        assert [it["id"] for it in items] == ["present"]

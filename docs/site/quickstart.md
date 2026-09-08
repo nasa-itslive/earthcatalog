@@ -5,46 +5,86 @@ catalog backed by Apache Iceberg. Instead of a database, Parquet files sit on S3
 and a small SQLite file tracks the Iceberg schema. DuckDB reads them directly —
 no serialization overhead, no infrastructure.
 
-## Bulk ingest
+## Daily update (the normal path)
 
-First-time full backfill from an S3 Inventory file. Drops any existing table and
-recreates it from scratch.
+Two exact steps. The diff is an out-of-core DuckDB `EXCEPT` between two
+inventory days; the ingest anti-joins the result against the unified index, so
+already-ingested keys are skipped even if a previous run was missed.
 
-```python
-import earthcatalog as ec
-from obstore.store import S3Store
+```bash
+# 1. What changed between yesterday and today?  (exact, string comparison)
+earthcatalog diff \
+    --current  s3://…/inventory/2026-09-06T01-00Z/manifest.json \
+    --previous s3://…/inventory/2026-09-05T01-00Z/manifest.json \
+    --out      s3://…/diffs/new-20260905-20260906.parquet \
+    --out-old  s3://…/diffs/old-20260905-20260906.parquet   # disappeared keys (GC input)
 
-store = S3Store(bucket="its-live-data", region="us-west-2")
-catalog = ec.open(store=store, base="s3://my-bucket/catalog")
-
-catalog.bulk_ingest("s3://bucket/inventory/full.parquet", mode="full",
-                     create_client=lambda: coiled.Client(n_workers=100))
+# 2. Ingest what is actually new (~40k keys ≈ 15 min on a GitHub runner)
+earthcatalog ingest \
+    --diff s3://…/diffs/new-20260905-20260906.parquet \
+    --warehouse s3://my-bucket/catalog/warehouse \
+    --mode delta --fetch-workers 16
 ```
 
-For smaller inventories the single-node path works without Dask:
+`earthcatalog ingest --diff` is:
 
-```python
-catalog.ingest("s3://bucket/inventory/full.parquet", mode="full")
+- **exact** — new = string anti-join against the unified index, no hash
+  collisions, no false "already ingested";
+- **idempotent** — re-running the same command does nothing once everything
+  is indexed;
+- **self-healing** — a crash leaves a small journal; the next run recovers
+  it automatically, and a stale index catches up from the backlog instead of
+  skipping days;
+- **resumable** — every batch commits journal-first; a crash loses at most
+  one batch.
+
+Add `--dry-run` to count `considered / new / already indexed` without writing
+anything, and `--limit N` to bound a test run.
+
+## Full (re)build
+
+First-time build from a complete inventory. Drops the existing table, index,
+and staging area, then ingests everything.
+
+```bash
+earthcatalog ingest \
+  --inventory s3://bucket/inventory/full.parquet \
+  --warehouse s3://my-bucket/catalog/warehouse \
+  --mode full --grid h3 --resolution 1
 ```
 
-## Delta ingest
+`--mode full` resets the table **and** the index and sweeps `_staging/` — a
+populated warehouse re-ingests from zero.
 
-Daily incremental updates. Appends new files to the existing table without
-overwriting, and updates the hash index for duplicate detection.
+## Bulk ingest (Dask/Coiled — not for the daily path)
 
-```python
-catalog.ingest("s3://bucket/delta/2026-04-28.parquet",
-          mode="delta",
-          update_hash_index=True)
+Large historical builds can fan out to a cluster. Stop after the scatter step
+so workers never idle behind the head's inventory read, then run the
+map/reduce:
+
+```bash
+# Step 1: scatter into fixed-row shard files (no cluster needed)
+earthcatalog ingest --inventory s3://bucket/inventory/full.parquet \
+    --mode full --scatter-only
+# Step 2: map/reduce on the cluster
+earthcatalog ingest --inventory s3://…/staging/shards/<run_id>/scatter.json \
+    --mode full --scheduler coiled
 ```
 
-Optionally filter by modification date:
+See the [Ingest Guide](operations/ingest_guide.md) for scheduler options.
 
-```python
-from datetime import UTC, datetime, timedelta
+## Catching up a stale catalog
 
-catalog.ingest("delta.parquet", mode="delta",
-          since=datetime.now(UTC) - timedelta(days=2))
+If the catalog index is behind the inventory (missed runs), the daily flow
+self-corrects: the diff still only carries the days' changes, and the
+anti-join ingests everything the index is missing. For a large gap, diff
+against the index directly:
+
+```bash
+earthcatalog diff --current s3://…/today.manifest.json \
+    --against-index s3://…/catalog/warehouse_index.parquet \
+    --out s3://…/catchup.parquet
+earthcatalog ingest --diff s3://…/catchup.parquet --warehouse s3://…/catalog/warehouse
 ```
 
 ## Search
@@ -141,6 +181,6 @@ df = con.execute(f"""
 
 ```python
 catalog.stats()              # per-partition row/file counts
-catalog.unique_item_count()  # unique STAC items (from hash index)
+catalog.unique_item_count()  # active STAC items (from the unified index)
 catalog.info()               # grid metadata (type, resolution, boundaries)
 ```

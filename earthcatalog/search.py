@@ -453,27 +453,32 @@ def _norm_date(d: str | None) -> str | None:
 
 def _format_bytes(n: int) -> str:
     """Human-readable byte size."""
+    size = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
-        n /= 1024
-    return f"{n:.1f} PB"
+        if size < 1024:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 def _item_in_datetime_range(item: dict, start: str | None, end: str | None) -> bool:
-    """Check if a STAC item's ``properties.datetime`` falls within *start*..*end*.
+    """Check if a STAC item's temporal extent overlaps *start*..*end*.
 
-    Both bounds are inclusive.  ``None`` means unbounded on that side.
-    If both are ``None`` (no temporal filter), all items pass.
+    Items may carry a range (``start_datetime`` / ``end_datetime``, e.g.
+    velocity pairs that span a year boundary) or a single ``datetime``.
+    Overlap semantics: the item matches when its extent intersects the query
+    interval.  Unbounded query sides match everything.
     """
     if start is None and end is None:
         return True
-    dt = item.get("properties", {}).get("datetime")
-    if dt is None:
+    props = item.get("properties", {})
+    item_start = props.get("start_datetime") or props.get("datetime")
+    item_end = props.get("end_datetime") or props.get("datetime")
+    if item_start is None and item_end is None:
         return False
-    if start is not None and dt < start:
+    if start is not None and (item_end or item_start) < start:
         return False
-    if end is not None and dt > end:
+    if end is not None and (item_start or item_end) > end:
         return False
     return True
 
@@ -534,3 +539,30 @@ def _cql2_format_literal(val) -> str:
         escaped = val.replace("'", "''")
         return f"'{escaped}'"
     raise TypeError(f"Unsupported CQL2 literal type: {type(val).__name__}")
+
+
+def build_query(
+    paths: list[str],
+    geom=None,
+    start_dt=None,
+    end_dt=None,
+    raw_filter=None,
+    select: str = "*",
+) -> str:
+    """Build a DuckDB read_parquet SQL query for *paths* with the given filters.
+
+    Shared by ``duck_search`` and ``search_uris`` so the WHERE-building logic
+    lives in exactly one place.
+    """
+    path_list = ", ".join(repr(p) for p in paths)
+    conditions: list[str] = []
+    if geom is not None:
+        conditions.append(f"ST_Intersects(geometry, ST_GeomFromText('{geom.wkt}'))")
+    if start_dt is not None:
+        conditions.append(f"end_datetime >= '{start_dt}'")
+    if end_dt is not None:
+        conditions.append(f"start_datetime <= '{end_dt}'")
+    if raw_filter is not None:
+        conditions.append(_cql2_to_sql(raw_filter))
+    where = " AND ".join(conditions) if conditions else "TRUE"
+    return f"SELECT {select} FROM read_parquet([{path_list}]) WHERE {where}"

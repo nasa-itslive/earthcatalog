@@ -13,7 +13,7 @@ Entry points for opening a catalog, ingesting data, and searching.
     options:
       members:
         - ingest
-        - bulk_ingest
+        - ingest_inventory
         - search
         - search_to_arrow
         - search_files
@@ -27,5 +27,5 @@ Entry points for opening a catalog, ingesting data, and searching.
 |---|---|
 | [`earthcatalog`](core.md) | Catalog, search, transform, lock, schema |
 | [`earthcatalog.grids`](grids.md) | Spatial partitioners (H3, GeoJSON) |
-| [`earthcatalog.pipelines`](pipelines.md) | Incremental and backfill pipelines |
+| [`earthcatalog.pipelines`](pipelines.md) | Ingest pipelines |
 | [`earthcatalog.maintenance`](maintenance.md) | Warehouse compaction |

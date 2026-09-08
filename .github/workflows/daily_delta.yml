@@ -1,29 +1,81 @@
-# WARNING: Disabled until secrets are injected. Use workflow_dispatch to test manually.
-name: Daily Delta
+name: Daily Catalog Update
+
+# One job, two steps:
+#   1. diff:   DuckDB EXCEPT of today's inventory vs yesterday's → new/changed
+#              keys parquet (exact, out-of-core; writes only the diff file).
+#   2. ingest: earthcatalog ingest --diff <file> anti-joins the diff against
+#              the unified index (already-known keys skipped), fetches the
+#              unknown STAC items with a bounded pool, commits, and writes
+#              {warehouse}/_last_run.json (uploaded as an artifact).
+#
+# Every write path (warehouse, catalog db, lock, diffs) is a dispatch input;
+# the defaults are the PRODUCTION catalog paths.  Override them to point a
+# run at the refactoring/ scratch pad instead.  The `concurrency` group is
+# the single-writer guard.  Scheduled daily at 14:00 UTC (inventory manifests
+# are stamped T01-00Z, so 13h of buffer guarantees yesterday's manifest).
 
 on:
-  # schedule:
-  #   - cron: "0 2 * * *" # 02:00 UTC daily
+  schedule:
+    - cron: "0 14 * * *"
   workflow_dispatch:
     inputs:
-      date:
-        description: "Date for delta file name (YYYY-MM-DD). Defaults to today."
+      current_manifest:
+        description: "Current inventory manifest.json (defaults to yesterday)"
+        required: false
+        default: ""
+      previous_manifest:
+        description: "Previous inventory manifest.json (defaults to day before)"
+        required: false
+        default: ""
+      warehouse:
+        description: "Warehouse root (write target)"
+        required: false
+        default: "s3://its-live-data/test-space/stac/catalog/warehouse"
+      catalog_key:
+        description: "Object key the run's earthcatalog.db is uploaded to"
+        required: false
+        default: "test-space/stac/catalog/earthcatalog.db"
+      lock_key:
+        description: "Object key for the advisory lock file"
+        required: false
+        default: "test-space/stac/catalog/.lock"
+      diffs_prefix:
+        description: "Where the diff parquet is written"
+        required: false
+        default: "s3://its-live-data/test-space/stac/catalog/diffs"
+      dry_run:
+        description: "Count only — no warehouse writes at all"
+        required: false
+        default: "false"
+      limit:
+        description: "Cap the number of items ingested (empty = no cap)"
         required: false
         default: ""
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: earthcatalog-daily_delta
+  cancel-in-progress: false
 
 env:
-  AWS_REGION: us-west-2
-  WAREHOUSE_HASH: s3://its-live-data/test-space/stac/catalog/warehouse_id_hashes.parquet
-  DELTA_PREFIX: s3://its-live-data/test-space/stac/catalog/delta
+  AWS_REGION:        us-west-2
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  WAREHOUSE:         ${{ github.event.inputs.warehouse || 's3://its-live-data/test-space/stac/catalog/warehouse' }}
+  CATALOG_KEY:       ${{ github.event.inputs.catalog_key || 'test-space/stac/catalog/earthcatalog.db' }}
+  LOCK_KEY:          ${{ github.event.inputs.lock_key || 'test-space/stac/catalog/.lock' }}
+  DIFFS_PREFIX:      ${{ github.event.inputs.diffs_prefix || 's3://its-live-data/test-space/stac/catalog/diffs' }}
+  DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
+  LIMIT:             ${{ github.event.inputs.limit }}
+  INVENTORY_BASE:    s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory
 
 jobs:
-  produce-delta:
-    name: Produce daily delta
+  daily:
+    name: Diff + ingest
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -38,34 +90,64 @@ jobs:
       - name: Install earthcatalog
         run: uv sync
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Determine manifest URL
-        id: manifest
+      - name: Resolve days and paths
+        id: days
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            DATE="${{ github.event.inputs.date }}"
+          if [ -n "${{ github.event.inputs.current_manifest }}" ]; then
+            echo "current=${{ github.event.inputs.current_manifest }}" >> "$GITHUB_OUTPUT"
           else
-            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
+            echo "current=${{ env.INVENTORY_BASE }}/$(date -u -d 'yesterday' +%Y-%m-%d)T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
           fi
-          echo "date=$DATE" >> "$GITHUB_OUTPUT"
-          echo "manifest_url=s3://pds-buckets-its-live-logbucket-70tr3aw5f2op/inventory/velocity_image_pair/its-live-data/VelocityGranuleInventory/${DATE}T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ github.event.inputs.previous_manifest }}" ]; then
+            echo "previous=${{ github.event.inputs.previous_manifest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "previous=${{ env.INVENTORY_BASE }}/$(date -u -d '2 days ago' +%Y-%m-%d)T01-00Z/manifest.json" >> "$GITHUB_OUTPUT"
+          fi
+          echo "diff_out=${{ env.DIFFS_PREFIX }}/new-$(date -u -d '2 days ago' +%Y%m%d)-$(date -u -d 'yesterday' +%Y%m%d).parquet" >> "$GITHUB_OUTPUT"
 
-      - name: Run daily delta
+      - name: Diff inventories (DuckDB, out-of-core)
         run: |
-          uv run python scripts/daily_delta.py \
-            "${{ steps.manifest.outputs.manifest_url }}" \
-            --warehouse-hash ${{ env.WAREHOUSE_HASH }} \
-            --delta-prefix ${{ env.DELTA_PREFIX }} \
-            --date "${{ steps.manifest.outputs.date }}"
+          uv run earthcatalog diff \
+            --current  "${{ steps.days.outputs.current }}" \
+            --previous "${{ steps.days.outputs.previous }}" \
+            --out      "${{ steps.days.outputs.diff_out }}"
+
+      - name: Ingest the diff
+        run: |
+          ARGS=""
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "$LIMIT" ]; then ARGS="$ARGS --limit $LIMIT"; fi
+          uv run earthcatalog ingest \
+            --diff          "${{ steps.days.outputs.diff_out }}" \
+            --catalog       /tmp/earthcatalog.db \
+            --warehouse     "$WAREHOUSE" \
+            --catalog-key   "$CATALOG_KEY" \
+            --lock-key      "$LOCK_KEY" \
+            --mode          delta \
+            --scheduler     synchronous \
+            --fetch-workers 16 \
+            --chunk-size    10000 \
+            $ARGS
+
+      - name: Download run summary
+        if: always()
+        run: |
+          aws s3 cp "${{ env.WAREHOUSE }}/_last_run.json" ./_last_run.json || \
+            echo "::warning::no _last_run.json produced"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: last-run
+          path: _last_run.json
+          if-no-files-found: ignore
 
       - name: Summary
         if: always()
         run: |
-          echo "### Delta Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "Date: ${{ steps.manifest.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Manifest: \`${{ steps.manifest.outputs.manifest_url }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Daily Update" >> "$GITHUB_STEP_SUMMARY"
+          echo "Warehouse: \`${WAREHOUSE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: \`${DRY_RUN}\`  Limit: \`${LIMIT:-none}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Current: \`${{ steps.days.outputs.current }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Previous: \`${{ steps.days.outputs.previous }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Diff: \`${{ steps.days.outputs.diff_out }}\`" >> "$GITHUB_STEP_SUMMARY"
+          test -f _last_run.json && cat _last_run.json >> "$GITHUB_STEP_SUMMARY" || true
