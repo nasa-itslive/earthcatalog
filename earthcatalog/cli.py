@@ -453,7 +453,8 @@ def info(
     catalog_s3: str | None = typer.Option(
         None,
         "--catalog-s3",
-        help="s3:// URI to auto-download the catalog from.",
+        help="s3:// URI to auto-download the catalog from (defaults to the "
+        "earthcatalog.db beside the warehouse).",
     ),
     warehouse: str = typer.Option(
         "s3://its-live-data/test-space/stac/catalog/warehouse",
@@ -468,15 +469,15 @@ def info(
 ) -> None:
     """Print a catalog summary: grid metadata, file/row counts, year distribution.
 
-    Reads the maintained ``stats.json`` snapshot at the top of the catalog
-    when present (instant); ``--verify`` recomputes it the expensive way.
+    With no arguments this reads the default production catalog and its
+    maintained ``stats.json`` snapshot — instant, no data scans.
+    ``--verify`` recomputes the snapshot the expensive way.
     """
     import os
     from pathlib import Path
 
     if not catalog and not catalog_s3:
-        typer.echo("ERROR: specify --catalog or --catalog-s3")
-        raise typer.Exit(1)
+        catalog_s3 = f"{warehouse.rsplit('/', 1)[0]}/earthcatalog.db"
 
     catalog_path = catalog or "/tmp/earthcatalog_info.db"
     if catalog_s3:
