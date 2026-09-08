@@ -382,6 +382,10 @@ class IngestPipeline:
             for bulk_only in ("skip_fetch", "skip_compact", "fetch_concurrency"):
                 serial_kwargs.pop(bulk_only, None)
             serial_kwargs.pop("dedupe", None)  # pairs already filtered
+            if cat._catalog_key:
+                # Durable per batch: the uploaded db must never lag the index
+                # by more than one batch, whatever the run length.
+                serial_kwargs["upload_db"] = lambda: cat.upload_catalog(local_db)
             summary = Ingester(**serial_kwargs).run(pairs_iter)
 
         summary["source"] = source
@@ -396,11 +400,7 @@ class IngestPipeline:
         return summary
 
     def _reconcile(self, summary: dict) -> None:
-        """Post-ingest report: what the index and Iceberg hold *right now*.
-
-        Metadata-only counts — DuckDB over the index parts, manifest
-        statistics for the table.  No full scans, no item fetches.
-        """
+        """Post-ingest report: index and Iceberg contents now (metadata-only)."""
         from .index import Index, resolve_index_path
 
         cat = self._cat

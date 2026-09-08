@@ -104,6 +104,37 @@ class TestDirectMode:
             "s3://data-bucket/b.stac.json",
         }
 
+    def test_upload_db_fires_per_batch(self):
+        """upload_db fires once per durable batch commit — the uploaded
+        catalog db must never lag the index by more than one batch."""
+        uploads = {"n": 0}
+
+        store = MemoryStore()
+        index = Index(store, "warehouse/index.parquet")
+
+        class _FakeTable:
+            def __init__(self):
+                self.files: list[str] = []
+                self.properties: dict[str, str] = {}
+
+            def add_files(self, paths):
+                self.files.extend(paths)
+
+        def _count():
+            uploads["n"] += 1
+
+        ing = Ingester(
+            store=store,
+            index=index,
+            table=_FakeTable(),
+            fetch_fn=lambda b, k: _make_item(k),
+            warehouse_prefix="warehouse/",
+            batch_size=2,
+            upload_db=_count,
+        )
+        ing.run(_inventory(["a.stac.json", "b.stac.json", "c.stac.json"]))
+        assert uploads["n"] == 2  # batches of 2 → two non-empty flushes
+
 
 class TestResume:
     def test_crash_midrun_resumes_without_duplicates(self):

@@ -63,6 +63,7 @@ class Ingester:
         fetch_workers: int = 1,
         delta: bool = False,
         dedupe: Callable[[Iterator], Iterator] | None = None,
+        upload_db: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._index = index
@@ -75,12 +76,12 @@ class Ingester:
         self._fetch_workers = fetch_workers
         self._delta = delta
         self._dedupe = dedupe
-        # Schema-driven hive layout (grid, level, time_bin) — a plain tuple
-        # so it can ship to Dask workers.
+        # Upload the catalog db after each durable batch (crash safety).
+        self._upload_db = upload_db
+        # Schema-driven hive layout (grid, level, time_bin), worker-safe.
         self._layout = layout_of(table.properties)
-        # Resume filter: pairs -> pairs with known keys removed.  Production
-        # runs inject the DuckDB anti-join (diff.anti_join); without one the
-        # run falls back to a set-based filter against the index.
+        # Resume filter: production injects the DuckDB anti-join
+        # (diff.anti_join); without one the run falls back to a set filter.
 
     def _full_path(self, rel_key: str) -> str:
         """Map a store-relative key to the full URI Iceberg ``add_files`` needs."""
@@ -210,12 +211,14 @@ class Ingester:
         new_paths, index_rows, rows = self._write_direct(items, on_file=on_file)
         if new_paths:
             # Iceberg commits first, the index part second: a crash between
-            # the two leaves the rows in the journal, and recovery writes
-            # exactly this part (deterministic {run_id}/{seq} name).
+            # the two leaves the rows in the journal, recovered as this
+            # exact part (deterministic {run_id}/{seq} name).
             self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
                 part = f"{journal.run_id}/{seq:04d}" if journal is not None else None
                 self._index.append(index_rows, part=part)
+            if self._upload_db is not None:
+                self._upload_db()
         if journal is not None:
             journal.finish_batch(seq or 0)
         return rows
@@ -544,11 +547,10 @@ def _write_direct(
     """Write items to GeoParquet without touching the table/index.
 
     Worker-safe (plain state only) so a distributed caller can fan out this
-    function and commit once on the head.  *on_file(rel_key, index_rows)*,
-    when given, fires after each file is durably written — the journal's
-    per-file update.  *layout* is the schema-driven ``(grid, level,
-    time_bin)`` tuple; keys are built with :func:`partition_prefix`.
-    Returns ``(new_paths, index_rows, rows)``.
+    function and commit once on the head.  *on_file(rel_key, index_rows)*
+    fires after each durably-written file (the journal's per-file update);
+    keys follow the schema-driven *layout*.  Returns the 3-tuple
+    ``(new_paths, index_rows, rows)``.
     """
     grid, level, time_bin = layout
     fo = fan_out(items, partitioner) if partitioner else items
@@ -575,10 +577,8 @@ def _write_direct(
 def _fetch_items(fetch_fn, pairs: list[tuple[str, str]], concurrency: int) -> list:
     """Fetch STAC items for (bucket, key) pairs concurrently, dropping Nones.
 
-    The default fetch (``earthcatalog.inventory.fetch_item``) runs through the
-    async path (``obstore.get_async`` + orjson, like ``main``) — true I/O
-    concurrency without a thread per request.  A custom ``fetch_fn`` (tests)
-    falls back to a thread pool.
+    The default fetcher uses the async obstore path (true I/O concurrency,
+    no thread per request); a custom ``fetch_fn`` (tests) uses a thread pool.
     """
     if fetch_fn is _inventory.fetch_item:
         return _inventory.fetch_items_async(pairs, concurrency=concurrency)
