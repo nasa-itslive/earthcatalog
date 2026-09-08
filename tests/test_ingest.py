@@ -41,6 +41,7 @@ def _run(
     *,
     fetch_fn=None,
     batch_size: int = 2,
+    partitioner=None,
 ):
     """Run an ingest to completion on MemoryStore, returning (store, ingester)."""
     store = MemoryStore()
@@ -64,6 +65,7 @@ def _run(
         index=index,
         table=table,
         fetch_fn=fetch_fn or _default_fetch,
+        partitioner=partitioner,
         warehouse_prefix="warehouse/",
         batch_size=batch_size,
     )
@@ -134,6 +136,35 @@ class TestDirectMode:
         )
         ing.run(_inventory(["a.stac.json", "b.stac.json", "c.stac.json"]))
         assert uploads["n"] == 2  # batches of 2 → two non-empty flushes
+
+    def test_index_rows_carry_fanout_cells(self):
+        """Index rows must record the fan-out cell — GC locates the files to
+        rewrite through it, and a multi-cell item touches several partitions
+        (one index row per source key × cell)."""
+        import shapely.geometry
+
+        from earthcatalog.grids.h3_partitioner import H3Partitioner
+
+        wide = {
+            "id": "item-wide",
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0.0, 58.0], [6.0, 58.0], [6.0, 63.0], [0.0, 63.0], [0.0, 58.0]]],
+            },
+            "properties": {"datetime": "2020-05-01T00:00:00Z", "platform": "sentinel-1"},
+            "_source_bucket": "data-bucket",
+            "_source_key": "wide.stac.json",
+        }
+        p = H3Partitioner(resolution=1)
+        cells = set(p.get_intersecting_keys(shapely.geometry.shape(wide["geometry"]).wkb))
+        assert len(cells) >= 2, "test polygon must span several cells"
+
+        store, _, index, _ = _run(["wide.stac.json"], fetch_fn=lambda b, k: wide, partitioner=p)
+        rows = [r for r in index.stream_active() if r["stac_id"] == "item-wide"]
+        assert {r["grid_partition"] for r in rows} == cells
+        assert len(rows) == len(cells)  # one row per (key, cell)
+        assert all(r["grid_partition"] != "__none__" for r in rows)
 
 
 class TestResume:
