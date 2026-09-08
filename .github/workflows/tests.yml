@@ -33,10 +33,12 @@ jobs:
           source .venv/bin/activate
           uv sync --extra dev
 
-      - name: Run tests (unit + integration)
+      - name: Run tests (unit)
         run: |
           source .venv/bin/activate
-          pytest --tb=short -q -m "not performance"
+          # Hermetic PR gate: integration/e2e tests hit real S3 and are run
+          # on demand (workflow dispatch or locally), not on every PR.
+          pytest --tb=short -q -m "not integration and not performance and not e2e"
 
       - name: Upload test results
         if: failure()
@@ -75,4 +77,4 @@ jobs:
           earthcatalog diff --help
           earthcatalog info --help
           earthcatalog migrate-indices --help
-          python -c "import earthcatalog, earthcatalog.diff, earthcatalog.keydiff, earthcatalog.journal, earthcatalog.migrate; print('imports ok')"
+          python -c "import earthcatalog, earthcatalog.diff, earthcatalog.journal, earthcatalog.migrate; print('imports ok')"
