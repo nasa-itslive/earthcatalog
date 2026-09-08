@@ -162,8 +162,17 @@ def consolidate_partition(
     dir_key = first_key.rsplit("/", 1)[0]
 
     tables: list[pa.Table] = []
+    already_missing = 0
     for uri in plan.files:
-        raw = bytes(obstore.get(store, _key(uri, warehouse_prefix)).bytes())
+        try:
+            raw = bytes(obstore.get(store, _key(uri, warehouse_prefix)).bytes())
+        except FileNotFoundError:
+            # A previous run committed the delete but crashed before its db
+            # upload — the metadata still lists the object.  Its rows only
+            # survive if this run's predecessor already merged them; count
+            # what actually exists and let the verification below speak.
+            already_missing += 1
+            continue
         tables.append(pq.ParquetFile(io.BytesIO(raw)).read())
     merged = pa.concat_tables(tables)
     if dedupe and merged.num_rows:
@@ -216,6 +225,7 @@ def consolidate_partition(
         "rows": rows,
         "rows_removed_dupes": sum(t.num_rows for t in tables) - rows,
         "old_files_deleted": removed,
+        "already_missing": already_missing,
         "new_file": new_key,
     }
 

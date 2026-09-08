@@ -115,6 +115,32 @@ def test_consolidate_dedupes(warehouse):
     assert _table_ids(table) == [f"item-{i}.stac.json" for i in range(5)]
 
 
+def test_consolidate_tolerates_already_deleted_files(warehouse):
+    """Crash window from a previous run: its commit landed but the db
+    upload didn't, so metadata lists objects already deleted on S3.
+    Consolidation must heal the partition from what physically exists."""
+    store, table, wh = warehouse
+    plans = plan(table, min_files=3)
+    victim = plans[0].files[0]  # whichever part sorts first in the metadata
+    from earthcatalog.consolidate import _key
+
+    victim_key = _key(victim, "warehouse")
+    import io
+
+    import pyarrow.parquet as pq
+
+    victim_rows = pq.ParquetFile(io.BytesIO(bytes(store.get(victim_key).bytes()))).metadata.num_rows
+    store.delete(victim_key)
+
+    reports = run(store, table, "warehouse", min_files=3)
+
+    assert reports[0]["already_missing"] == 1
+    assert reports[0]["rows"] == 5 - victim_rows
+    assert _part_file_count(store) == 1
+    assert sum(1 for _ in table.scan().plan_files()) == 1
+    assert table.scan().count() == 5 - victim_rows
+
+
 def test_dry_run_writes_nothing(warehouse):
     store, table, _ = warehouse
     reports = run(store, table, "warehouse", min_files=3, dry_run=True)
