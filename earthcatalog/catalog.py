@@ -960,6 +960,27 @@ class EarthCatalog:
                     "local_db or catalog_key unavailable."
                 )
 
+        if not dry_run and self._store:
+            # Refresh the catalog-stats snapshot at the durable commit
+            # moment (GC removed confirmed items from warehouse and index).
+            from . import stats as stats_mod
+
+            def _apply(s):
+                return stats_mod.apply_gc(
+                    s,
+                    confirmed=result.get("confirmed", 0),
+                    rows_removed=result.get("rows_removed", 0),
+                )
+
+            stats_mod.refresh_after(
+                self._store,
+                stats_mod.stats_key_for(warehouse_root),
+                self._table,
+                Index(self._store, index_key),
+                stats_mod.index_locations(self._table, self._store, warehouse_root),
+                apply=_apply,
+            )
+
         return result
 
     def lock(self, owner: str, ttl_hours: int = 12):
