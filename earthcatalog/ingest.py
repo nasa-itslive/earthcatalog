@@ -1,25 +1,10 @@
 """
-Resumable STAC ingest — the single ingest path for earthcatalog.
-
-Replaces the three legacy entry points (``incremental.run``,
-``backfill.run_backfill``, ``EarthCatalog.ingest``) with one pipeline whose
-checkpoint is the unified :class:`earthcatalog.index.Index`.
-
-Resume model
-------------
-The index records every source key (``s3://bucket/key``) that has been
-durably ingested.  On every run we skip source keys already in the index —
-a crash wastes nothing because re-running simply continues from where the
-last successful ``index.append`` left off.  A crash *before* ``index.append``
-is recovered by compaction (which dedups on ``id_hash``), so the system is
-eventually consistent and idempotent.
-
-Modes
------
-``stage="direct"`` — fan-out items are written straight to GeoParquet.
-``stage="ndjson"`` — items are first fanned out to per-(cell, year) NDJSON
-    (useful for PGSTAC interchange), then compacted to GeoParquet in a
-    second pass.
+Resumable STAC ingest — the single ingest path for earthcatalog.  The
+unified :class:`earthcatalog.index.Index` is the resume checkpoint: every
+run skips source keys already recorded there, so crashes waste nothing and
+re-runs are idempotent.  ``stage="direct"`` writes fan-out items straight
+to GeoParquet; ``stage="ndjson"`` stages per-partition NDJSON first (bulk
+profile, PGSTAC interchange) and compacts in a second pass.
 """
 
 from __future__ import annotations
@@ -109,8 +94,8 @@ class Ingester:
         considered = 0
         pending: list[dict] = []
 
-        # Close any crash window left by a previous run (no-op list when
-        # there are no journals), then journal this run's own batches.
+        # Close any crash window left by a previous run, then journal this
+        # run's own batches.
         recovery = recover_journals(
             self._store,
             self._warehouse_prefix,
@@ -559,7 +544,20 @@ def _write_direct(
 
     rows = 0
     new_paths: list[str] = []
-    index_rows = [_to_index_row(it) for it in items if it.get("_source_key")]
+    # Index rows come from the FAN-OUT items: only those carry
+    # grid_partition (fetched STAC items never do), and GC locates the
+    # files to rewrite through it — so a multi-cell item yields one row
+    # per (source key, cell), and GC cleans every partition it touched.
+    index_rows = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for it in fo:
+        if not it.get("_source_key"):
+            continue
+        pair = (it["_source_key"], it.get("properties", {}).get("grid_partition", "__none__"))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        index_rows.append(_to_index_row(it))
 
     for (cell, bin_val), group in group_by_partition(fo, time_bin).items():
         prefix = partition_prefix(warehouse_prefix, grid, level, cell, time_bin, bin_val)

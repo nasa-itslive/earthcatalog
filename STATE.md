@@ -75,7 +75,36 @@ db backed up at `refactoring/backups/earthcatalog-pre-catchup-20260907.db`.
 **Production flip — applied (2026-09-08, user GO).** `daily_delta.yml`
 defaults now target `catalog/` (warehouse, catalog db, lock, diffs) and run
 on a daily 14:00 UTC schedule (manifests are stamped T01-00Z; 13h buffer).
-The schedule takes effect once this branch merges to main.
+`consolidate.yml` runs Sundays 08:00 UTC after the GC slot.
+
+**Consolidation — shipped + fully run (2026-09-08).** `earthcatalog/consolidate.py`
+replaces the legacy script: metadata-only planning, memory-bounded streaming
+(one file + id-set in RAM; partitions capped at 512MB/5M rows in `plan()`),
+serial per tile, one atomic Iceberg transaction per partition (predicate
+delete + append; old objects deleted only after the commit, per-key
+retries, non-fatal).  Crash-window healing: adopts the previous run's
+orphaned merged output when listed files are missing.  CLI:
+`earthcatalog consolidate --min-files --limit-tiles --dry-run`.
+Full production run: 286 partitions, 7,178 files removed (11,822 → 4,644),
+row count preserved to within 2 — both verified as duplicate-id dedupe
+(the index itself has zero duplicate ids).
+
+**GC validation on warehouse-ci (2026-09-08) — found + fixed a real bug.**
+The validation run (3 simulated deletions) exposed that `_write_direct`
+built index rows from *pre-fan-out* items, so appended index rows recorded
+`grid_partition="__none__"` and GC could locate no files — a silent no-op.
+Fixed: index rows come from fan-out items, one per (source key, cell), so
+multi-cell orphans are cleaned from every partition they touched.
+Validated end-to-end on warehouse-ci: dry-run exact (3 candidates, 0
+writes), live run removed all fan-out rows of the 3 items across ~200
+multi-cell partitions, index soft-deletes correct.
+
+**REQUIRED before the first production GC:** repair the production index's
+`grid_partition` column (394,964 catch-up rows + 42.85M legacy rows all
+need cell attribution from the table) and make GC derive orphan partitions
+from Iceberg metadata (iterate-to-fixpoint), not index cells — the
+straggler lesson: a multi-cell item can retain one row in a partition its
+index row didn't mention.
 
 **Stale-metadata repair — done (2026-09-08).** The PR's integration tests
 exposed that the live `earthcatalog.db` still referenced the pre-migration

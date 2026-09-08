@@ -334,6 +334,95 @@ def migrate_indices_command(
 
 
 # ---------------------------------------------------------------------------
+# `consolidate` sub-command — merge small parts per partition
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def consolidate(
+    catalog: str = typer.Option(
+        "/tmp/earthcatalog.db",
+        "--catalog",
+        help="Local SQLite Iceberg catalog path (downloaded from the warehouse when remote).",
+    ),
+    warehouse: str = typer.Option(
+        ...,
+        "--warehouse",
+        help="Warehouse root (s3:// URI or local path).",
+    ),
+    min_files: int = typer.Option(
+        4,
+        "--min-files",
+        help="Consolidate partitions holding at least this many files.",
+    ),
+    limit_tiles: int | None = typer.Option(
+        None,
+        "--limit-tiles",
+        help="Cap how many partitions to consolidate (biggest offenders first).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report consolidation targets without writing anything.",
+    ),
+) -> None:
+    """Merge a partition's small parts into one file, atomically in Iceberg.
+
+    Metadata-only planning; the replacement is a single Iceberg transaction
+    (drop old files, append the merged one), and old objects are deleted
+    only after that commit succeeds.
+    """
+    import os
+    from pathlib import Path as _Path
+
+    from obstore.store import LocalStore, S3Store
+
+    from earthcatalog.catalog import _open_sqlite, download_catalog, upload_catalog
+    from earthcatalog.consolidate import run as run_consolidation
+    from earthcatalog.run import _make_s3_store
+
+    catalog_key = None
+    if warehouse.startswith("s3://"):
+        bucket, key_path = warehouse.removeprefix("s3://").split("/", 1)
+        store: S3Store | LocalStore = _make_s3_store(bucket)
+        warehouse_prefix = key_path.rstrip("/")
+        catalog_key = os.environ.get(
+            "EARTHCATALOG_CATALOG_KEY", f"{warehouse_prefix}/earthcatalog.db"
+        )
+        if not os.path.exists(catalog):
+            download_catalog(catalog, store=store, catalog_key=catalog_key)
+    else:
+        store = LocalStore(str(_Path(warehouse).parent))
+        warehouse_prefix = _Path(warehouse).name
+
+    cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
+    table = cat.load_table("earthcatalog.stac_items")
+
+    reports = run_consolidation(
+        store,
+        table,
+        warehouse_prefix,
+        min_files=min_files,
+        limit_tiles=limit_tiles,
+        dry_run=dry_run,
+    )
+    for r in reports:
+        typer.echo(
+            f"{r['tile']}/{r['bin_value']}: "
+            + (
+                f"[dry-run] {r['files']} files, {r['rows']:,} rows, {r['bytes']:,} bytes"
+                if r.get("dry_run")
+                else f"{r['files_before']} → {r['files_after']} files, "
+                f"{r['rows']:,} rows, {r['rows_removed_dupes']:,} dupes removed"
+            )
+        )
+    typer.echo(f"{len(reports)} partition(s) {'targeted' if dry_run else 'consolidated'}")
+
+    if not dry_run and catalog_key:
+        upload_catalog(catalog, store=store, catalog_key=catalog_key)
+
+
+# ---------------------------------------------------------------------------
 # `info` sub-command — catalog summary
 # ---------------------------------------------------------------------------
 
