@@ -449,8 +449,7 @@ def info(
         typer.echo("ERROR: specify --catalog or --catalog-s3")
         raise typer.Exit(1)
 
-    assert catalog is not None
-    catalog_path = catalog
+    catalog_path = catalog or "/tmp/earthcatalog_info.db"
     if catalog_s3:
         import obstore
         from obstore.store import S3Store
@@ -528,15 +527,32 @@ def info(
         else:
             idx = _Index(LocalStore(str(Path(index_path).parent)), Path(index_path).name)
             full = [str(Path(index_path).parent / loc) for loc in idx.locations()]
-        unique = idx.count_active()
-        typer.echo(f"  Unique items  : {unique:,}")
+        typer.echo(f"  Index rows    : {idx.count_active():,}")
+
+        # Unique items = distinct source keys (multi-cell items hold one
+        # index row per cell, so a plain row count overstates them).
+        try:
+            import duckdb
+
+            con = duckdb.connect()
+            con.execute("INSTALL aws; LOAD aws; CALL load_aws_credentials();")
+            con.execute("SET s3_region='us-west-2';")
+            loc_list = ", ".join(f"'{loc}'" for loc in full)
+            unique_row = con.execute(
+                f"SELECT count(DISTINCT s3_key) FROM read_parquet([{loc_list}]) WHERE NOT deleted"
+            ).fetchone()
+            unique = int(unique_row[0]) if unique_row else 0
+        except Exception as exc:
+            typer.echo(f"  Unique items  : unavailable ({exc})")
+        else:
+            typer.echo(f"  Unique items  : {unique:,}")
         per_day = idx.items_per_day(days=14, locations=full)
         if per_day:
             typer.echo("  Items per day :")
             for d, n in per_day:
                 typer.echo(f"    {d}: {n:,}")
     except Exception as exc:
-        typer.echo(f"  Unique items  : unavailable ({exc})")
+        typer.echo(f"  Items per day : unavailable ({exc})")
 
 
 # ---------------------------------------------------------------------------
