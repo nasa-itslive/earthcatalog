@@ -102,8 +102,9 @@ multi-cell partitions, index soft-deletes correct.
 **Index location unified (2026-09-08, user request).** The index now lives
 entirely under `warehouse_index/` as partitioned parts — the legacy single
 file `warehouse_index.parquet` (1.58 GB, 42,850,169 rows) was streamed into
-43 × 1M-row base parts (`base-20260908/`), joined by the catch-up parts and
-all future daily appends.  Final state: 43,440,147 rows (= 43,245,133 keys
+36 flat part files directly under `warehouse_index/` (no subdirectories —
+part names are flat: `part_NNNNN.parquet`, daily appends `{run_id}--{seq}.parquet`),
+joined by all future daily appends.  Final state: 43,440,147 rows (= 43,245,133 keys
 + 195,014 multi-cell expansions), distinct keys exact, 0 `__none__`,
 0 deleted.  Legacy file backed up at
 `refactoring/backups/warehouse_index-legacy-20260908.parquet`.

@@ -28,7 +28,7 @@ Index(store, key)
 
 append(rows, part=None) -> int
     Write one new part (never reads existing parts).  *part* is a
-    deterministic sub-path (``{run_id}/{seq:04d}`` in production) so crash
+    deterministic flat name (``{run_id}--{seq:04d}`` in production) so crash
     recovery can rewrite the exact part it owes.
 
 locations() -> list[str], exists() -> bool
@@ -153,7 +153,7 @@ class Index:
 
         Never reads existing parts — the daily cost is the delta, not the
         catalog.  *part* is a deterministic sub-path (production:
-        ``{run_id}/{seq:04d}``, so crash recovery can rewrite exactly the
+        ``{run_id}--{seq:04d}``, so crash recovery can rewrite exactly the
         part it owes); omitted, an opaque id is generated.
         """
         if not rows:
@@ -176,7 +176,7 @@ class Index:
             schema=_SCHEMA,
         )
 
-        part_id = part or f"_auto/{uuid.uuid4().hex}"
+        part_id = part or f"_auto--{uuid.uuid4().hex}"
         buf = io.BytesIO()
         pq.write_table(tbl, buf, compression="zstd")
         obstore.put(self._store, f"{self._base}/{part_id}.parquet", buf.getvalue())

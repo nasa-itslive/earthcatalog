@@ -195,7 +195,7 @@ def recover_journals(
         if files_registered:
             # Crash inside the window: add_files done, index part not
             # written.  Recovery writes the exact part the crashed run owed
-            # (deterministic {run_id}/{seq} name) and drops the journal.
+            # (deterministic {run_id}--{seq} name) and drops the journal.
             if rows:
                 # An item spanning multiple cells is journaled once per file;
                 # the normal path appends one row per source key.
@@ -204,7 +204,7 @@ def recover_journals(
                     unique.setdefault(r["s3_key"], r)
                 run_id = jkey.rsplit("/", 2)[-2]
                 seq = jkey.rsplit("/", 1)[-1].removesuffix(".json")
-                index.append(list(unique.values()), part=f"{run_id}/{seq}")
+                index.append(list(unique.values()), part=f"{run_id}--{seq}")
                 report["rows_appended"] += len(unique)
             obstore.delete(store, jkey)
         else:
