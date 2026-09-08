@@ -44,12 +44,22 @@ class PartitionPlan:
         return (self.tile, self.bin_value)
 
 
-def plan(table, *, min_files: int = 4, limit_tiles: int | None = None) -> list[PartitionPlan]:
+def plan(
+    table,
+    *,
+    min_files: int = 4,
+    limit_tiles: int | None = None,
+    max_bytes: int = 512_000_000,
+    max_rows: int = 5_000_000,
+) -> list[PartitionPlan]:
     """Rank partitions by file count (metadata-only; never touches data).
 
     *min_files* is the consolidation trigger; *limit_tiles* caps how many
-    partitions are returned (the biggest offenders first).  The ``unknown``
-    temporal bin is skipped — its files carry no datetime to predicate on.
+    partitions are returned (the biggest offenders first).  Partitions
+    bigger than *max_bytes* or *max_rows* are skipped — a consolidation
+    holds one partition's rows in memory, and the caps keep that bounded
+    on a CI runner.  The ``unknown`` temporal bin is skipped too (its
+    files carry no datetime to predicate on).
     """
     time_bin = table.properties.get("earthcatalog.time_bin", "year")
     groups: dict[tuple[str, str], list] = defaultdict(list)
@@ -61,14 +71,18 @@ def plan(table, *, min_files: int = 4, limit_tiles: int | None = None) -> list[P
     for (tile, bv), dfs in groups.items():
         if len(dfs) < min_files or bv == "unknown":
             continue
+        total_bytes = sum(df.file_size_in_bytes for df in dfs)
+        total_rows = sum(df.record_count for df in dfs)
+        if total_bytes > max_bytes or total_rows > max_rows:
+            continue
         paths = tuple(df.file_path for df in dfs)
         plans.append(
             PartitionPlan(
                 tile=tile,
                 bin_value=bv,
                 files=paths,
-                total_rows=sum(df.record_count for df in dfs),
-                total_bytes=sum(df.file_size_in_bytes for df in dfs),
+                total_rows=total_rows,
+                total_bytes=total_bytes,
             )
         )
     plans.sort(key=lambda p: (-len(p.files), p.total_bytes))
@@ -161,31 +175,22 @@ def consolidate_partition(
     first_key = _key(plan.files[0], warehouse_prefix)
     dir_key = first_key.rsplit("/", 1)[0]
 
-    tables: list[pa.Table] = []
-    already_missing = 0
-    for uri in plan.files:
-        try:
-            raw = bytes(obstore.get(store, _key(uri, warehouse_prefix)).bytes())
-        except FileNotFoundError:
-            # A previous run may have gotten partway through this partition
-            # before dying; what matters is whether its merged output exists.
-            already_missing += 1
-            continue
-        tables.append(pq.ParquetFile(io.BytesIO(raw)).read())
-
-    # Missing files are the signature of a crash window: the previous run's
-    # merged output — which holds MORE than the surviving files — may sit in
-    # the directory, unregistered.  If so, adopt it; never merge from fewer
+    # One listing replaces N failed GETs: compare what physically exists
+    # against what the metadata lists.  Missing files are the signature of
+    # a crash window — the previous run's merged output may sit in the
+    # directory, unregistered.  If so, adopt it; never merge from fewer
     # rows when the fuller file is right there.
+    meta_keys = {_key(u, warehouse_prefix) for u in plan.files}
+    listed = {
+        obj["path"]
+        for listing in obstore.list(store, prefix=dir_key)
+        for obj in listing
+        if obj["path"].endswith(".parquet")
+    }
+    already_missing = len(meta_keys - listed)
     orphan_key: str | None = None
     if already_missing:
-        listed = {
-            obj["path"]
-            for listing in obstore.list(store, prefix=dir_key)
-            for obj in listing
-            if obj["path"].endswith(".parquet")
-        }
-        candidates = sorted(listed - {_key(u, warehouse_prefix) for u in plan.files})
+        candidates = sorted(listed - meta_keys)
         orphan_key = candidates[0] if candidates else None
 
     new_uri: str | None = None
@@ -198,28 +203,49 @@ def consolidate_partition(
         rows = pq.ParquetFile(
             io.BytesIO(bytes(obstore.get(store, new_key).bytes()))
         ).metadata.num_rows
-    elif tables:
-        merged = pa.concat_tables(tables)
-        if dedupe and merged.num_rows:
-            seen: set[str] = set()
-            keep: list[bool] = []
-            for item_id in merged.column("id").to_pylist():
-                keep.append(item_id not in seen)
-                seen.add(item_id)
-            merged = merged.filter(pa.array(keep))
-        rows = merged.num_rows
-
-        seq = _next_seq(dir_key, store)
-        new_key = f"{dir_key}/part_{seq:06d}.parquet"
-        buf = io.BytesIO()
-        pq.write_table(merged, buf, compression="zstd")
-        data = buf.getvalue()
-        obstore.put(store, new_key, data)
-        if pq.ParquetFile(io.BytesIO(data)).metadata.num_rows != rows:
-            obstore.delete(store, new_key)
-            raise RuntimeError(f"consolidation verification failed for {dir_key}")
-        new_uri = plan.files[0].rsplit("/", 1)[0] + f"/part_{seq:06d}.parquet"
-        removed_dupes = sum(t.num_rows for t in tables) - rows
+    elif meta_keys & listed:
+        # Stream one source file at a time into the output ParquetWriter:
+        # memory peaks at a single file plus the dedupe id set, never at
+        # the whole partition (plan() caps partition sizes upstream).
+        sink = io.BytesIO()
+        writer: pq.ParquetWriter | None = None
+        seen: set[str] = set()
+        rows_in = 0
+        for uri in plan.files:
+            key = _key(uri, warehouse_prefix)
+            if key not in listed:
+                continue
+            tbl = pq.ParquetFile(io.BytesIO(bytes(obstore.get(store, key).bytes()))).read()
+            rows_in += tbl.num_rows
+            if dedupe:
+                keep: list[bool] = []
+                for item_id in tbl.column("id").to_pylist():
+                    if item_id not in seen:
+                        seen.add(item_id)
+                        keep.append(True)
+                    else:
+                        keep.append(False)
+                if not keep:
+                    continue
+                tbl = tbl.filter(pa.array(keep, type=pa.bool_()))
+            if tbl.num_rows == 0:
+                continue
+            if writer is None:
+                writer = pq.ParquetWriter(sink, tbl.schema, compression="zstd")
+            writer.write_table(tbl)
+            rows += tbl.num_rows
+        if writer is not None:
+            writer.close()
+            # Footer check: the output must hold exactly the streamed rows.
+            written = pq.ParquetFile(io.BytesIO(sink.getvalue())).metadata.num_rows
+            if written != rows:
+                raise RuntimeError(f"consolidation verification failed for {dir_key}")
+            removed_dupes = rows_in - rows
+            seq = _next_seq(dir_key, store)
+            new_key = f"{dir_key}/part_{seq:06d}.parquet"
+            obstore.put(store, new_key, sink.getvalue())
+            new_uri = plan.files[0].rsplit("/", 1)[0] + f"/part_{seq:06d}.parquet"
+            removed_dupes = rows_in - rows
     # else: every listed object is gone and no orphan exists — a pure
     # phantom cleanup (predicate-delete only, nothing appended).
 
@@ -280,10 +306,18 @@ def run(
     *,
     min_files: int = 4,
     limit_tiles: int | None = None,
+    max_bytes: int = 512_000_000,
+    max_rows: int = 5_000_000,
     dry_run: bool = False,
 ) -> list[dict]:
     """Plan (always) and consolidate (unless *dry_run*). Returns the reports."""
-    plans = plan(table, min_files=min_files, limit_tiles=limit_tiles)
+    plans = plan(
+        table,
+        min_files=min_files,
+        limit_tiles=limit_tiles,
+        max_bytes=max_bytes,
+        max_rows=max_rows,
+    )
     if dry_run:
         return [
             {

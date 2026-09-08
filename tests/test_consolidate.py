@@ -64,6 +64,13 @@ def test_plan_respects_threshold_and_limit(warehouse):
     assert len(plan(table, min_files=1, limit_tiles=1)) == 1
 
 
+def test_plan_skips_partitions_over_memory_caps(warehouse):
+    _, table, _ = warehouse
+    # The fixture's partition is tiny; absurdly low caps must exclude it.
+    assert plan(table, min_files=1, max_bytes=1) == []
+    assert plan(table, min_files=1, max_rows=1) == []
+
+
 def test_consolidate_replaces_files_atomically(warehouse):
     store, table, _ = warehouse
     before_ids = _table_ids(table)

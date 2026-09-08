@@ -15,6 +15,7 @@ catalog = ec.open(store=store, base="s3://bucket/catalog")
 catalog.ingest_inventory("delta.parquet", mode="delta")
 
 # Full ingest (Dask/Coiled)
+import coiled
 from earthcatalog.ingest_config import IngestConfig
 catalog.ingest_inventory("full_inventory.parquet", config=IngestConfig(create_client=coiled.Client))
 
