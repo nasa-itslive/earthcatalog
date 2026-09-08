@@ -197,10 +197,10 @@ class Ingester:
         if new_paths:
             # Iceberg commits first, the index part second: a crash between
             # the two leaves the rows in the journal, recovered as this
-            # exact part (deterministic {run_id}/{seq} name).
+            # exact part (deterministic {run_id}--{seq} name).
             self._table.add_files([self._full_path(k) for k in new_paths])
             if index_rows:
-                part = f"{journal.run_id}/{seq:04d}" if journal is not None else None
+                part = f"{journal.run_id}--{seq:04d}" if journal is not None else None
                 self._index.append(index_rows, part=part)
             if self._upload_db is not None:
                 self._upload_db()
