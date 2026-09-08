@@ -174,34 +174,57 @@ def consolidate_partition(
             already_missing += 1
             continue
         tables.append(pq.ParquetFile(io.BytesIO(raw)).read())
-    merged = pa.concat_tables(tables)
-    if dedupe and merged.num_rows:
-        seen: set[str] = set()
-        keep: list[bool] = []
-        for item_id in merged.column("id").to_pylist():
-            keep.append(item_id not in seen)
-            seen.add(item_id)
-        merged = merged.filter(pa.array(keep))
-    rows = merged.num_rows
 
-    seq = _next_seq(dir_key, store)
-    new_key = f"{dir_key}/part_{seq:06d}.parquet"
-    buf = io.BytesIO()
-    pq.write_table(merged, buf, compression="zstd")
-    data = buf.getvalue()
-    obstore.put(store, new_key, data)
-    if pq.ParquetFile(io.BytesIO(data)).metadata.num_rows != rows:
-        obstore.delete(store, new_key)
-        raise RuntimeError(f"consolidation verification failed for {dir_key}")
+    new_uri: str | None = None
+    new_key: str | None = None
+    rows = 0
+    if tables:
+        merged = pa.concat_tables(tables)
+        if dedupe and merged.num_rows:
+            seen: set[str] = set()
+            keep: list[bool] = []
+            for item_id in merged.column("id").to_pylist():
+                keep.append(item_id not in seen)
+                seen.add(item_id)
+            merged = merged.filter(pa.array(keep))
+        rows = merged.num_rows
 
-    new_uri = plan.files[0].rsplit("/", 1)[0] + f"/part_{seq:06d}.parquet"
+        seq = _next_seq(dir_key, store)
+        new_key = f"{dir_key}/part_{seq:06d}.parquet"
+        buf = io.BytesIO()
+        pq.write_table(merged, buf, compression="zstd")
+        data = buf.getvalue()
+        obstore.put(store, new_key, data)
+        if pq.ParquetFile(io.BytesIO(data)).metadata.num_rows != rows:
+            obstore.delete(store, new_key)
+            raise RuntimeError(f"consolidation verification failed for {dir_key}")
+        new_uri = plan.files[0].rsplit("/", 1)[0] + f"/part_{seq:06d}.parquet"
+    else:
+        # Every listed object is already gone — the previous run merged and
+        # deleted but never uploaded its db.  Adopt the orphaned output if
+        # it is there; otherwise this is a pure phantom cleanup.
+        listed = {
+            obj["path"]
+            for listing in obstore.list(store, prefix=dir_key)
+            for obj in listing
+            if obj["path"].endswith(".parquet")
+        }
+        orphans = sorted(listed - {_key(u, warehouse_prefix) for u in plan.files})
+        if orphans:
+            new_key = orphans[0]
+            new_uri = plan.files[0].rsplit("/", 1)[0] + "/" + new_key.rsplit("/", 1)[1]
+            rows = pq.ParquetFile(
+                io.BytesIO(bytes(obstore.get(store, new_key).bytes()))
+            ).metadata.num_rows
+
     # The delete producer must be created (and its parent snapshot pinned)
     # before the append is staged, so it computes against the old manifests.
     with table.transaction() as tx:
         deleter = tx.update_snapshot({"earthcatalog.consolidated": "true"}).delete()
         deleter.delete_by_predicate(_temporal_predicate(plan.tile, plan.bin_value))
         deleter.commit()
-        tx.add_files([new_uri])
+        if new_uri:
+            tx.add_files([new_uri])
 
     # Drop only objects the commit actually removed from the metadata.
     remaining = {
@@ -221,7 +244,7 @@ def consolidate_partition(
         "tile": plan.tile,
         "bin_value": plan.bin_value,
         "files_before": len(plan.files),
-        "files_after": 1,
+        "files_after": 1 if new_uri else 0,
         "rows": rows,
         "rows_removed_dupes": sum(t.num_rows for t in tables) - rows,
         "old_files_deleted": removed,

@@ -141,6 +141,41 @@ def test_consolidate_tolerates_already_deleted_files(warehouse):
     assert table.scan().count() == 5 - victim_rows
 
 
+def test_consolidate_adopts_orphaned_output(warehouse):
+    """Worst crash window: the previous run merged, committed AND deleted
+    the old objects, but never uploaded its db — S3 holds one unregistered
+    merged file while the metadata lists only phantoms.  Consolidation
+    must adopt the orphan and drop the phantoms."""
+    store, table, _ = warehouse
+    from earthcatalog.consolidate import _key
+
+    plans = plan(table, min_files=3)
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def read(uri):
+        return pq.ParquetFile(io.BytesIO(bytes(store.get(_key(uri, "warehouse")).bytes()))).read()
+
+    merged = pa.concat_tables([read(u) for u in plans[0].files])
+    buf = io.BytesIO()
+    pq.write_table(merged, buf, compression="zstd")
+    orphan_key = "warehouse/grid=h3/level=2/tile=cellA/year=2020/part_000009.parquet"
+    for u in plans[0].files:  # the crashed run deleted every listed object
+        store.delete(_key(u, "warehouse"))
+    store.put(orphan_key, buf.getvalue())
+
+    reports = run(store, table, "warehouse", min_files=3)
+
+    assert reports[0]["already_missing"] == len(plans[0].files)
+    assert reports[0]["new_file"] == orphan_key
+    assert reports[0]["rows"] == 5
+    assert table.scan().count() == 5
+    assert _part_file_count(store) == 1
+    assert _table_ids(table) == [f"item-{i}.stac.json" for i in range(5)]
+
+
 def test_dry_run_writes_nothing(warehouse):
     store, table, _ = warehouse
     reports = run(store, table, "warehouse", min_files=3, dry_run=True)
