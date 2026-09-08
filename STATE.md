@@ -75,9 +75,22 @@ db backed up at `refactoring/backups/earthcatalog-pre-catchup-20260907.db`.
 **Production flip — applied (2026-09-08, user GO).** `daily_delta.yml`
 defaults now target `catalog/` (warehouse, catalog db, lock, diffs) and run
 on a daily 14:00 UTC schedule (manifests are stamped T01-00Z; 13h buffer).
-The schedule takes effect once this branch merges to main.  Remaining
-non-blockers: consolidate.py v2-layout refresh + GC real-data deletion
-validation (both dry-run first).
+The schedule takes effect once this branch merges to main.
+
+**Stale-metadata repair — done (2026-09-08).** The PR's integration tests
+exposed that the live `earthcatalog.db` still referenced the pre-migration
+legacy layout: 4,473 `grid_partition=…` files (67.5M rows) that 404, while
+the real data — migrated earlier into `grid=h3/level=1/tile=…` — sat
+unreferenced.  Verified first: 11,822 v2 files on S3 hold exactly
+68,067,891 rows (matching the metadata total to the row).  Then rebuilt the
+table over the real files (fixing a doubled-prefix URI bug in
+`_list_warehouse_keys` en route, b0299de) and uploaded.  Validation:
+68,067,891 rows / 11,822 files, 300/300 spot-checked files exist, the exact
+CI-failing Greenland query returns 28,713 items, per-decade searches
+(1985→2026) all return results.  Backups:
+`refactoring/backups/earthcatalog-pre-rebuild-20260908.db` and
+`…pre-catchup-20260907.db`.  Remaining non-blockers: consolidate.py
+v2-layout refresh + GC real-data deletion validation (both dry-run first).
 
 ## What landed (this cycle)
 
