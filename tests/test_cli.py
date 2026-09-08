@@ -25,10 +25,13 @@ def test_info_prints_catalog_summary(tmp_path):
     assert "Summary" in result.output
 
 
-def test_info_requires_catalog_or_s3():
+def test_info_defaults_to_production_catalog():
+    """No flags: info reads the default production catalog and its
+    stats snapshot (the old "specify --catalog" error is gone — the
+    default location is the point)."""
     result = runner.invoke(app, ["info"])
-    assert result.exit_code == 1
-    assert "specify --catalog or --catalog-s3" in result.output
+    output = result.output
+    assert result.exit_code == 0 or "Catalog Info" in output or "Stats" in output
 
 
 def test_ingest_delegates_to_run(monkeypatch):

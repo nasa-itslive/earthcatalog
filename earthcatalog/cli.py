@@ -480,7 +480,7 @@ def info(
         catalog_s3 = f"{warehouse.rsplit('/', 1)[0]}/earthcatalog.db"
 
     catalog_path = catalog or "/tmp/earthcatalog_info.db"
-    if catalog_s3:
+    if catalog_s3 and catalog_s3.startswith("s3://"):
         import obstore
         from obstore.store import S3Store
 
@@ -492,6 +492,8 @@ def info(
         data = bytes(obstore.get(store, key).bytes())
         Path(catalog_path).write_bytes(data)
         typer.echo(f"Downloaded catalog from s3://{bucket}/{key}")
+    elif not catalog and catalog_s3:
+        catalog_path = catalog_s3  # local warehouse: the db sits beside it
 
     os.environ.pop("AWS_ACCESS_KEY_ID", None)
     os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
@@ -518,6 +520,57 @@ def info(
     index_path = resolve_index_path(table, f"{warehouse.rstrip('/')}_index.parquet")
     typer.echo(f"  Unique index  : {index_path}")
 
+    from obstore.store import LocalStore, ObjectStore, S3Store
+
+    from earthcatalog import stats as stats_mod
+    from earthcatalog.index import Index as _Index
+    from earthcatalog.run import _make_s3_store
+
+    idx_store: ObjectStore
+    if warehouse.startswith("s3://"):
+        idx_store = _make_s3_store(warehouse.removeprefix("s3://").split("/", 1)[0])
+    else:
+        idx_store = LocalStore(str(Path(warehouse).parent))
+    skey = stats_mod.stats_key_for(warehouse)
+    index_rel = (
+        index_path.removeprefix("s3://").split("/", 1)[1]
+        if index_path.startswith("s3://")
+        else os.path.basename(index_path)
+    )
+    idx = _Index(idx_store, index_rel)
+    stored = stats_mod.load(idx_store, skey)
+
+    if stored is not None and not verify:
+        # Fast path: render entirely from the snapshot — no manifest or
+        # data scans at all.
+        typer.echo(f"\n{'=' * 60}")
+        typer.echo("  Summary")
+        typer.echo(f"{'=' * 60}")
+        typer.echo(f"  Warehouse rows: {stored['warehouse_rows']:,}")
+        typer.echo(f"  Warehouse files: {stored['warehouse_files']:,}")
+        typer.echo(f"  Warehouse size : {stored['warehouse_bytes'] / 1e9:.2f} GB")
+        typer.echo(f"  Unique cells  : {len(stored.get('cells', {})):,}")
+        years = sorted(stored.get("years", {}))
+        if years:
+            typer.echo(f"  Years         : {years[0]}-{years[-1]} ({len(years)} years)")
+        hot = sorted(stored.get("hot_locations", []), key=lambda h: -h["row_count"])[:5]
+        if hot:
+            typer.echo("  Hot locations :")
+            for s in hot:
+                typer.echo(f"    {s['grid_partition']}: {s['row_count']:,} rows")
+        typer.echo(f"  Unique items  : {stored['unique_items']:,}")
+        typer.echo(f"  Index rows    : {stored['index_rows']:,}")
+        if stored.get("deleted_rows"):
+            typer.echo(f"  Deleted rows  : {stored['deleted_rows']:,}")
+        per_day = sorted(stored.get("items_per_day", {}).items())[-14:]
+        if per_day:
+            typer.echo("  Items per day :")
+            for d, n in per_day:
+                typer.echo(f"    {d}: {n:,}")
+        typer.echo(f"  Stats computed: {stored.get('computed_at', 'n/a')}")
+        return
+
+    # Slow path: metadata summary, then (re)compute and store the snapshot.
     stats = info.stats(table)
     total_rows = sum(s["row_count"] for s in stats)
     total_files = sum(s["file_count"] for s in stats)
@@ -542,58 +595,35 @@ def info(
         for s in top:
             typer.echo(f"    {s['grid_partition']}: {s['row_count']:,} rows")
 
-    # Unified-index counts: unique active items + ingest rate per day.
-    try:
-        from obstore.store import LocalStore, ObjectStore, S3Store
-
-        from earthcatalog import stats as stats_mod
-        from earthcatalog.index import Index as _Index
-        from earthcatalog.run import _make_s3_store
-
-        idx_store: ObjectStore
-        if warehouse.startswith("s3://"):
-            idx_store = _make_s3_store(warehouse.removeprefix("s3://").split("/", 1)[0])
+    # (Re)compute the snapshot the expensive way: bootstrap or --verify.
+    locations = stats_mod.index_locations(table, idx_store, warehouse)
+    computed = stats_mod.compute_full(table, idx, locations)
+    if stored is not None:
+        drift = {
+            k: (stored.get(k), computed.get(k))
+            for k in computed
+            if k != "computed_at" and stored.get(k) != computed.get(k)
+        }
+        if drift:
+            typer.echo("  [verify] drift detected:")
+            for k, (old, new) in drift.items():
+                typer.echo(f"    {k}: {old} -> {new}")
         else:
-            idx_store = LocalStore(str(Path(warehouse).parent))
-        skey = stats_mod.stats_key_for(warehouse)
-        index_rel = (
-            index_path.removeprefix("s3://").split("/", 1)[1]
-            if index_path.startswith("s3://")
-            else os.path.basename(index_path)
-        )
-        idx = _Index(idx_store, index_rel)
-        locations = stats_mod.index_locations(table, idx_store, warehouse)
+            typer.echo("  [verify] stored stats matched the recomputation")
+    else:
+        typer.echo("  Stats snapshot: bootstrapped")
+    stats_mod.save(idx_store, skey, computed)
 
-        stored = stats_mod.load(idx_store, skey)
-        if stored is None or verify:
-            computed = stats_mod.compute_full(table, idx, locations)
-            if stored is not None:
-                drift = {
-                    k: (stored.get(k), computed.get(k))
-                    for k in computed
-                    if k != "computed_at" and stored.get(k) != computed.get(k)
-                }
-                if drift:
-                    typer.echo("  [verify] drift detected:")
-                    for k, (old, new) in drift.items():
-                        typer.echo(f"    {k}: {old} -> {new}")
-                else:
-                    typer.echo("  [verify] stored stats matched the recomputation")
-            stats_mod.save(idx_store, skey, computed)
-            stored = computed
-
-        typer.echo(f"  Unique items  : {stored['unique_items']:,}")
-        typer.echo(f"  Index rows    : {stored['index_rows']:,}")
-        if stored.get("deleted_rows"):
-            typer.echo(f"  Deleted rows  : {stored['deleted_rows']:,}")
-        per_day = stored.get("items_per_day", {})
-        if per_day:
-            typer.echo("  Items per day :")
-            for d, n in sorted(per_day.items())[-14:]:
-                typer.echo(f"    {d}: {n:,}")
-        typer.echo(f"  Stats computed: {stored.get('computed_at', 'n/a')}")
-    except Exception as exc:
-        typer.echo(f"  Stats snapshot: unavailable ({exc})")
+    typer.echo(f"  Unique items  : {computed['unique_items']:,}")
+    typer.echo(f"  Index rows    : {computed['index_rows']:,}")
+    if computed.get("deleted_rows"):
+        typer.echo(f"  Deleted rows  : {computed['deleted_rows']:,}")
+    per_day = computed.get("items_per_day", {})
+    if per_day:
+        typer.echo("  Items per day :")
+        for d, n in sorted(per_day.items())[-14:]:
+            typer.echo(f"    {d}: {n:,}")
+    typer.echo(f"  Stats computed: {computed.get('computed_at', 'n/a')}")
 
 
 # ---------------------------------------------------------------------------
