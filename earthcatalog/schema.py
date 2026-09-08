@@ -142,6 +142,24 @@ def partition_year(bin_name: str, ordinal: int) -> int:
     raise ValueError(f"unknown time bin: {bin_name!r}")
 
 
+def partition_bin_value(bin_name: str, ordinal: int | None) -> str:
+    """Hive path value for a temporal-transform partition ordinal:
+    ``2025`` / ``2025-12`` / ``2025-12-20``, or ``"unknown"`` for a null
+    ordinal (items without a datetime live in the unknown partition).
+    """
+    if ordinal is None:
+        return "unknown"
+    if bin_name == "year":
+        return str(partition_year(bin_name, ordinal))
+    if bin_name == "month":
+        y, m = 1970 + ordinal // 12, ordinal % 12 + 1
+        return f"{y}-{m:02d}"
+    if bin_name == "day":
+        d = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(days=ordinal)
+        return d.date().isoformat()
+    raise ValueError(f"unknown time bin: {bin_name!r}")
+
+
 ICEBERG_SCHEMA = Schema(
     NestedField(1, "id", StringType(), required=False),
     NestedField(2, "grid_partition", StringType(), required=False),
