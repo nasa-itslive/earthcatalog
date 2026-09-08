@@ -232,19 +232,32 @@ def consolidate_partition(
         if new_uri:
             tx.add_files([new_uri])
 
-    # Drop only objects the commit actually removed from the metadata.
+    # Drop only objects the commit actually removed from the metadata.  A
+    # failed delete is never fatal: the object is orphaned but harmless
+    # (unreferenced), so retry briefly and leave anything that still fails.
     remaining = {
         t.file.file_path for t in table.scan().plan_files() if t.file.partition[0] == plan.tile
     }
     removed = 0
+    left = 0
+    import time
+
     for uri in plan.files:
         if uri in remaining:
             continue
-        try:
-            obstore.delete(store, _key(uri, warehouse_prefix))
-            removed += 1
-        except FileNotFoundError:
-            pass
+        for attempt in range(3):
+            try:
+                obstore.delete(store, _key(uri, warehouse_prefix))
+                removed += 1
+                break
+            except FileNotFoundError:
+                removed += 1
+                break
+            except Exception:
+                if attempt == 2:
+                    left += 1
+                else:
+                    time.sleep(5 * (attempt + 1))
 
     return {
         "tile": plan.tile,
@@ -254,6 +267,7 @@ def consolidate_partition(
         "rows": rows,
         "rows_removed_dupes": removed_dupes,
         "old_files_deleted": removed,
+        "old_files_left": left,
         "already_missing": already_missing,
         "new_file": new_key,
     }
