@@ -394,6 +394,25 @@ class IngestPipeline:
             self._reconcile(summary)
         self._write_last_run(summary)
 
+        if not cfg.scatter_only and store:
+            # Refresh the catalog-stats snapshot at the durable commit
+            # moment (same time as the catalog-db upload).
+            from . import stats as stats_mod
+
+            def _apply(s):
+                return stats_mod.apply_ingest(
+                    s, new_items=summary.get("items", 0), rows=summary.get("rows", 0)
+                )
+
+            stats_mod.refresh_after(
+                store,
+                stats_mod.stats_key_for(warehouse_root),
+                cat._table,
+                index,
+                index_uris,
+                apply=_apply,
+            )
+
         if store and cat._catalog_key:
             cat.upload_catalog(local_db)
 

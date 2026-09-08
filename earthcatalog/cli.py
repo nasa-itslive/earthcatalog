@@ -421,6 +421,26 @@ def consolidate(
     if not dry_run and catalog_key:
         upload_catalog(catalog, store=store, catalog_key=catalog_key)
 
+        # Refresh the catalog-stats snapshot at the durable commit moment.
+        from earthcatalog import stats as stats_mod
+        from earthcatalog.index import Index
+
+        def _apply(s):
+            return stats_mod.apply_consolidation(
+                s,
+                rows_removed_dupes=sum(r["rows_removed_dupes"] for r in reports),
+                files_saved=sum(r["files_before"] - r["files_after"] for r in reports),
+            )
+
+        stats_mod.refresh_after(
+            store,
+            stats_mod.stats_key_for(warehouse),
+            table,
+            Index(store, os.path.basename(catalog_key)),
+            stats_mod.index_locations(table, store, warehouse),
+            apply=_apply,
+        )
+
 
 # ---------------------------------------------------------------------------
 # `info` sub-command — catalog summary
@@ -440,8 +460,17 @@ def info(
         "--warehouse",
         help="Warehouse root path (s3:// URI).",
     ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="Recompute the stats snapshot from the data and report drift.",
+    ),
 ) -> None:
-    """Print a catalog summary: grid metadata, file/row counts, year distribution."""
+    """Print a catalog summary: grid metadata, file/row counts, year distribution.
+
+    Reads the maintained ``stats.json`` snapshot at the top of the catalog
+    when present (instant); ``--verify`` recomputes it the expensive way.
+    """
     import os
     from pathlib import Path
 
@@ -449,8 +478,7 @@ def info(
         typer.echo("ERROR: specify --catalog or --catalog-s3")
         raise typer.Exit(1)
 
-    assert catalog is not None
-    catalog_path = catalog
+    catalog_path = catalog or "/tmp/earthcatalog_info.db"
     if catalog_s3:
         import obstore
         from obstore.store import S3Store
@@ -515,28 +543,56 @@ def info(
 
     # Unified-index counts: unique active items + ingest rate per day.
     try:
-        from obstore.store import LocalStore
+        from obstore.store import LocalStore, ObjectStore, S3Store
 
+        from earthcatalog import stats as stats_mod
         from earthcatalog.index import Index as _Index
         from earthcatalog.run import _make_s3_store
 
-        if index_path.startswith("s3://"):
-            bucket = index_path.removeprefix("s3://").split("/", 1)[0]
-            store = _make_s3_store(bucket)
-            idx = _Index(store, index_path.removeprefix("s3://").split("/", 1)[1])
-            full = [f"s3://{bucket}/{loc}" for loc in idx.locations()]
+        idx_store: ObjectStore
+        if warehouse.startswith("s3://"):
+            idx_store = _make_s3_store(warehouse.removeprefix("s3://").split("/", 1)[0])
         else:
-            idx = _Index(LocalStore(str(Path(index_path).parent)), Path(index_path).name)
-            full = [str(Path(index_path).parent / loc) for loc in idx.locations()]
-        unique = idx.count_active()
-        typer.echo(f"  Unique items  : {unique:,}")
-        per_day = idx.items_per_day(days=14, locations=full)
+            idx_store = LocalStore(str(Path(warehouse).parent))
+        skey = stats_mod.stats_key_for(warehouse)
+        index_rel = (
+            index_path.removeprefix("s3://").split("/", 1)[1]
+            if index_path.startswith("s3://")
+            else os.path.basename(index_path)
+        )
+        idx = _Index(idx_store, index_rel)
+        locations = stats_mod.index_locations(table, idx_store, warehouse)
+
+        stored = stats_mod.load(idx_store, skey)
+        if stored is None or verify:
+            computed = stats_mod.compute_full(table, idx, locations)
+            if stored is not None:
+                drift = {
+                    k: (stored.get(k), computed.get(k))
+                    for k in computed
+                    if k != "computed_at" and stored.get(k) != computed.get(k)
+                }
+                if drift:
+                    typer.echo("  [verify] drift detected:")
+                    for k, (old, new) in drift.items():
+                        typer.echo(f"    {k}: {old} -> {new}")
+                else:
+                    typer.echo("  [verify] stored stats matched the recomputation")
+            stats_mod.save(idx_store, skey, computed)
+            stored = computed
+
+        typer.echo(f"  Unique items  : {stored['unique_items']:,}")
+        typer.echo(f"  Index rows    : {stored['index_rows']:,}")
+        if stored.get("deleted_rows"):
+            typer.echo(f"  Deleted rows  : {stored['deleted_rows']:,}")
+        per_day = stored.get("items_per_day", {})
         if per_day:
             typer.echo("  Items per day :")
-            for d, n in per_day:
+            for d, n in sorted(per_day.items())[-14:]:
                 typer.echo(f"    {d}: {n:,}")
+        typer.echo(f"  Stats computed: {stored.get('computed_at', 'n/a')}")
     except Exception as exc:
-        typer.echo(f"  Unique items  : unavailable ({exc})")
+        typer.echo(f"  Stats snapshot: unavailable ({exc})")
 
 
 # ---------------------------------------------------------------------------
