@@ -630,12 +630,14 @@ def info(
 ) -> None:
     """Print a catalog summary: grid metadata, file/row counts, year distribution.
 
-    Entirely read-only by default, including on first run when no
-    ``stats.json`` snapshot exists yet remotely. With no arguments this
-    reads the default production catalog and its maintained ``stats.json``
-    snapshot — instant, no data scans. ``--verify`` recomputes the snapshot
-    the expensive way and reports drift against the stored one. Neither
-    mode ever writes to storage unless ``--update`` is also given.
+    Entirely read-only and instant by default: with no arguments this
+    reads the default production catalog and prints its maintained
+    ``stats.json`` snapshot — no manifest or index scans at all. If no
+    snapshot exists yet, it says so and stops; it does *not* silently
+    fall back to a full recompute. ``--verify`` recomputes the snapshot
+    the expensive way and reports drift against the stored one (still
+    read-only). Neither mode ever writes to storage unless ``--update``
+    is also given.
     """
     import os
     from pathlib import Path
@@ -659,9 +661,14 @@ def info(
     elif not catalog and catalog_s3:
         catalog_path = catalog_s3  # local warehouse: the db sits beside it
 
-    os.environ.pop("AWS_ACCESS_KEY_ID", None)
-    os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
-    os.environ.pop("AWS_SESSION_TOKEN", None)
+    if not update:
+        # info is a public, anonymous-read command by design — strip any
+        # local credentials so behavior doesn't depend on what happens to
+        # be configured. --update needs real write credentials, so it
+        # keeps them.
+        os.environ.pop("AWS_ACCESS_KEY_ID", None)
+        os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+        os.environ.pop("AWS_SESSION_TOKEN", None)
 
     from earthcatalog.catalog import FULL_NAME, _catalog_info, _open_sqlite
     from earthcatalog.index import resolve_index_path
@@ -692,7 +699,23 @@ def info(
 
     idx_store: ObjectStore
     if warehouse.startswith("s3://"):
-        idx_store = _make_s3_store(warehouse.removeprefix("s3://").split("/", 1)[0])
+        bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+        if update:
+            # Writing needs real, authenticated credentials.
+            idx_store = _make_s3_store(bucket)
+        else:
+            # Read-only (default / --verify): anonymous, unsigned access —
+            # matching how the catalog db itself was downloaded above.
+            # Relying on _make_s3_store here would silently build an
+            # unauthenticated *signed* client whenever no local AWS
+            # credentials happen to be configured, whose requests S3
+            # rejects outright — Index.locations() swallows that failure
+            # and reports zero unique items / index rows instead of the
+            # real counts.
+            region = (
+                os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+            )
+            idx_store = S3Store(bucket=bucket, region=region, skip_signature=True)
     else:
         idx_store = LocalStore(str(Path(warehouse).parent))
     skey = stats_mod.stats_key_for(warehouse)
@@ -734,7 +757,20 @@ def info(
         typer.echo(f"  Stats computed: {stored.get('computed_at', 'n/a')}")
         return
 
-    # Slow path: metadata summary, then (re)compute and store the snapshot.
+    if not verify and not update:
+        # No cached snapshot, and the caller didn't ask for a recompute:
+        # stay instant and read-only rather than silently falling back to
+        # a full manifest + index scan. Only --verify / --update trigger
+        # the expensive path below.
+        typer.echo(f"\n{'=' * 60}")
+        typer.echo("  Summary")
+        typer.echo(f"{'=' * 60}")
+        typer.echo("  Stats snapshot: none stored yet")
+        typer.echo("  Pass --verify (recompute + compare) or --update (bootstrap) to compute it.")
+        return
+
+    # Slow path — only reached with --verify or --update: metadata
+    # summary, then (re)compute and optionally store the snapshot.
     stats = info.stats(table)
     total_rows = sum(s["row_count"] for s in stats)
     total_files = sum(s["file_count"] for s in stats)

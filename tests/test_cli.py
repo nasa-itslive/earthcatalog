@@ -36,10 +36,13 @@ def test_info_never_writes_stats_json_without_update(tmp_path):
     get_or_create(catalog, grid_config=GridConfig(type="h3", resolution=2))
     stats_path = tmp_path / "stats.json"
 
-    # Plain `info`, no snapshot exists yet: must not write anything.
+    # Plain `info`, no snapshot exists yet: must not write anything, and
+    # must not silently fall back to a full manifest/index scan either
+    # ("Total rows" only ever gets printed by that expensive path).
     result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh])
     assert result.exit_code == 0, result.output
     assert "none stored yet" in result.output
+    assert "Total rows" not in result.output
     assert not stats_path.exists()
     assert list(tmp_path.rglob("stats.json")) == []
 
