@@ -64,8 +64,8 @@ class IngestPipeline:
     def __init__(self, catalog: EarthCatalog, config: IngestConfig | None = None) -> None:
         self._cat = catalog
         self._cfg = config or IngestConfig()
-        self._catalog: SqlCatalog = catalog._catalog
-        self._table: Table = catalog._table
+        self._catalog: SqlCatalog = catalog.catalog
+        self._table: Table = catalog.table
 
     @staticmethod
     def _store_relative(key: str) -> str:
@@ -119,11 +119,11 @@ class IngestPipeline:
         local_db = uri.removeprefix("sqlite:///")
 
         grid_cfg = GridConfig(
-            type=cat._info.grid_type,
-            resolution=cat._info.grid_resolution,
-            boundaries_path=cat._info.boundaries_path,
-            id_field=cat._info.id_field,
-            time_bin=cat._table.properties.get(PROP_TIME_BIN, "year"),
+            type=cat.info.grid_type,
+            resolution=cat.info.grid_resolution,
+            boundaries_path=cat.info.boundaries_path,
+            id_field=cat.info.id_field,
+            time_bin=cat.table.properties.get(PROP_TIME_BIN, "year"),
         )
         partitioner = build_partitioner(grid_cfg)
 
@@ -136,12 +136,12 @@ class IngestPipeline:
             delta = False
         elif mode == "auto":
             try:
-                n = sum(s["row_count"] for s in cat._info.stats(cat._table))
+                n = sum(s["row_count"] for s in cat.info.stats(cat.table))
                 delta = n > 0
             except Exception:
                 delta = False
 
-        if cat._store and cat._catalog_key and not os.path.exists(local_db):
+        if cat.store and cat.catalog_key and not os.path.exists(local_db):
             # run.py downloads before opening the catalog; re-downloading
             # here would swap the sqlite under the open connection.
             cat.download_catalog(local_db)
@@ -157,7 +157,7 @@ class IngestPipeline:
                 self._catalog.create_namespace(NAMESPACE)
             except Exception:
                 pass
-            cat._table = self._table = get_or_create(self._catalog, grid_config=grid_cfg)
+            cat.table = self._table = get_or_create(self._catalog, grid_config=grid_cfg)
 
         warehouse_prefix = warehouse_root.rstrip("/") + "/"
         if warehouse_prefix.startswith("s3://"):
@@ -169,11 +169,11 @@ class IngestPipeline:
             # Local stores are rooted at the warehouse dir — same
             # store-relative rule as the index key above.
             warehouse_prefix = os.path.basename(warehouse_root.rstrip("/")) + "/"
-        index_prop = resolve_index_path(cat._table, f"{warehouse_root.rstrip('/')}_index.parquet")
+        index_prop = resolve_index_path(cat.table, f"{warehouse_root.rstrip('/')}_index.parquet")
         index_key = self._store_relative(index_prop)
-        if cat._store is None:
+        if cat.store is None:
             raise RuntimeError("ingest requires a warehouse store")
-        store: ObjectStore = cat._store
+        store: ObjectStore = cat.store
         index = Index(store, index_key)
 
         if not delta and store:
@@ -253,7 +253,7 @@ class IngestPipeline:
         kwargs = dict(
             store=store,
             index=index,
-            table=cat._table,
+            table=cat.table,
             partitioner=partitioner,
             warehouse_prefix=warehouse_prefix,
             warehouse_root=warehouse_root,
@@ -322,7 +322,7 @@ class IngestPipeline:
 
             if cfg.scatter_only:
                 print("scatter_only set — skipping map/reduce.")
-                if store and cat._catalog_key:
+                if store and cat.catalog_key:
                     cat.upload_catalog(local_db)
                 return {
                     "items": 0,
@@ -380,7 +380,7 @@ class IngestPipeline:
             for bulk_only in ("skip_fetch", "skip_compact", "fetch_concurrency"):
                 serial_kwargs.pop(bulk_only, None)
             serial_kwargs.pop("dedupe", None)  # pairs already filtered
-            if cat._catalog_key:
+            if cat.catalog_key:
                 # Durable per batch: the uploaded db must never lag the index
                 # by more than one batch, whatever the run length.
                 serial_kwargs["upload_db"] = lambda: cat.upload_catalog(local_db)
@@ -405,13 +405,13 @@ class IngestPipeline:
             stats_mod.refresh_after(
                 store,
                 stats_mod.stats_key_for(warehouse_root),
-                cat._table,
+                cat.table,
                 index,
                 index_uris,
                 apply=_apply,
             )
 
-        if store and cat._catalog_key:
+        if store and cat.catalog_key:
             cat.upload_catalog(local_db)
 
         return summary
@@ -422,13 +422,13 @@ class IngestPipeline:
 
         cat = self._cat
         root = self._catalog.properties.get("warehouse", "")
-        key = resolve_index_path(cat._table, f"{root.rstrip('/')}_index.parquet")
+        key = resolve_index_path(cat.table, f"{root.rstrip('/')}_index.parquet")
         try:
             key = self._store_relative(key)
-            if key and cat._store is not None:
-                summary["index_keys"] = Index(cat._store, key).count_active()
-            summary["iceberg_rows"] = cat._table.scan().count()
-            summary["iceberg_files"] = sum(1 for _ in cat._table.scan().plan_files())
+            if key and cat.store is not None:
+                summary["index_keys"] = Index(cat.store, key).count_active()
+            summary["iceberg_rows"] = cat.table.scan().count()
+            summary["iceberg_files"] = sum(1 for _ in cat.table.scan().plan_files())
         except Exception as exc:
             print(f"(reconciliation counts unavailable: {exc})")
             return
@@ -445,10 +445,10 @@ class IngestPipeline:
         import obstore
 
         cat = self._cat
-        store = cat._store
+        store = cat.store
         if not store:
             return
-        root = cat._catalog.properties.get("warehouse", "")
+        root = cat.catalog.properties.get("warehouse", "")
         rel = root.removeprefix("s3://").split("/", 1)
         key = f"{rel[1].rstrip('/')}/_last_run.json" if len(rel) == 2 else "_last_run.json"
         payload = dict(summary)
