@@ -43,6 +43,7 @@ from pybloom_live import ScalableBloomFilter
 from earthcatalog.index import Index
 from earthcatalog.inventory import _iter_inventory
 from earthcatalog.schema import partition_prefix
+from earthcatalog.stats import parse_s3_uri
 
 _DEFAULT_ERROR_RATE = 0.0001
 _DEFAULT_CONCURRENCY = 64
@@ -79,8 +80,10 @@ def find_deletion_candidates(index: Index, bloom: ScalableBloomFilter) -> list[d
 def _default_head_fn(s3_key: str) -> bool:
     from obstore.store import S3Store
 
-    no_scheme = s3_key.removeprefix("s3://")
-    bucket, _, key = no_scheme.partition("/")
+    parsed = parse_s3_uri(s3_key)
+    if not parsed:
+        return False
+    bucket, key = parsed
     if not key:
         return False
     store = S3Store(bucket=bucket, region="us-west-2", skip_signature=True)
@@ -176,9 +179,10 @@ def _orphans_by_partition(orphans: list[dict]) -> dict[tuple[str, int | None], s
 
 def _store_key_from_uri(uri: str) -> str:
     """Convert ``s3://bucket/key`` to the bucket-relative *key* (others pass through)."""
-    if uri.startswith("s3://"):
-        _, _, rest = uri.removeprefix("s3://").partition("/")
-        return rest
+    parsed = parse_s3_uri(uri)
+    if parsed:
+        _, key = parsed
+        return key
     return uri
 
 
@@ -201,7 +205,9 @@ def iceberg_orphan_file_scan(table, batch_size: int = 5_000) -> Callable[[set[st
             try:
                 plan = table.scan(row_filter=In("id", chunk)).plan_files()  # type: ignore[misc,arg-type,call-arg]
             except Exception as exc:
-                print(f"WARN: Iceberg orphan discovery failed ({exc}); using index-derived files only")
+                print(
+                    f"WARN: Iceberg orphan discovery failed ({exc}); using index-derived files only"
+                )
                 return found
             for task in plan:
                 found.add(_store_key_from_uri(task.file.file_path))
@@ -294,7 +300,9 @@ def execute_cleanup(
 
     index_files: set[str] = set()
     for cell, year in by_partition:
-        index_files.update(_list_partition_files(store, warehouse_prefix, cell, year, layout=layout))
+        index_files.update(
+            _list_partition_files(store, warehouse_prefix, cell, year, layout=layout)
+        )
     discovered: set[str] = set()
     if discover_fn is not None:
         discovered = discover_fn(orphaned_ids)

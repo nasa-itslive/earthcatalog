@@ -43,6 +43,21 @@ if TYPE_CHECKING:
     from .catalog import EarthCatalog
 
 
+def _filtered_inventory(
+    source: str, since=None, suffix: str = ".stac.json", limit: int | None = None
+):
+    """Iterate inventory, filter by suffix, apply limit (if any).
+
+    Returns an iterator of (bucket, key) tuples.
+    """
+    from .inventory import iter_inventory
+
+    base = ((b, k) for b, k in iter_inventory(source, since=since) if k.endswith(suffix))
+    if limit is not None:
+        return islice(base, limit)
+    return base
+
+
 class IngestPipeline:
     """Orchestrates a (re)ingest of STAC items from an S3 Inventory."""
 
@@ -78,7 +93,6 @@ class IngestPipeline:
         from .inventory import (
             delete_scatter,
             is_scatter_manifest,
-            iter_inventory,
             load_inventory_shards,
             scatter_manifest_exists,
             scatter_manifest_path,
@@ -216,14 +230,8 @@ class IngestPipeline:
                 considered = count_rows(resolve_files(source))
                 new = sum(1 for _ in dedupe_source())
             else:
-                base: Iterator[tuple[str, str]] = (
-                    (b, k)
-                    for b, k in iter_inventory(source, since=cfg.since)
-                    if k.endswith(".stac.json")
-                )
-                if cfg.limit is not None:
-                    base = islice(base, cfg.limit)
-                pairs_iter = dedupe_pairs(base) if dedupe is not None else base
+                pairs_iter = _filtered_inventory(source, since=cfg.since, limit=cfg.limit)
+                pairs_iter = dedupe_pairs(pairs_iter) if dedupe is not None else pairs_iter
                 considered = 0
 
                 def _counted():
@@ -361,22 +369,11 @@ class IngestPipeline:
                 )
                 pairs_iter = dedupe_source(limit=cfg.limit)
             elif dedupe is not None:
-                base = (
-                    (b, k)
-                    for b, k in iter_inventory(source, since=cfg.since)
-                    if k.endswith(".stac.json")
+                pairs_iter = dedupe_pairs(
+                    _filtered_inventory(source, since=cfg.since, limit=cfg.limit)
                 )
-                if cfg.limit is not None:
-                    base = islice(base, cfg.limit)
-                pairs_iter = dedupe_pairs(base)
             else:
-                pairs_iter = (
-                    (b, k)
-                    for b, k in iter_inventory(source, since=cfg.since)
-                    if k.endswith(".stac.json")
-                )
-                if cfg.limit is not None:
-                    pairs_iter = islice(pairs_iter, cfg.limit)
+                pairs_iter = _filtered_inventory(source, since=cfg.since, limit=cfg.limit)
             serial_kwargs = dict(kwargs)
             # Bulk-only knobs (the Dask workers own them).
             for bulk_only in ("skip_fetch", "skip_compact", "fetch_concurrency"):

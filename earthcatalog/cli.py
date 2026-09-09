@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import typer
 
+from .stats import parse_s3_uri
+
 app = typer.Typer(
     name="earthcatalog",
     help="EarthCatalog STAC → Iceberg ingest tool.",
@@ -322,8 +324,9 @@ def migrate_indices_command(
     from earthcatalog.run import _make_s3_store
 
     cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
-    if warehouse.startswith("s3://"):
-        bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+    parsed = parse_s3_uri(warehouse)
+    if parsed:
+        bucket, _ = parsed
         store: S3Store | LocalStore = _make_s3_store(bucket)
     else:
         store = LocalStore(warehouse)
@@ -382,8 +385,9 @@ def consolidate(
     from earthcatalog.run import _make_s3_store
 
     catalog_key = None
-    if warehouse.startswith("s3://"):
-        bucket, key_path = warehouse.removeprefix("s3://").split("/", 1)
+    parsed = parse_s3_uri(warehouse)
+    if parsed:
+        bucket, key_path = parsed
         store: S3Store | LocalStore = _make_s3_store(bucket)
         warehouse_prefix = key_path.rstrip("/")
         catalog_key = os.environ.get(
@@ -470,14 +474,26 @@ def index_backfill_command(
         "--run-id",
         help="Part name prefix (default: backfill-YYYYMMDD). Deterministic, so re-runs resume.",
     ),
-    stage: bool = typer.Option(False, "--stage", help="Download the current index parts locally first."),
-    rescan: bool = typer.Option(False, "--rescan", help="Force a fresh warehouse scan (cache is reused otherwise)."),
-    build: bool = typer.Option(False, "--build", help="Emit the missing pointer parts into the local work dir."),
-    verify: bool = typer.Option(
-        False, "--verify", help="Full cards-vs-copies verification over the local index (gate before upload)."
+    stage: bool = typer.Option(
+        False, "--stage", help="Download the current index parts locally first."
     ),
-    upload: bool = typer.Option(False, "--upload", help="GATED: copy the built parts to the live index."),
-    rollback: bool = typer.Option(False, "--rollback", help="Delete exactly the manifest's parts from the live index."),
+    rescan: bool = typer.Option(
+        False, "--rescan", help="Force a fresh warehouse scan (cache is reused otherwise)."
+    ),
+    build: bool = typer.Option(
+        False, "--build", help="Emit the missing pointer parts into the local work dir."
+    ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="Full cards-vs-copies verification over the local index (gate before upload).",
+    ),
+    upload: bool = typer.Option(
+        False, "--upload", help="GATED: copy the built parts to the live index."
+    ),
+    rollback: bool = typer.Option(
+        False, "--rollback", help="Delete exactly the manifest's parts from the live index."
+    ),
 ) -> None:
     """Backfill missing (granule x cell) index pointers from warehouse metadata.
 
@@ -493,14 +509,19 @@ def index_backfill_command(
     from earthcatalog.run import _make_s3_store
 
     wd = _Path(work_dir)
-    bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
-    remote_store = _make_s3_store(bucket)
+    parsed = parse_s3_uri(warehouse)
+    bucket = parsed[0] if parsed else ""
+    if bucket:
+        remote_store = _make_s3_store(bucket)
+    else:
+        remote_store = LocalStore(warehouse)
     # On a bucket-level store the base key is the full path: the index is a
     # sibling of the warehouse dir ({warehouse}_index/).
     key = index_key
     if key is None:
-        if warehouse.startswith("s3://"):
-            key = f"{warehouse.removeprefix('s3://').split('/', 1)[1].rstrip('/')}_index"
+        if parsed:
+            _, key_path = parsed
+            key = f"{key_path.rstrip('/')}_index"
         else:
             key = f"{warehouse.rstrip('/')}_index"
     manifest: ib.BackfillManifest | None = None
@@ -548,7 +569,10 @@ def index_backfill_command(
         f"Index today : {rep['index_rows']:,} rows, {rep['distinct_keys']:,} distinct keys\n"
         f"Missing     : {rep['missing_pairs']:,} (granule x cell) pointers\n"
         f"No s3_key   : {rep['granules_without_key']:,} granules\n"
-        + "".join(f"  top cell  : {t['grid_partition']} ({t['missing']:,} missing)\n" for t in rep["top_cells"])
+        + "".join(
+            f"  top cell  : {t['grid_partition']} ({t['missing']:,} missing)\n"
+            for t in rep["top_cells"]
+        )
     )
 
     if build:
@@ -566,7 +590,9 @@ def index_backfill_command(
             run_id=rid,
             chunk_rows=chunk_rows,
         )
-        typer.echo(f"Built {len(manifest.parts)} part(s), {manifest.rows_written:,} rows — manifest at {wd / 'manifest.json'}")
+        typer.echo(
+            f"Built {len(manifest.parts)} part(s), {manifest.rows_written:,} rows — manifest at {wd / 'manifest.json'}"
+        )
 
     if verify:
         v = ib.verify(cache, ib.staged_locations(wd), con)
@@ -646,12 +672,12 @@ def info(
         catalog_s3 = f"{warehouse.rsplit('/', 1)[0]}/earthcatalog.db"
 
     catalog_path = catalog or "/tmp/earthcatalog_info.db"
-    if catalog_s3 and catalog_s3.startswith("s3://"):
+    parsed_catalog = parse_s3_uri(catalog_s3) if catalog_s3 else None
+    if parsed_catalog:
         import obstore
         from obstore.store import S3Store
 
-        no_scheme = catalog_s3.removeprefix("s3://")
-        bucket, key = no_scheme.split("/", 1)
+        bucket, key = parsed_catalog
         region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
         store = S3Store(bucket=bucket, region=region, skip_signature=True)
         catalog_path = f"/tmp/earthcatalog_info_{key.rsplit('/', 1)[-1]}.db"
@@ -698,8 +724,9 @@ def info(
     from earthcatalog.run import _make_s3_store
 
     idx_store: ObjectStore
-    if warehouse.startswith("s3://"):
-        bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+    parsed_warehouse = parse_s3_uri(warehouse)
+    if parsed_warehouse:
+        bucket, _ = parsed_warehouse
         if update:
             # Writing needs real, authenticated credentials.
             idx_store = _make_s3_store(bucket)
@@ -719,11 +746,8 @@ def info(
     else:
         idx_store = LocalStore(str(Path(warehouse).parent))
     skey = stats_mod.stats_key_for(warehouse)
-    index_rel = (
-        index_path.removeprefix("s3://").split("/", 1)[1]
-        if index_path.startswith("s3://")
-        else os.path.basename(index_path)
-    )
+    parsed_index = parse_s3_uri(index_path)
+    index_rel = parsed_index[1] if parsed_index else os.path.basename(index_path)
     idx = _Index(idx_store, index_rel)
     stored = stats_mod.load(idx_store, skey)
 

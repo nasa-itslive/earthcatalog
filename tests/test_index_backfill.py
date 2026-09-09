@@ -37,7 +37,9 @@ def env(tmp_path):
         ]
     )
     con = duckdb.connect()
-    scan = ib.scan_warehouse(LocalStore(str(root / "warehouse")), str(root / "warehouse"), work, con)
+    scan = ib.scan_warehouse(
+        LocalStore(str(root / "warehouse")), str(root / "warehouse"), work, con
+    )
     return {
         "root": root,
         "work": work,
@@ -60,14 +62,19 @@ class TestScan:
 
     def test_cache_is_reused(self, env):
         n = ib.scan_warehouse(
-            LocalStore(str(env["root"] / "warehouse")), str(env["root"] / "warehouse"), env["work"], env["con"]
+            LocalStore(str(env["root"] / "warehouse")),
+            str(env["root"] / "warehouse"),
+            env["work"],
+            env["con"],
         )
         assert n["cached"] is True and n["rows"] == 4
 
 
 class TestReport:
     def test_missing_pairs_and_keyless_granules(self, env):
-        rep = ib.report(env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"])
+        rep = ib.report(
+            env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"]
+        )
         assert rep["warehouse_rows"] == 4
         assert rep["index_rows"] == 2
         assert rep["distinct_keys"] == 2
@@ -95,7 +102,9 @@ class TestBuild:
         after_existing = {k: v for k, v in _hash_dir(env["work"] / "index").items() if k in before}
         assert after_existing == before
         # full verification passes
-        v = ib.verify(env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"])
+        v = ib.verify(
+            env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"]
+        )
         assert v["index_rows"] == 4
         assert v["distinct_keys"] == 2
         assert v["duplicate_pairs"] == 0
@@ -117,7 +126,9 @@ class TestBuild:
         m2 = ib.build(**common)
         assert m2.rows_written == m1.rows_written
         # still exactly 4 index rows, no duplicates
-        v = ib.verify(env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"])
+        v = ib.verify(
+            env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"]
+        )
         assert v["index_rows"] == 4 and v["duplicate_pairs"] == 0
 
     def test_detects_new_warehouse_copy_without_card(self, env):
@@ -125,9 +136,14 @@ class TestBuild:
         # force a fresh cache to pick up the new copy
         (env["work"] / "warehouse_triples.parquet").unlink()
         ib.scan_warehouse(
-            LocalStore(str(env["root"] / "warehouse")), str(env["root"] / "warehouse"), env["work"], env["con"]
+            LocalStore(str(env["root"] / "warehouse")),
+            str(env["root"] / "warehouse"),
+            env["work"],
+            env["con"],
         )
-        v = ib.verify(env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"])
+        v = ib.verify(
+            env["work"] / "warehouse_triples.parquet", ib.staged_locations(env["work"]), env["con"]
+        )
         assert v["copies_without_card"] == 3  # A@c2, C@c3, and the new B@c9
 
 
@@ -158,7 +174,9 @@ class TestUploadRollback:
 
 class TestManifest:
     def test_round_trip(self, tmp_path):
-        m = ib.BackfillManifest(run_id="r", chunk_rows=10, parts=[{"part": "r--0000", "rows": 10}], rows_written=10)
+        m = ib.BackfillManifest(
+            run_id="r", chunk_rows=10, parts=[{"part": "r--0000", "rows": 10}], rows_written=10
+        )
         m.save(tmp_path)
         m2 = ib.BackfillManifest.load(tmp_path)
         assert m2.run_id == "r" and m2.rows_written == 10

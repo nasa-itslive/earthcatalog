@@ -69,11 +69,23 @@ def _setup_underindexed_copy():
     index = Index(store, "warehouse_index.parquet")
     index.append(
         [
-            {"s3_key": _s3_key("a.stac.json"), "stac_id": "item-A", "grid_partition": "cellA", "year": 2020},
-            {"s3_key": _s3_key("b.stac.json"), "stac_id": "item-B", "grid_partition": "cellA", "year": 2020},
+            {
+                "s3_key": _s3_key("a.stac.json"),
+                "stac_id": "item-A",
+                "grid_partition": "cellA",
+                "year": 2020,
+            },
+            {
+                "s3_key": _s3_key("b.stac.json"),
+                "stac_id": "item-B",
+                "grid_partition": "cellA",
+                "year": 2020,
+            },
         ]
     )
-    _put_warehouse_file(store, "grid_partition=cellA/year=2020/part_0.parquet", ["item-A", "item-B"])
+    _put_warehouse_file(
+        store, "grid_partition=cellA/year=2020/part_0.parquet", ["item-A", "item-B"]
+    )
     _put_warehouse_file(store, "grid=h3/level=1/tile=cellB/year=2020/part_9.parquet", ["item-B"])
     discover = lambda ids: {  # noqa: E731
         "grid_partition=cellA/year=2020/part_0.parquet",
@@ -126,7 +138,10 @@ class TestIcebergBackedCleanup:
         assert result["rows_removed"] == 2
         assert result["residual_copies"] == 0  # every copy was located
         # nothing written, nothing deleted, index untouched
-        assert _read_ids(store, "grid_partition=cellA/year=2020/part_0.parquet") == ["item-A", "item-B"]
+        assert _read_ids(store, "grid_partition=cellA/year=2020/part_0.parquet") == [
+            "item-A",
+            "item-B",
+        ]
         assert "grid=h3/level=1/tile=cellB/year=2020/part_9.parquet" in _list_keys(store)
         assert [r["stac_id"] for r in index.stream_active()] == ["item-A", "item-B"]
 
@@ -136,11 +151,18 @@ class TestIcebergBackedCleanup:
         index = Index(store, "warehouse_index.parquet")
         index.append(
             [
-                {"s3_key": _s3_key("b.stac.json"), "stac_id": "item-B", "grid_partition": "cellA", "year": 2020},
+                {
+                    "s3_key": _s3_key("b.stac.json"),
+                    "stac_id": "item-B",
+                    "grid_partition": "cellA",
+                    "year": 2020,
+                },
             ]
         )
         # item-B's only copy lives in cellB — nowhere the index names.
-        _put_warehouse_file(store, "grid=h3/level=1/tile=cellB/year=2020/part_9.parquet", ["item-B"])
+        _put_warehouse_file(
+            store, "grid=h3/level=1/tile=cellB/year=2020/part_9.parquet", ["item-B"]
+        )
         inv = _write_inventory_csv(tmp_path / "inv.csv", [])
 
         with pytest.raises(RuntimeError, match="did not converge"):

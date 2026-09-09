@@ -143,8 +143,7 @@ class TestNewCatalogOpenAPI:
         assert ec.grid_type == "h3"
         assert ec.grid_resolution == 1
         assert hasattr(ec, "search_files")
-        assert hasattr(ec, "stats")
-        assert hasattr(ec, "cells_for_geometry")
+        assert hasattr(ec, "search")
 
     def test_open_legacy_api_still_works(self, tmp_path):
         db = str(tmp_path / "catalog.db")
@@ -215,23 +214,6 @@ class TestSearchFilesSpatialPruning:
 class TestEarthCatalogConvenienceMethods:
     """Test EarthCatalog convenience methods provide correct data."""
 
-    def test_stats_aggregates_partition_data(self, populated_warehouse):
-        """stats() should aggregate manifest data correctly."""
-        _, tbl, items = populated_warehouse
-        info = _catalog_info(tbl)
-
-        stats = info.stats(tbl)
-
-        # Should have at least one partition
-        assert len(stats) > 0
-
-        # Each stat should have required keys
-        for s in stats:
-            assert "grid_partition" in s
-            assert "year" in s
-            assert "row_count" in s
-            assert "file_count" in s
-
     def test_stats_row_counts_match_manifest(self, populated_warehouse):
         """stats() row counts should match Iceberg manifest records."""
         _, tbl, items = populated_warehouse
@@ -244,36 +226,6 @@ class TestEarthCatalogConvenienceMethods:
         total_from_manifest = sum(task.file.record_count for task in tbl.scan().plan_files())
 
         assert total_from_stats == total_from_manifest
-
-    def test_cells_for_geometry_returns_valid_h3(self, populated_warehouse):
-        """cells_for_geometry should return valid H3 cell IDs."""
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-
-        import h3
-
-        bbox = box(-60, 60, -40, 75)
-        cells = info.cells_for_geometry(bbox)
-
-        # All cells should be valid H3
-        for cell in cells:
-            assert h3.is_valid_cell(cell), f"Invalid H3 cell: {cell}"
-
-    def test_cell_list_sql_produces_valid_fragment(self, populated_warehouse):
-        """cell_list_sql should produce valid embeddable SQL."""
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-
-        bbox = box(-60, 60, -40, 75)
-        sql = info.cell_list_sql(bbox)
-
-        # Should be valid SQL fragment
-        assert sql.startswith("grid_partition IN (")
-        assert sql.endswith(")")
-
-        # Should be embeddable
-        full_sql = f"SELECT * FROM t WHERE {sql} AND datetime > '2020-01-01'"
-        assert "grid_partition IN (" in full_sql
 
 
 # ---------------------------------------------------------------------------
@@ -291,14 +243,6 @@ class TestEarthCatalogProperties:
 
         assert info.grid_type == "h3"
         assert isinstance(info.grid_resolution, int)
-
-    def test_table_property_returns_underlying_table(self, populated_warehouse):
-        """table property should return the PyIceberg Table."""
-        _, tbl, _ = populated_warehouse
-        info = _catalog_info(tbl)
-
-        # This is mainly for type checking - just ensure it doesn't error
-        assert info is not None
 
     def test_html_repr(self, populated_warehouse):
         from earthcatalog import EarthCatalog

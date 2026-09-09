@@ -41,14 +41,6 @@ class DiffResult:
     seconds: float = 0.0
     steps: dict = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
-        return {
-            "new_rows": self.new_rows,
-            "old_rows": self.old_rows,
-            "seconds": round(self.seconds, 1),
-            "steps": {k: round(v, 1) for k, v in self.steps.items()},
-        }
-
 
 def resolve_files(source: str) -> list[str]:
     """Resolve *source* to a list of inventory Parquet URIs.

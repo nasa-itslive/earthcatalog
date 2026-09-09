@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 from . import store_config
 from .schema import (
-    _HIVE_RE,
     FULL_NAME,
     ICEBERG_SCHEMA,
     NAMESPACE,
@@ -42,9 +41,6 @@ from .schema import (
     layout_of,
     partition_year,
 )
-
-HIVE_RE = _HIVE_RE
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -770,24 +766,6 @@ class EarthCatalog:
 
         return _ctx()
 
-    def stats(self) -> list[dict]:
-        """Return per-partition row counts and file sizes from Iceberg metadata."""
-        return self._info.stats(self._table)
-
-    def unique_item_count(self) -> int:
-        """Return the count of active (non-deleted) items from the unified index."""
-        default_index_path = None
-        if self._catalog is not None:
-            warehouse = self._catalog.properties.get("warehouse", "")
-            if warehouse:
-                default_index_path = warehouse.rstrip("/") + "_index.parquet"
-
-        return self._info.unique_item_count(self._table, self._store, default_index_path)
-
-    def info(self) -> CatalogInfo:
-        """Return the grid metadata and catalog statistics object."""
-        return self._info
-
     def ingest_inventory(
         self,
         inventory_path: str,
@@ -967,21 +945,6 @@ class EarthCatalog:
 
         return result
 
-    def lock(self, owner: str, ttl_hours: int = 12):
-        """Return an S3Lock that uses this EarthCatalog's store and key."""
-        from .lock import S3Lock
-
-        lock_key = getattr(self._catalog, "_lock_key", None) or ".lock"
-        return S3Lock(owner=owner, ttl_hours=ttl_hours, store=self._store, key=lock_key)
-
-    def cells_for_geometry(self, geom) -> list[str]:
-        """Return the partition keys that intersect *geom*."""
-        return self._info.cells_for_geometry(geom)
-
-    def cell_list_sql(self, geom) -> str:
-        """Return a SQL fragment suitable for ``WHERE grid_partition IN (...)``."""
-        return self._info.cell_list_sql(geom)
-
     @property
     def grid_type(self) -> str:
         """Return the grid partitioning system type."""
@@ -991,11 +954,6 @@ class EarthCatalog:
     def grid_resolution(self) -> int | None:
         """Return the H3/S2 resolution (None for GeoJSON grids)."""
         return self._info.grid_resolution
-
-    @property
-    def table(self):
-        """Return the underlying PyIceberg Table (for advanced use)."""
-        return self._table
 
     def _repr_html_(self) -> str:
         """Return an HTML representation for Jupyter notebooks.
