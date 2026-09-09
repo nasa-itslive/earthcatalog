@@ -289,7 +289,13 @@ def _catalog_info(table) -> CatalogInfo:
     props = table.properties
     grid_type = props.get(PROP_GRID_TYPE, "h3")
     raw_res = props.get(PROP_GRID_RESOLUTION)
-    grid_resolution = int(raw_res) if raw_res is not None else None
+    # Integral resolutions stay int (h3/s2 levels); fractional allowed for
+    # degree-based grids (lat_lon).
+    if raw_res is None:
+        grid_resolution: float | None = None
+    else:
+        parsed = float(raw_res)
+        grid_resolution = int(parsed) if parsed.is_integer() else parsed
     return CatalogInfo(
         grid_type=grid_type,
         grid_resolution=grid_resolution,

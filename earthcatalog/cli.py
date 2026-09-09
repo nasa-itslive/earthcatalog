@@ -122,12 +122,14 @@ def ingest(
     grid: str = typer.Option(
         "h3",
         "--grid",
-        help="Grid system: 'h3' | 's2' | 'utm' | 'geojson' (for fresh full builds).",
+        help="Grid system: 'h3' | 's2' | 'utm' | 'geojson' | 'lat_lon' (for fresh "
+        "full builds; lat_lon --resolution = degrees per tile).",
     ),
-    resolution: int | None = typer.Option(
+    resolution: float | None = typer.Option(
         None,
         "--resolution",
-        help="Grid resolution (h3/s2). Default: h3=1, s2=2.",
+        help="Grid resolution (h3/s2 level; lat_lon degrees per tile). "
+        "Default: h3=1, s2=2, lat_lon=2.",
     ),
     boundaries: str | None = typer.Option(
         None,

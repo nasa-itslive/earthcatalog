@@ -29,13 +29,13 @@ from earthcatalog.partitioner import AbstractPartitioner
 def _build_h3(cfg: GridConfig, **kwargs: Any) -> AbstractPartitioner:
     from earthcatalog.grids.h3_partitioner import H3Partitioner
 
-    return H3Partitioner(resolution=cfg.resolution or 1, **kwargs)
+    return H3Partitioner(resolution=int(cfg.resolution or 1), **kwargs)
 
 
 def _build_s2(cfg: GridConfig, **kwargs: Any) -> AbstractPartitioner:
     from earthcatalog.grids.s2_partitioner import S2Partitioner
 
-    return S2Partitioner(resolution=cfg.resolution or 2, **kwargs)
+    return S2Partitioner(resolution=int(cfg.resolution or 2), **kwargs)
 
 
 def _build_utm(cfg: GridConfig, **kwargs: Any) -> AbstractPartitioner:
@@ -56,11 +56,20 @@ def _build_geojson(cfg: GridConfig, **kwargs: Any) -> AbstractPartitioner:
     )
 
 
+def _build_lat_lon(cfg: GridConfig, **kwargs: Any) -> AbstractPartitioner:
+    from earthcatalog.grids.latlon_partitioner import LatLonPartitioner
+
+    if cfg.resolution is not None and cfg.resolution <= 0:
+        raise ValueError(f"lat_lon resolution must be positive degrees, got {cfg.resolution}")
+    return LatLonPartitioner(resolution=cfg.resolution or 2, **kwargs)
+
+
 _REGISTRY: dict[str, Callable[..., AbstractPartitioner]] = {
     "h3": _build_h3,
     "s2": _build_s2,
     "utm": _build_utm,
     "geojson": _build_geojson,
+    "lat_lon": _build_lat_lon,
 }
 
 

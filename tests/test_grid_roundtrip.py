@@ -110,6 +110,46 @@ def test_roundtrip_geojson_boundaries(tmp_path):
     assert "geo-item" in ids
 
 
+def test_roundtrip_lat_lon_month_bin_config_only(tmp_path):
+    """GridConfig(type=lat_lon, resolution=2, time_bin=month) must produce a
+    grid=lat_lon/level=2/tile=…/month=… warehouse layout and find items back
+    — the config-only layout promise of the v2 hive scheme."""
+    from obstore.store import LocalStore as _LS
+
+    grid_config = GridConfig(type="lat_lon", resolution=2, time_bin="month")
+    item = _point_item("latlon-item", -118.2, -46.3, "2025-12-20T00:00:00Z")
+
+    store = _LS(str(tmp_path))
+    wh = tmp_path / "warehouse"
+    wh.mkdir(parents=True)
+    cat = _open_sqlite(db_path=str(tmp_path / "catalog.db"), warehouse_path=str(wh))
+    table = get_or_create(cat, grid_config=grid_config)
+
+    partitioner = build_partitioner(grid_config)
+    assert partitioner.time_bin == "month"
+    item["properties"]["grid_partition"] = partitioner.get_intersecting_keys(_wkb_of(item))[0]
+    ing = Ingester(
+        store=store,
+        index=Index(store, "warehouse_index.parquet"),
+        table=table,
+        fetch_fn=lambda b, k: item,
+        partitioner=partitioner,
+        warehouse_prefix="warehouse",
+        warehouse_root=str(wh),
+        batch_size=10,
+    )
+    ing.run([("data-bucket", item["_source_key"])])
+
+    keys = [obj["path"] for batch in store.list(prefix="warehouse/") for obj in batch]
+    parquet = [k for k in keys if k.endswith(".parquet")]
+    assert any("grid=lat_lon/level=2/tile=r-24c-60/month=2025-12/" in k for k in parquet)
+
+    ec = EarthCatalog(catalog=cat, table=table, info=_catalog_info(table), store=store, catalog_key=None)
+    assert ec.grid_type == "lat_lon"
+    result = ec.search(bbox=[-119.0, -47.0, -117.0, -45.0], datetime="2025-12-01/2025-12-31")
+    assert {it.id for it in result.item_collection()} == {"latlon-item"}
+
+
 def test_catalog_info_reuses_one_partitioner(tmp_path):
     """The read-side partitioner is built once and cached."""
     wh = tmp_path / "warehouse"

@@ -388,14 +388,15 @@ def main() -> None:
     parser.add_argument(
         "--grid",
         default="h3",
-        choices=["h3", "s2", "utm", "geojson"],
-        help="Grid system for fresh full builds.",
+        choices=["h3", "s2", "utm", "geojson", "lat_lon"],
+        help="Grid system for fresh full builds. lat_lon takes --resolution in "
+        "degrees per tile.",
     )
     parser.add_argument(
         "--resolution",
-        type=int,
+        type=float,
         default=None,
-        help="Grid resolution (h3/s2). Default: h3=1, s2=2.",
+        help="Grid resolution (h3/s2 level; lat_lon degrees per tile). Default: h3=1, s2=2, lat_lon=2.",
     )
     parser.add_argument(
         "--boundaries",
