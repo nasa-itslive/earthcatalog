@@ -185,7 +185,11 @@ class TestEarthCatalogItemSearch:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet", "b.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}", "geometry": _GEOM_AT_POINT}])
+        monkeypatch.setattr(
+            rustac,
+            "search_sync",
+            lambda href, **kw: [{"id": f"item-{href}", "geometry": _GEOM_AT_POINT}],
+        )
         sr = EarthCatalogItemSearch(
             params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
         )
@@ -225,7 +229,9 @@ class TestEarthCatalogItemSearch:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["f.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": "item", "geometry": _GEOM_AT_POINT}])
+        monkeypatch.setattr(
+            rustac, "search_sync", lambda href, **kw: [{"id": "item", "geometry": _GEOM_AT_POINT}]
+        )
         sr = EarthCatalogItemSearch(
             params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
         )
@@ -254,7 +260,11 @@ class TestEarthCatalogItemSearch:
         import rustac
 
         monkeypatch.setattr(
-            rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}-{i}", "geometry": _GEOM_AT_POINT} for i in range(5)]
+            rustac,
+            "search_sync",
+            lambda href, **kw: [
+                {"id": f"item-{href}-{i}", "geometry": _GEOM_AT_POINT} for i in range(5)
+            ],
         )
         sr = EarthCatalogItemSearch(
             params={"intersects": {"type": "Point", "coordinates": [0, 60]}, "max_items": 3},

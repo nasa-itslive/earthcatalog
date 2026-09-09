@@ -33,7 +33,6 @@ dependencies = [
 dev = [
   "pandas",
   "coiled",
-  "bokeh",
   "jupyterlab",
   "dask-labextension",
   "pytest",
@@ -120,7 +119,6 @@ local_scheme = "node-and-date"
 dev = [
     "pandas",
     "coiled",
-    "bokeh",
     "jupyterlab",
     "dask-labextension",
     "pytest",

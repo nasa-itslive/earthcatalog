@@ -201,7 +201,9 @@ def iceberg_orphan_file_scan(table, batch_size: int = 5_000) -> Callable[[set[st
             try:
                 plan = table.scan(row_filter=In("id", chunk)).plan_files()  # type: ignore[misc,arg-type,call-arg]
             except Exception as exc:
-                print(f"WARN: Iceberg orphan discovery failed ({exc}); using index-derived files only")
+                print(
+                    f"WARN: Iceberg orphan discovery failed ({exc}); using index-derived files only"
+                )
                 return found
             for task in plan:
                 found.add(_store_key_from_uri(task.file.file_path))
@@ -294,7 +296,9 @@ def execute_cleanup(
 
     index_files: set[str] = set()
     for cell, year in by_partition:
-        index_files.update(_list_partition_files(store, warehouse_prefix, cell, year, layout=layout))
+        index_files.update(
+            _list_partition_files(store, warehouse_prefix, cell, year, layout=layout)
+        )
     discovered: set[str] = set()
     if discover_fn is not None:
         discovered = discover_fn(orphaned_ids)

@@ -470,14 +470,26 @@ def index_backfill_command(
         "--run-id",
         help="Part name prefix (default: backfill-YYYYMMDD). Deterministic, so re-runs resume.",
     ),
-    stage: bool = typer.Option(False, "--stage", help="Download the current index parts locally first."),
-    rescan: bool = typer.Option(False, "--rescan", help="Force a fresh warehouse scan (cache is reused otherwise)."),
-    build: bool = typer.Option(False, "--build", help="Emit the missing pointer parts into the local work dir."),
-    verify: bool = typer.Option(
-        False, "--verify", help="Full cards-vs-copies verification over the local index (gate before upload)."
+    stage: bool = typer.Option(
+        False, "--stage", help="Download the current index parts locally first."
     ),
-    upload: bool = typer.Option(False, "--upload", help="GATED: copy the built parts to the live index."),
-    rollback: bool = typer.Option(False, "--rollback", help="Delete exactly the manifest's parts from the live index."),
+    rescan: bool = typer.Option(
+        False, "--rescan", help="Force a fresh warehouse scan (cache is reused otherwise)."
+    ),
+    build: bool = typer.Option(
+        False, "--build", help="Emit the missing pointer parts into the local work dir."
+    ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="Full cards-vs-copies verification over the local index (gate before upload).",
+    ),
+    upload: bool = typer.Option(
+        False, "--upload", help="GATED: copy the built parts to the live index."
+    ),
+    rollback: bool = typer.Option(
+        False, "--rollback", help="Delete exactly the manifest's parts from the live index."
+    ),
 ) -> None:
     """Backfill missing (granule x cell) index pointers from warehouse metadata.
 
@@ -548,7 +560,10 @@ def index_backfill_command(
         f"Index today : {rep['index_rows']:,} rows, {rep['distinct_keys']:,} distinct keys\n"
         f"Missing     : {rep['missing_pairs']:,} (granule x cell) pointers\n"
         f"No s3_key   : {rep['granules_without_key']:,} granules\n"
-        + "".join(f"  top cell  : {t['grid_partition']} ({t['missing']:,} missing)\n" for t in rep["top_cells"])
+        + "".join(
+            f"  top cell  : {t['grid_partition']} ({t['missing']:,} missing)\n"
+            for t in rep["top_cells"]
+        )
     )
 
     if build:
@@ -566,7 +581,9 @@ def index_backfill_command(
             run_id=rid,
             chunk_rows=chunk_rows,
         )
-        typer.echo(f"Built {len(manifest.parts)} part(s), {manifest.rows_written:,} rows — manifest at {wd / 'manifest.json'}")
+        typer.echo(
+            f"Built {len(manifest.parts)} part(s), {manifest.rows_written:,} rows — manifest at {wd / 'manifest.json'}"
+        )
 
     if verify:
         v = ib.verify(cache, ib.staged_locations(wd), con)

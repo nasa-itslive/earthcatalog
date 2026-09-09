@@ -37,13 +37,3 @@ class IngestConfig:
     fetch_concurrency: int = 256
     # Bounded fetch pool for the serial (daily) path; 1 = strictly serial.
     fetch_workers: int = 16
-
-    @classmethod
-    def from_kwargs(cls, **kwargs) -> IngestConfig:
-        """Build from the legacy keyword arguments (unknown keys ignored)."""
-        allowed = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in kwargs.items() if k in allowed})
-
-
-# Back-compat alias — the pre-rename public name.
-BackfillConfig = IngestConfig

@@ -77,7 +77,10 @@ def scan_warehouse(
 
     cache = work_dir / _TRIPLES_FILE
     if cache.exists():
-        return {"cached": True, "rows": con.execute(f"SELECT count(*) FROM read_parquet('{cache}')").fetchone()[0]}
+        return {
+            "cached": True,
+            "rows": con.execute(f"SELECT count(*) FROM read_parquet('{cache}')").fetchone()[0],
+        }
 
     uris = _list_warehouse_keys(warehouse_store, warehouse_root)
     if not uris:
@@ -113,7 +116,9 @@ def report(cache: Path, index_locs: list[str], con) -> dict:
     trips = str(cache)
     cards = _card_sources(index_locs)
     out: dict = {}
-    out["warehouse_rows"] = con.execute(f"SELECT count(*) FROM read_parquet('{trips}')").fetchone()[0]
+    out["warehouse_rows"] = con.execute(f"SELECT count(*) FROM read_parquet('{trips}')").fetchone()[
+        0
+    ]
     out["index_rows"] = con.execute(f"SELECT count(*) FROM read_parquet([{cards}])").fetchone()[0]
     out["distinct_keys"] = con.execute(
         f"SELECT count(DISTINCT s3_key) FROM read_parquet([{cards}]) WHERE s3_key <> ''"
@@ -288,7 +293,9 @@ def verify(cache: Path, index_locs: list[str], con) -> dict:
     cards = _card_sources(index_locs)
     out: dict = {}
     out["index_rows"] = con.execute(f"SELECT count(*) FROM read_parquet([{cards}])").fetchone()[0]
-    out["warehouse_rows"] = con.execute(f"SELECT count(*) FROM read_parquet('{trips}')").fetchone()[0]
+    out["warehouse_rows"] = con.execute(f"SELECT count(*) FROM read_parquet('{trips}')").fetchone()[
+        0
+    ]
     out["distinct_keys"] = con.execute(
         f"SELECT count(DISTINCT s3_key) FROM read_parquet([{cards}]) WHERE s3_key <> ''"
     ).fetchone()[0]
@@ -319,7 +326,9 @@ def verify(cache: Path, index_locs: list[str], con) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def upload(manifest: BackfillManifest, src_store: ObjectStore, index_key: str, dest_store: ObjectStore) -> int:
+def upload(
+    manifest: BackfillManifest, src_store: ObjectStore, index_key: str, dest_store: ObjectStore
+) -> int:
     """Copy the manifest's parts from the local staging store to the live index."""
     total = 0
     for entry in manifest.parts:
