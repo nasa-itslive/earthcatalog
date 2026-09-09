@@ -359,7 +359,7 @@ def count_active_items(index_path: str, store=None) -> int:
     if index_path.startswith("s3://"):
         if store is None:
             return 0
-        from .stats import parse_s3_uri
+        from .uris import parse_s3_uri
 
         parsed = parse_s3_uri(index_path)
         if not parsed or not parsed[1]:

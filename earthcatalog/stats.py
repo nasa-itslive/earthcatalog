@@ -30,24 +30,9 @@ import obstore
 from obstore.store import ObjectStore
 
 from .schema import PROP_TIME_BIN, partition_year
+from .uris import parse_s3_uri  # noqa: F401  (re-export: canonical home is uris.py)
 
 STATS_VERSION = 1
-
-
-def parse_s3_uri(uri: str) -> tuple[str, str] | None:
-    """Parse an S3 URI into (bucket, key).
-
-    Returns None if the URI is not an S3 URI. Non-S3 URIs (local paths, etc.)
-    pass through as-is via the return None convention.
-    """
-    if not uri.startswith("s3://"):
-        return None
-    no_scheme = uri.removeprefix("s3://")
-    parts = no_scheme.split("/", 1)
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return parts[0], ""
-
 
 def stats_key_for(warehouse: str) -> str:
     """Store key for stats.json — the top of the catalog, beside

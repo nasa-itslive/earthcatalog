@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from obstore.store import ObjectStore
 
 from .ingest_config import IngestConfig
+from .uris import parse_s3_uri, strip_bucket
 
 if TYPE_CHECKING:
     from pyiceberg.catalog.sql import SqlCatalog
@@ -71,7 +72,7 @@ class IngestPipeline:
     def _store_relative(key: str) -> str:
         """Normalize an index path/URI to a store-relative object key."""
         if key.startswith("s3://"):
-            return key.removeprefix("s3://").split("/", 1)[1]
+            return strip_bucket(key)
         if os.path.isabs(key):
             # Local stores are rooted at the warehouse dir.
             return os.path.basename(key)
@@ -164,7 +165,7 @@ class IngestPipeline:
             # Store-relative key prefix (obstore keys are relative to the
             # bucket); the full s3:// URI is passed as warehouse_root so
             # Iceberg add_files resolves real paths.
-            warehouse_prefix = warehouse_prefix.removeprefix("s3://").split("/", 1)[1]
+            warehouse_prefix = strip_bucket(warehouse_prefix)
         elif os.path.isabs(warehouse_prefix):
             # Local stores are rooted at the warehouse dir — same
             # store-relative rule as the index key above.
@@ -200,9 +201,9 @@ class IngestPipeline:
         # Resume filter: DuckDB anti-join against the unified index (every
         # location: legacy single file + all parts) when it exists; absent
         # index (first run) → everything is new.
-        if warehouse_root.startswith("s3://"):
-            bucket = warehouse_root.removeprefix("s3://").split("/", 1)[0]
-            index_uris = [f"s3://{bucket}/{loc}" for loc in index.locations()]
+        parsed_wh = parse_s3_uri(warehouse_root)
+        if parsed_wh:
+            index_uris = [f"s3://{parsed_wh[0]}/{loc}" for loc in index.locations()]
         else:
             # Local: anchor to the absolute index property path — the
             # LocalStore root is not derivable from the warehouse dir
@@ -449,8 +450,8 @@ class IngestPipeline:
         if not store:
             return
         root = cat.catalog.properties.get("warehouse", "")
-        rel = root.removeprefix("s3://").split("/", 1)
-        key = f"{rel[1].rstrip('/')}/_last_run.json" if len(rel) == 2 else "_last_run.json"
+        parsed = parse_s3_uri(root)
+        key = f"{parsed[1].rstrip('/')}/_last_run.json" if parsed else "_last_run.json"
         payload = dict(summary)
         payload["finished_at"] = _dt.now(UTC).isoformat()
         obstore.put(store, key, json.dumps(payload, default=str).encode())

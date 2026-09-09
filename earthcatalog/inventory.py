@@ -11,7 +11,6 @@ daily-delta script.
 from __future__ import annotations
 
 import asyncio
-import configparser
 import csv
 import gzip
 import hashlib
@@ -32,48 +31,17 @@ import pyarrow.parquet as pq
 from obstore.store import ObjectStore, S3Store
 from tqdm import tqdm
 
-_STORES: dict[str, S3Store] = {}
+from earthcatalog import stores
 
 
 def get_store(bucket: str) -> S3Store:
-    if bucket not in _STORES:
-        _STORES[bucket] = S3Store(
-            bucket=bucket,
-            region="us-west-2",
-            skip_signature=True,
-        )
-    return _STORES[bucket]
+    """Unsigned store for public buckets (delegates to :mod:`earthcatalog.stores`)."""
+    return stores.make_anonymous_store(bucket)
 
 
 def get_authenticated_store(bucket: str) -> S3Store:
-    key_id, secret, token = _aws_keys()
-
-    kwargs: dict = dict(bucket=bucket, region="us-west-2")
-    if key_id:
-        kwargs["aws_access_key_id"] = key_id
-    if secret:
-        kwargs["aws_secret_access_key"] = secret
-    if token:
-        kwargs["aws_session_token"] = token
-
-    return S3Store(**kwargs)
-
-
-def _aws_keys() -> tuple[str, str, str]:
-    """AWS credentials from the environment, else ~/.aws/credentials."""
-
-    key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    token = os.environ.get("AWS_SESSION_TOKEN", "")
-    if not (key_id and secret):
-        cfg = configparser.ConfigParser()
-        cfg.read(os.path.expanduser("~/.aws/credentials"))
-        profile = os.environ.get("AWS_PROFILE", "default")
-        if profile in cfg:
-            key_id = cfg[profile].get("aws_access_key_id", key_id)
-            secret = cfg[profile].get("aws_secret_access_key", secret)
-            token = cfg[profile].get("aws_session_token", token) or token
-    return key_id, secret, token
+    """Authenticated store (delegates to :mod:`earthcatalog.stores`)."""
+    return stores.make_s3_store(bucket)
 
 
 def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
@@ -89,7 +57,7 @@ def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
 
     if warehouse_path.startswith("s3://"):
         props["s3.region"] = region
-        key_id, secret, token = _aws_keys()
+        key_id, secret, token = stores.aws_credentials()
         if key_id and secret:
             props["s3.access-key-id"] = key_id
             props["s3.secret-access-key"] = secret

@@ -17,7 +17,6 @@ Can also be imported and called directly from Python::
 """
 
 import argparse
-import configparser
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -25,30 +24,15 @@ from pathlib import Path
 
 from obstore.store import LocalStore, S3Store
 
+from earthcatalog.uris import parse_s3_uri
+
 
 def _make_s3_store(bucket: str, prefix: str = "") -> S3Store:
-    key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-    token = os.environ.get("AWS_SESSION_TOKEN")
-    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
-    if not (key_id and secret):
-        cfg = configparser.ConfigParser()
-        cfg.read(os.path.expanduser("~/.aws/credentials"))
-        profile = os.environ.get("AWS_PROFILE", "default")
-        if profile in cfg:
-            key_id = cfg[profile].get("aws_access_key_id", key_id)
-            secret = cfg[profile].get("aws_secret_access_key", secret)
-            token = cfg[profile].get("aws_session_token", token) or token
-    kwargs: dict = dict(bucket=bucket, region=region)
-    if prefix:
-        kwargs["prefix"] = prefix
-    if key_id:
-        kwargs["aws_access_key_id"] = key_id
-    if secret:
-        kwargs["aws_secret_access_key"] = secret
-    if token:
-        kwargs["aws_session_token"] = token
-    return S3Store(**kwargs)
+    """Authenticated S3 store — the implementation lives in
+    :mod:`earthcatalog.stores`; kept as an alias for existing importers."""
+    from earthcatalog.stores import make_s3_store
+
+    return make_s3_store(bucket, prefix=prefix)
 
 
 def run(
@@ -135,8 +119,7 @@ def run(
     # Build stores
     # ------------------------------------------------------------------
     if warehouse.startswith("s3://"):
-        wh_no_scheme = warehouse.removeprefix("s3://")
-        wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
+        wh_bucket, wh_prefix = parse_s3_uri(warehouse)  # type: ignore[union-attr,misc]
         # Bucket-level store: the pipeline uses full bucket keys
         # (warehouse_prefix / index_key), so a prefix here would double-prefix.
         warehouse_store: S3Store | LocalStore = _make_s3_store(wh_bucket)
