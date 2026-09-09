@@ -95,12 +95,12 @@ def rebuild_iceberg_from_warehouse(
         FULL_NAME,
         ICEBERG_SCHEMA,
         NAMESPACE,
-        _open_sqlite,
+        open_sqlite,
         upload_catalog,
     )
     from earthcatalog.schema import PROP_TIME_BIN, build_partition_spec
 
-    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
+    catalog = open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
 
     try:
         existing = catalog.load_table(FULL_NAME)

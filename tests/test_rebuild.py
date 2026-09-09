@@ -91,7 +91,7 @@ def test_rebuild_preserves_month_partition_spec(monkeypatch, tmp_path):
             created["spec"] = partition_spec
             return _Table()
 
-    monkeypatch.setattr(catalog_mod, "_open_sqlite", lambda **kw: _FakeCatalog())
+    monkeypatch.setattr(catalog_mod, "open_sqlite", lambda **kw: _FakeCatalog())
     monkeypatch.setattr(rebuild_mod, "_list_warehouse_keys", lambda *a: [])
 
     n = rebuild_mod.rebuild_iceberg_from_warehouse(

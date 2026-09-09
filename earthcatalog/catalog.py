@@ -262,11 +262,22 @@ def _catalog_info(table) -> CatalogInfo:
 # ---------------------------------------------------------------------------
 
 
-def _open_sqlite(db_path: str, warehouse_path: str) -> SqlCatalog:
-    """Open a PyIceberg SqlCatalog from local paths (internal use)."""
+def open_sqlite(db_path: str, warehouse_path: str) -> SqlCatalog:
+    """Open a PyIceberg SqlCatalog over a local SQLite db for *warehouse_path*.
+
+    Part of the catalog lifecycle surface (used by the CLI, run.py, rebuild
+    and the GC entry script).  Credentials come from
+    :func:`earthcatalog.inventory.sql_catalog_props` — this is the
+    *writer* configuration; the read-mostly catalog built by :func:`open`
+    configures anonymous/region properties itself.
+    """
     from .inventory import sql_catalog_props
 
     return SqlCatalog(NAMESPACE, **sql_catalog_props(db_path, warehouse_path))
+
+
+# Historical private name — importers across cli/run/tests still use it.
+_open_sqlite = open_sqlite
 
 
 def download_catalog(

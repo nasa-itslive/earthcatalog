@@ -339,7 +339,7 @@ def consolidate(
 
     from obstore.store import LocalStore, S3Store
 
-    from earthcatalog.catalog import _open_sqlite, download_catalog, upload_catalog
+    from earthcatalog.catalog import download_catalog, open_sqlite, upload_catalog
     from earthcatalog.consolidate import run as run_consolidation
     from earthcatalog.run import _make_s3_store
 
@@ -358,7 +358,7 @@ def consolidate(
         store = LocalStore(str(_Path(warehouse).parent))
         warehouse_prefix = _Path(warehouse).name
 
-    cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
+    cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
     table = cat.load_table("earthcatalog.stac_items")
 
     reports = run_consolidation(
@@ -481,10 +481,10 @@ def info(
         os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
         os.environ.pop("AWS_SESSION_TOKEN", None)
 
-    from earthcatalog.catalog import FULL_NAME, _catalog_info, _open_sqlite
+    from earthcatalog.catalog import FULL_NAME, _catalog_info, open_sqlite
     from earthcatalog.index import resolve_index_path
 
-    cat = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse)
+    cat = open_sqlite(db_path=catalog_path, warehouse_path=warehouse)
     try:
         table = cat.load_table(FULL_NAME)
     except Exception:

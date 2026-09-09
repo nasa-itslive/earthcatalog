@@ -221,12 +221,12 @@ def run(
     from earthcatalog.catalog import (
         EarthCatalog,
         _catalog_info,
-        _open_sqlite,
         get_or_create,
+        open_sqlite,
     )
     from earthcatalog.ingest_config import IngestConfig
 
-    cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
+    cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
     table = get_or_create(cat, grid_config=grid)
     ec = EarthCatalog(
         catalog=cat,
