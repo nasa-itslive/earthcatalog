@@ -1,8 +1,11 @@
 # Simplification Progress Report
 
 **Session:** Implementation Phase (Commits 8b5d589 → 2650d24)  
-**Branch:** main  
-**Status:** Phase 1-3 complete; Phase 4 (RPI-1) deferred; Phase 5 (reporting) in progress
+**Branch:** main (original pass); superseded/extended by `refactoring-simpler`  
+**Status:** Phases 1-3 complete on `main`. The "Follow-up Pass" section at the
+bottom of this file (branch `refactoring-simpler`) completed the structural
+refactor this pass set up — see `CHANGELOG.md` for the authoritative,
+up-to-date list of changes and breaking changes.
 
 ---
 

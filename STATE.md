@@ -176,7 +176,8 @@ earthcatalog ingest --diff <new.parquet> --mode delta \
   `year=unknown/`); dead `_GC_FILE_RE` removed; docs + plan_simplification
   reconciled; `scripts/daily_delta.py` and the two-job workflow deleted —
   `daily_delta.yml` is now one job (diff → ingest, concurrency group,
-  timeout 120 min), still dispatch-only.
+  timeout 120 min), live on a 14:00 UTC daily schedule (plus manual
+  `workflow_dispatch`).
 
 ## Real-data verification (T0 + E2E, all numbers real)
 
@@ -299,7 +300,7 @@ runner-sized. Real-data verified end to end (see table above).
 ```bash
 source ~/.pyenv/versions/miniforge3-latest/etc/profile.d/conda.sh && mamba activate earthcatalog
 cd ~/github/nasa-itslive/earthcatalog
-pytest -q -m "not integration and not performance and not e2e"   # expect: 320 passed
+pytest -q -m "not integration and not performance and not e2e"   # expect: 374 passed
 
 # live dry-run / ingest (scratch only!)
 export AWS_ACCESS_KEY_ID="$(aws configure get aws_access_key_id)"

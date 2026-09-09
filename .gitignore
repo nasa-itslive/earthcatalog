@@ -179,3 +179,7 @@ cython_debug/
 .pypirc
 .python-version
 
+# Local editor/agent tooling config and scratch state (per-machine, not project config)
+opencode.json
+.zcode/
+
