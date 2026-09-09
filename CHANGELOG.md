@@ -9,7 +9,22 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- One-shot processing modules retired now that the store is normalized:
+  `earthcatalog/migrate.py` (legacy index migration) and
+  `earthcatalog/index_backfill.py`, plus their `migrate-indices` /
+  `index-backfill` CLI commands. Production catch-up is a plain
+  `earthcatalog ingest --mode auto` diff ingest.
+- Orphaned `earthcatalog/tools/` dev utility and the `scripts/ingest.py`
+  backward-compat shim.
+- Deprecated `EarthCatalog.bulk_ingest()` alias (use `ingest_inventory()`).
+- Dead private-name aliases in `inventory.py`; callers use the public
+  `iter_inventory*` names.
+
 ### Fixed
+- CI workflows (`consolidate.yml`, `garbage_collect.yml`) now call
+  `earthcatalog info` instead of the deleted `scripts/info.py` (both were
+  failing at the catalog-info steps).
 - README canonical search example uses `catalog.search()` returning pystac
   Items for clarity.
 - `run_backfill` no longer builds a prefix-scoped warehouse store (fixed

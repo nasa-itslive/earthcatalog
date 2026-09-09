@@ -157,9 +157,9 @@ earthcatalog ingest --diff <new.parquet> --mode delta \
   (6 cells green). Scope: **serial direct stage** (see Open item).
 - **`--mode full` really rebuilds** — index object deleted + `_staging/`
   swept with the table drop (A1).
-- **`earthcatalog/migrate.py` + `earthcatalog migrate-indices`** — legacy
-  `*_id_hashes.parquet` / `*_source_index.parquet` → unified index;
-  validated sidecar, atomic swap, idempotent (A8). Single resolver
+- **Unified index** — legacy `*_id_hashes.parquet` / `*_source_index.parquet`
+  files were folded into the unified index by the (now-removed, one-shot)
+  `migrate-indices` command. Single resolver
   `resolve_index_path()` (`earthcatalog.index_path` property → conventional
   path; legacy property deliberately not followed).
 - **Bulk profile** — scatter/map-reduce landed (step 0); DaskIngester head
@@ -280,10 +280,11 @@ runner-sized. Real-data verified end to end (see table above).
 - **RPI-4 · Consolidation `--audit`** — per-partition row counts vs
   `Index.count_active()` into `_last_run.json` (crash-orphan visibility,
   plan §5).
-- **RPI-5 · Production backlog decision** — the real index at `catalog/` is
-  394,964 keys behind; decide: run `migrate-indices` + a catch-up diff ingest
-  there, or rebuild the test warehouse under refactoring first. Needs a user
-  call.
+- **RPI-5 · Production backlog decision** — RESOLVED: the store is
+  normalized; the one-shot `migrate.py` / `index_backfill.py` modules and
+  their CLI commands were removed. Production catch-up is a plain
+  diff ingest (`earthcatalog ingest --mode auto`) against the latest
+  inventory manifest.
 - **RPI-6 · Enable workflows** — only after AWS secrets exist in the repo and
   RPI-1 lands; first run in `--dry-run`.
 - **RPI-7 · Optional** — ndjson-stage fault cells (de-scoped by design),

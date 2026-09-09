@@ -76,5 +76,4 @@ jobs:
           earthcatalog ingest --help
           earthcatalog diff --help
           earthcatalog info --help
-          earthcatalog migrate-indices --help
-          python -c "import earthcatalog, earthcatalog.diff, earthcatalog.journal, earthcatalog.migrate; print('imports ok')"
+          python -c "import earthcatalog, earthcatalog.diff, earthcatalog.journal; print('imports ok')"

@@ -378,7 +378,8 @@ def get_or_create(catalog: SqlCatalog, grid_config=None) -> Table:
         table = catalog.load_table(FULL_NAME)
         missing = {k: v for k, v in props.items() if k not in table.properties}
         # A legacy warehouse carries earthcatalog.hash_index_path; leave the
-        # index property alone until migrate_indices() stamps it.
+        # index property alone — it was stamped when the warehouse was
+        # migrated to the unified index.
         if table.properties.get(PROP_HASH_INDEX_PATH):
             missing.pop(PROP_INDEX_PATH, None)
         if missing:

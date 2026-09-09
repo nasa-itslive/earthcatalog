@@ -83,8 +83,8 @@ def resolve_index_path(table: Table | None, default_index_path: str) -> str:
     ``{warehouse_root}_index.parquet``), else ``""``.  The legacy
     ``earthcatalog.hash_index_path`` property is deliberately NOT followed:
     it names the retired ``*_id_hashes.parquet`` file whose schema this
-    Index cannot read — run :func:`earthcatalog.migrate.migrate_indices`
-    on such warehouses (which stamps the property as its final step).
+    Index cannot read (those warehouses were migrated to the unified
+    index; the one-shot migration tool has since been removed).
     """
     from .schema import PROP_INDEX_PATH
 
