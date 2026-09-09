@@ -171,7 +171,7 @@ earthcatalog uses a **SQLite-backed PyIceberg catalog** (`catalog.db`).
 
 ## Compaction
 
-Over many incremental runs each `(grid_partition, year)` bucket accumulates many small part files. `scripts/consolidate.py` merges them.
+Over many incremental runs each `(grid_partition, year)` bucket accumulates many small part files. `earthcatalog consolidate` merges them.
 
 ```
 compact_warehouse(warehouse_path, catalog_path, threshold=2)

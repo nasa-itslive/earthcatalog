@@ -165,7 +165,8 @@ earthcatalog ingest --diff <new.parquet> --mode delta \
 - **Bulk profile** — scatter/map-reduce landed (step 0); DaskIngester head
   pre-filters shards against the index before `client.map` (A5).
 - **CLI/packaging (A7)** — entry point lives in `earthcatalog/run.py`;
-  `scripts/ingest.py` is a shim; wheel smoke test added to CI.
+  the `earthcatalog ingest` CLI is the single front door (shim removed);
+  wheel smoke test in CI.
 - **`--dry-run`** (counts, no writes) and **`_last_run.json`** written to the
   warehouse every run.
 - **A11/A12** — year=NULL sentinel (GC partition lookup matches

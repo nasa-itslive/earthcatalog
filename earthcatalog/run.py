@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end ingest entry point — store building, client resolution, run.
 
-Lives in the package (wheels only package ``earthcatalog*``); the
-``scripts/ingest.py`` module is a thin shim over :func:`run`.
+Lives in the package (wheels only package ``earthcatalog*``) behind the
+``earthcatalog ingest`` CLI command.
 
 Can also be imported and called directly from Python::
 

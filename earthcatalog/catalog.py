@@ -798,23 +798,6 @@ class EarthCatalog:
 
         return IngestPipeline(self, config).run(inventory_path, mode=mode)
 
-    def bulk_ingest(
-        self,
-        inventory_path: str,
-        *,
-        mode: str = "auto",
-        config: IngestConfig | None = None,
-    ) -> dict:
-        """Deprecated alias for :meth:`ingest_inventory`."""
-        import warnings
-
-        warnings.warn(
-            "EarthCatalog.bulk_ingest() is deprecated; use ingest_inventory()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.ingest_inventory(inventory_path, mode=mode, config=config)
-
     def download_catalog(self, local_path: str) -> None:
         """Download catalog.db from the backing store to *local_path*."""
         download_catalog(local_path, store=self._store)

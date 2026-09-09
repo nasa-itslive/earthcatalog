@@ -2,7 +2,7 @@
 Tests for inventory reading: CSV, CSV.gz, and Parquet formats.
 
 All tests use local temp files — no S3 access required.
-The S3 path of _iter_inventory_csv is exercised by patching
+The S3 path of iter_inventory_csv is exercised by patching
 _fetch_inventory_bytes so no real network calls are made.
 """
 
@@ -22,12 +22,12 @@ from obstore.store import MemoryStore
 from earthcatalog.inventory import (
     InventoryShard,
     _coerce_last_modified,
-    _iter_inventory,
-    _iter_inventory_csv,
-    _iter_inventory_manifest,
-    _iter_inventory_parquet,
     delete_scatter,
     delete_shard_files,
+    iter_inventory,
+    iter_inventory_csv,
+    iter_inventory_manifest,
+    iter_inventory_parquet,
     is_scatter_manifest,
     load_inventory_shards,
     scatter_manifest_path,
@@ -105,30 +105,30 @@ class TestIterInventoryCsv:
             _write_csv(p, ROWS, with_header=with_header)
         else:
             _write_csv_gz(p, ROWS, with_header=with_header)
-        result = list(_iter_inventory_csv(str(p)))
+        result = list(iter_inventory_csv(str(p)))
         assert result == ROWS
 
     def test_csv_empty_lines_ignored(self, tmp_path):
         p = tmp_path / "inv.csv"
         p.write_text("bucket,key\n\nmy-bucket,a.stac.json\n\n")
-        result = list(_iter_inventory_csv(str(p)))
+        result = list(iter_inventory_csv(str(p)))
         assert result == [("my-bucket", "a.stac.json")]
 
     def test_csv_quoted_values(self, tmp_path):
         p = tmp_path / "inv.csv"
         p.write_text('"bucket","key"\n"my-bucket","prefix/a.stac.json"\n')
-        result = list(_iter_inventory_csv(str(p)))
+        result = list(iter_inventory_csv(str(p)))
         assert result == [("my-bucket", "prefix/a.stac.json")]
 
     def test_dispatch_csv(self, tmp_path):
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS)
-        assert list(_iter_inventory(str(p))) == ROWS
+        assert list(iter_inventory(str(p))) == ROWS
 
     def test_dispatch_csv_gz(self, tmp_path):
         p = tmp_path / "inv.csv.gz"
         _write_csv_gz(p, ROWS)
-        assert list(_iter_inventory(str(p))) == ROWS
+        assert list(iter_inventory(str(p))) == ROWS
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +140,14 @@ class TestIterInventoryParquet:
     def test_parquet_basic(self, tmp_path):
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS)
-        result = list(_iter_inventory_parquet(str(p)))
+        result = list(iter_inventory_parquet(str(p)))
         assert result == ROWS
 
     def test_parquet_preserves_order(self, tmp_path):
         rows = [(f"bucket-{i}", f"key-{i}.stac.json") for i in range(200)]
         p = tmp_path / "inv.parquet"
         _write_parquet(p, rows)
-        result = list(_iter_inventory_parquet(str(p)))
+        result = list(iter_inventory_parquet(str(p)))
         assert result == rows
 
     def test_parquet_batch_boundary(self, tmp_path):
@@ -156,7 +156,7 @@ class TestIterInventoryParquet:
         p = tmp_path / "inv.parquet"
         _write_parquet(p, rows)
         # batch_size=100 forces 3 batches for 250 rows
-        result = list(_iter_inventory_parquet(str(p), batch_size=100))
+        result = list(iter_inventory_parquet(str(p), batch_size=100))
         assert result == rows
 
     def test_parquet_extra_columns_ignored(self, tmp_path):
@@ -171,20 +171,20 @@ class TestIterInventoryParquet:
         )
         p = tmp_path / "inv.parquet"
         pq.write_table(table, str(p))
-        result = list(_iter_inventory_parquet(str(p)))
+        result = list(iter_inventory_parquet(str(p)))
         assert result == [("b", "k.stac.json")]
 
     def test_dispatch_parquet(self, tmp_path):
-        """_iter_inventory dispatches .parquet to the Parquet reader."""
+        """iter_inventory dispatches .parquet to the Parquet reader."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS)
-        assert list(_iter_inventory(str(p))) == ROWS
+        assert list(iter_inventory(str(p))) == ROWS
 
     def test_parquet_empty_file(self, tmp_path):
         """An empty Parquet inventory yields nothing."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, [])
-        assert list(_iter_inventory_parquet(str(p))) == []
+        assert list(iter_inventory_parquet(str(p))) == []
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +206,7 @@ def _make_csv_gz_bytes(rows, with_header=True) -> bytes:
 
 
 class TestS3CsvPath:
-    """_iter_inventory_csv with s3:// paths — _fetch_inventory_bytes mocked."""
+    """iter_inventory_csv with s3:// paths — _fetch_inventory_bytes mocked."""
 
     @pytest.mark.parametrize(
         ("suffix", "with_header"),
@@ -226,7 +226,7 @@ class TestS3CsvPath:
             "earthcatalog.inventory._fetch_inventory_bytes",
             return_value=raw,
         ):
-            assert list(_iter_inventory_csv(fake_path)) == ROWS
+            assert list(iter_inventory_csv(fake_path)) == ROWS
 
     def test_s3_plain_csv_no_str_copy(self):
         """Verify that the S3 plain-CSV path does NOT call bytes.decode() —
@@ -250,9 +250,9 @@ class TestS3CsvPath:
             "earthcatalog.inventory._fetch_inventory_bytes",
             return_value=spy,
         ):
-            list(_iter_inventory_csv(fake_path))
+            list(iter_inventory_csv(fake_path))
         assert not spy.decode_called, (
-            "_iter_inventory_csv called bytes.decode() — should use TextIOWrapper(BytesIO) instead"
+            "iter_inventory_csv called bytes.decode() — should use TextIOWrapper(BytesIO) instead"
         )
 
 
@@ -262,13 +262,13 @@ class TestS3CsvPath:
 
 
 class TestSinceFilterParquet:
-    """_iter_inventory_parquet with a since= cutoff date."""
+    """iter_inventory_parquet with a since= cutoff date."""
 
     def test_filters_old_rows(self, tmp_path):
         """Rows with last_modified_date < since must be excluded."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS, lm_dates=[_OLD, _NEW, _NEW])
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[1], ROWS[2]]
 
     def test_keeps_rows_at_exact_cutoff(self, tmp_path):
@@ -276,35 +276,35 @@ class TestSinceFilterParquet:
         exact = "2026-04-01T00:00:00.000Z"
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS[:1], lm_dates=[exact])
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[0]]
 
     def test_keeps_all_when_no_lm_column(self, tmp_path):
         """Graceful degradation: no last_modified_date column → all rows kept."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS)  # no lm_dates
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == ROWS
 
     def test_none_since_returns_all(self, tmp_path):
         """since=None must return all rows regardless of last_modified_date."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS, lm_dates=[_OLD, _OLD, _OLD])
-        result = list(_iter_inventory_parquet(str(p), since=None))
+        result = list(iter_inventory_parquet(str(p), since=None))
         assert result == ROWS
 
     def test_null_lm_passes_through(self, tmp_path):
         """Rows with a NULL last_modified_date must be passed through."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS[:1], lm_dates=[None])
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[0]]
 
     def test_dispatch_parquet_with_since(self, tmp_path):
-        """_iter_inventory propagates since= to the Parquet reader."""
+        """iter_inventory propagates since= to the Parquet reader."""
         p = tmp_path / "inv.parquet"
         _write_parquet(p, ROWS, lm_dates=[_OLD, _NEW, _NEW])
-        result = list(_iter_inventory(str(p), since=_SINCE))
+        result = list(iter_inventory(str(p), since=_SINCE))
         assert result == [ROWS[1], ROWS[2]]
 
 
@@ -314,41 +314,41 @@ class TestSinceFilterParquet:
 
 
 class TestSinceFilterCsv:
-    """_iter_inventory_csv with a since= cutoff date."""
+    """iter_inventory_csv with a since= cutoff date."""
 
     def test_filters_old_rows(self, tmp_path):
         """Rows with last_modified_date < since must be excluded."""
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS, lm_dates=[_OLD, _NEW, _NEW])
-        result = list(_iter_inventory_csv(str(p), since=_SINCE))
+        result = list(iter_inventory_csv(str(p), since=_SINCE))
         assert result == [ROWS[1], ROWS[2]]
 
     def test_keeps_all_when_no_lm_column_in_header(self, tmp_path):
         """Graceful degradation: header without last_modified_date → all rows."""
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS, with_header=True)  # only bucket, key header
-        result = list(_iter_inventory_csv(str(p), since=_SINCE))
+        result = list(iter_inventory_csv(str(p), since=_SINCE))
         assert result == ROWS
 
     def test_keeps_all_when_no_header(self, tmp_path):
         """Graceful degradation: no header at all → all rows passed through."""
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS, with_header=False)
-        result = list(_iter_inventory_csv(str(p), since=_SINCE))
+        result = list(iter_inventory_csv(str(p), since=_SINCE))
         assert result == ROWS
 
     def test_none_since_returns_all(self, tmp_path):
         """since=None must return all rows regardless of last_modified_date."""
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS, lm_dates=[_OLD, _OLD, _OLD])
-        result = list(_iter_inventory_csv(str(p), since=None))
+        result = list(iter_inventory_csv(str(p), since=None))
         assert result == ROWS
 
     def test_dispatch_csv_with_since(self, tmp_path):
-        """_iter_inventory propagates since= to the CSV reader."""
+        """iter_inventory propagates since= to the CSV reader."""
         p = tmp_path / "inv.csv"
         _write_csv(p, ROWS, lm_dates=[_OLD, _NEW, _NEW])
-        result = list(_iter_inventory(str(p), since=_SINCE))
+        result = list(iter_inventory(str(p), since=_SINCE))
         assert result == [ROWS[1], ROWS[2]]
 
 
@@ -399,7 +399,7 @@ def _write_parquet_timestamp(path, rows, lm_datetimes=None):
 
 
 class TestSinceFilterParquetTimestamp:
-    """_iter_inventory_parquet with a TIMESTAMP last_modified_date column."""
+    """iter_inventory_parquet with a TIMESTAMP last_modified_date column."""
 
     def test_filters_old_rows_timestamp(self, tmp_path):
         """TIMESTAMP rows < since are excluded."""
@@ -407,26 +407,26 @@ class TestSinceFilterParquetTimestamp:
         old_dt = datetime(2026, 1, 1, tzinfo=UTC)
         new_dt = datetime(2026, 4, 20, tzinfo=UTC)
         _write_parquet_timestamp(p, ROWS, [old_dt, new_dt, new_dt])
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[1], ROWS[2]]
 
     def test_keeps_rows_at_exact_cutoff_timestamp(self, tmp_path):
         """TIMESTAMP row exactly at since boundary is kept."""
         p = tmp_path / "inv.parquet"
         _write_parquet_timestamp(p, ROWS[:1], [_SINCE])
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[0]]
 
     def test_null_lm_timestamp_passes_through(self, tmp_path):
         """NULL TIMESTAMP rows are passed through."""
         p = tmp_path / "inv.parquet"
         _write_parquet_timestamp(p, ROWS[:1], [None])
-        result = list(_iter_inventory_parquet(str(p), since=_SINCE))
+        result = list(iter_inventory_parquet(str(p), since=_SINCE))
         assert result == [ROWS[0]]
 
 
 # ---------------------------------------------------------------------------
-# _iter_inventory_manifest — mocked obstore
+# iter_inventory_manifest — mocked obstore
 # ---------------------------------------------------------------------------
 
 
@@ -455,7 +455,7 @@ def _make_parquet_bytes(rows, lm_dates=None) -> bytes:
 
 
 class TestIterInventoryManifest:
-    """_iter_inventory_manifest with mocked obstore and _get_authenticated_store."""
+    """iter_inventory_manifest with mocked obstore and _get_authenticated_store."""
 
     def _run(self, manifest_bytes, data_files_bytes, since=None):
         """
@@ -483,12 +483,12 @@ class TestIterInventoryManifest:
         with (
             patch("earthcatalog.inventory.obstore.get", side_effect=fake_get),
             patch(
-                "earthcatalog.inventory._get_authenticated_store",
+                "earthcatalog.inventory.get_authenticated_store",
                 return_value="fake-store",
             ),
         ):
             return list(
-                _iter_inventory_manifest(
+                iter_inventory_manifest(
                     f"s3://{manifest_bucket}/{manifest_key}",
                     since=since,
                 )
@@ -508,13 +508,13 @@ class TestIterInventoryManifest:
         assert result == ROWS
 
     def test_since_filter_propagated(self):
-        """since= is forwarded to _iter_inventory_parquet for each data file."""
+        """since= is forwarded to iter_inventory_parquet for each data file."""
         data = _make_parquet_bytes(ROWS, lm_dates=[_OLD, _NEW, _NEW])
         result = self._run(b"", [data], since=_SINCE)
         assert result == [ROWS[1], ROWS[2]]
 
     def test_dispatch_manifest_json(self, tmp_path):
-        """_iter_inventory dispatches manifest.json suffix to manifest reader."""
+        """iter_inventory dispatches manifest.json suffix to manifest reader."""
         data = _make_parquet_bytes(ROWS)
 
         def fake_get(store, key):
@@ -535,7 +535,7 @@ class TestIterInventoryManifest:
                 return_value="fake-store",
             ),
         ):
-            result = list(_iter_inventory("s3://fake-log-bucket/inventory/manifest.json"))
+            result = list(iter_inventory("s3://fake-log-bucket/inventory/manifest.json"))
         assert result == ROWS
 
 

@@ -574,19 +574,3 @@ def fetch_items_async(
 ) -> list[dict]:
     """Synchronous wrapper: fetch *pairs* concurrently via the async path."""
     return asyncio.run(_fetch_all_async(pairs, concurrency))
-
-
-# Backward-compatible aliases (modules that imported the private names
-# from the deleted pipelines.incremental module can import from here).
-_iter_inventory_csv = iter_inventory_csv
-_iter_inventory_parquet = iter_inventory_parquet
-_iter_inventory_file_from_store = iter_inventory_file_from_store
-_iter_inventory_manifest = iter_inventory_manifest
-_iter_inventory = iter_inventory
-_fetch_item = fetch_item
-_get_store = get_store
-_get_authenticated_store = get_authenticated_store
-_fetch_inventory_bytes = _fetch_inventory_bytes
-_parse_last_modified = _parse_last_modified
-_coerce_last_modified = _coerce_last_modified
-_parse_manifest = _parse_manifest

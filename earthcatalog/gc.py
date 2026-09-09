@@ -41,7 +41,7 @@ from pyarrow.compute import (  # type: ignore[attr-defined]
 from pybloom_live import ScalableBloomFilter
 
 from earthcatalog.index import Index
-from earthcatalog.inventory import _iter_inventory
+from earthcatalog.inventory import iter_inventory
 from earthcatalog.schema import partition_prefix
 from earthcatalog.stats import parse_s3_uri
 
@@ -59,7 +59,7 @@ def build_inventory_bloom(
         mode=ScalableBloomFilter.SMALL_SET_GROWTH,
     )
     n = 0
-    for bucket, key in _iter_inventory(inventory_path):
+    for bucket, key in iter_inventory(inventory_path):
         if key.endswith(".stac.json"):
             bloom.add(f"s3://{bucket}/{key}")
             n += 1

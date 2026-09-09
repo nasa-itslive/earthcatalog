@@ -48,10 +48,6 @@ PROP_TIME_BIN = "earthcatalog.time_bin"
 _HIVE_RE = re.compile(
     r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
 )
-_HIVE_RE_V2 = re.compile(
-    r"grid=(?P<grid>[^/]+)/level=(?P<level>[^/]+)/tile=(?P<tile>[^/]+)/"
-    r"year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
-)
 
 TIME_BINS = ("year", "month", "day")
 
