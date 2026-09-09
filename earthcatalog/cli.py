@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import typer
 
+from .stats import parse_s3_uri
+
 app = typer.Typer(
     name="earthcatalog",
     help="EarthCatalog STAC → Iceberg ingest tool.",
@@ -322,8 +324,9 @@ def migrate_indices_command(
     from earthcatalog.run import _make_s3_store
 
     cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
-    if warehouse.startswith("s3://"):
-        bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+    parsed = parse_s3_uri(warehouse)
+    if parsed:
+        bucket, _ = parsed
         store: S3Store | LocalStore = _make_s3_store(bucket)
     else:
         store = LocalStore(warehouse)
@@ -382,8 +385,9 @@ def consolidate(
     from earthcatalog.run import _make_s3_store
 
     catalog_key = None
-    if warehouse.startswith("s3://"):
-        bucket, key_path = warehouse.removeprefix("s3://").split("/", 1)
+    parsed = parse_s3_uri(warehouse)
+    if parsed:
+        bucket, key_path = parsed
         store: S3Store | LocalStore = _make_s3_store(bucket)
         warehouse_prefix = key_path.rstrip("/")
         catalog_key = os.environ.get(
@@ -505,14 +509,19 @@ def index_backfill_command(
     from earthcatalog.run import _make_s3_store
 
     wd = _Path(work_dir)
-    bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
-    remote_store = _make_s3_store(bucket)
+    parsed = parse_s3_uri(warehouse)
+    bucket = parsed[0] if parsed else ""
+    if bucket:
+        remote_store = _make_s3_store(bucket)
+    else:
+        remote_store = LocalStore(warehouse)
     # On a bucket-level store the base key is the full path: the index is a
     # sibling of the warehouse dir ({warehouse}_index/).
     key = index_key
     if key is None:
-        if warehouse.startswith("s3://"):
-            key = f"{warehouse.removeprefix('s3://').split('/', 1)[1].rstrip('/')}_index"
+        if parsed:
+            _, key_path = parsed
+            key = f"{key_path.rstrip('/')}_index"
         else:
             key = f"{warehouse.rstrip('/')}_index"
     manifest: ib.BackfillManifest | None = None
@@ -663,12 +672,12 @@ def info(
         catalog_s3 = f"{warehouse.rsplit('/', 1)[0]}/earthcatalog.db"
 
     catalog_path = catalog or "/tmp/earthcatalog_info.db"
-    if catalog_s3 and catalog_s3.startswith("s3://"):
+    parsed_catalog = parse_s3_uri(catalog_s3) if catalog_s3 else None
+    if parsed_catalog:
         import obstore
         from obstore.store import S3Store
 
-        no_scheme = catalog_s3.removeprefix("s3://")
-        bucket, key = no_scheme.split("/", 1)
+        bucket, key = parsed_catalog
         region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
         store = S3Store(bucket=bucket, region=region, skip_signature=True)
         catalog_path = f"/tmp/earthcatalog_info_{key.rsplit('/', 1)[-1]}.db"
@@ -715,8 +724,9 @@ def info(
     from earthcatalog.run import _make_s3_store
 
     idx_store: ObjectStore
-    if warehouse.startswith("s3://"):
-        bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+    parsed_warehouse = parse_s3_uri(warehouse)
+    if parsed_warehouse:
+        bucket, _ = parsed_warehouse
         if update:
             # Writing needs real, authenticated credentials.
             idx_store = _make_s3_store(bucket)
@@ -736,11 +746,8 @@ def info(
     else:
         idx_store = LocalStore(str(Path(warehouse).parent))
     skey = stats_mod.stats_key_for(warehouse)
-    index_rel = (
-        index_path.removeprefix("s3://").split("/", 1)[1]
-        if index_path.startswith("s3://")
-        else os.path.basename(index_path)
-    )
+    parsed_index = parse_s3_uri(index_path)
+    index_rel = parsed_index[1] if parsed_index else os.path.basename(index_path)
     idx = _Index(idx_store, index_rel)
     stored = stats_mod.load(idx_store, skey)
 
