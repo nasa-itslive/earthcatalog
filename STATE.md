@@ -1,8 +1,11 @@
 # Project State — daily-ingest rework
 
-Last updated: **2026-09-06 evening** · Branch: `feature/garbage-collection` ·
-Suite: **320 passed** (`pytest -m "not integration and not performance and not e2e"`)
-· 9 commits landed today (see `git log --oneline d6a75ca..HEAD`, note `origin/main` is ~4 months stale).
+Last updated: **2026-09-09** · Branch: `refactoring-simpler` ·
+Suite: **374 passed** (`pytest -m "not integration and not performance and not e2e"`)
+· Structure refactor landed: partitioner owns temporal binning (h3/s2/utm/
+geojson/lat_lon, year/month/day), facade split out (`earthcatalog/facade.py`),
+one-shot modules removed, CLI-level daily-flow test in the PR gate (see
+CHANGELOG [Unreleased] for the breaking changes).
 
 ---
 

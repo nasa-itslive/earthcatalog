@@ -42,7 +42,7 @@ def run(
     catalog: str = "/tmp/earthcatalog_v2.db",
     warehouse: str = "s3://its-live-data/test-space/stac/catalog/warehouse",
     # Where to upload earthcatalog.db inside the bucket (key only, no s3://bucket/)
-    catalog_key: str = "test-space/stac/catalog/earthcatalog.db",
+    catalog_key: str | None = "test-space/stac/catalog/earthcatalog.db",
     lock_key: str = "test-space/stac/catalog/.lock",
     chunk_size: int = 100_000,
     limit: int | None = None,
@@ -125,17 +125,30 @@ def run(
         warehouse_store: S3Store | LocalStore = _make_s3_store(wh_bucket)
     else:
         Path(warehouse).mkdir(parents=True, exist_ok=True)
-        warehouse_store = LocalStore(str(warehouse))
-        wh_bucket = "its-live-data"  # fallback for store_config
+        # Store-relative keys are "{basename(warehouse)}/..." and the index /
+        # stats.json are siblings of the warehouse dir — root the store at
+        # the PARENT, matching the pipeline's local-store convention (see
+        # IngestPipeline.run), never at the warehouse itself (that would
+        # double-nest every object).
+        warehouse_store = LocalStore(str(Path(warehouse).parent))
 
     # ------------------------------------------------------------------
     # Configure store_config (controls catalog upload destination)
     # ------------------------------------------------------------------
     from earthcatalog import store_config
 
-    store_config.set_store(_make_s3_store(wh_bucket))
-    store_config.set_catalog_key(catalog_key)
-    store_config.set_lock_key(lock_key)
+    local_run = not warehouse.startswith("s3://")
+    if local_run:
+        # A local warehouse has nowhere remote to persist to: the catalog db
+        # stays at the --catalog path and no upload step may fire.
+        catalog_key = None
+        store_config.set_store(warehouse_store)
+        store_config.set_catalog_key("")
+        store_config.set_lock_key("")
+    else:
+        store_config.set_store(_make_s3_store(wh_bucket))
+        store_config.set_catalog_key(catalog_key or "")
+        store_config.set_lock_key(lock_key)
 
     if warehouse.startswith("s3://"):
         # Pull the remote catalog db BEFORE opening the local sqlite:
