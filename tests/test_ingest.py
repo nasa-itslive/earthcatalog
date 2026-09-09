@@ -678,7 +678,18 @@ class TestPerBucketCommitSkip:
         assert any("cellB" in k for k in staged)
 
         # Simulate cellA's bucket finishing: compact + commit + delete its NDJSON.
-        np, ir, _, ndjson_keys = ing_a._compact_ndjson_bucket("cellA", "2020")
+        # This calls the same module-level _compact_bucket that DaskIngester
+        # ships to client.map — not a wrapper.
+        from earthcatalog.ingest import _compact_bucket
+
+        np, ir, _, ndjson_keys = _compact_bucket(
+            ing_a._store,
+            ing_a._ndjson_prefix,
+            ing_a._warehouse_prefix,
+            ("cellA", "2020"),
+            delta=ing_a._delta,
+            layout=ing_a._layout,
+        )
         table.add_files(np)
         index.append(ir)
         for k in ndjson_keys:

@@ -327,19 +327,6 @@ class DaskIngester(Ingester):
                         buckets.add((cell, bv))
         return buckets
 
-    def _compact_ndjson_bucket(
-        self, cell: str, bin_val: str
-    ) -> tuple[list[str], list[dict], int, list[str]]:
-        """Compact one ``(cell, bin_value)`` bucket — see :func:`_compact_bucket`."""
-        return _compact_bucket(
-            self._store,
-            self._ndjson_prefix,
-            self._warehouse_prefix,
-            (cell, bin_val),
-            delta=self._delta,
-            layout=self._layout,
-        )
-
     def run(self, inventory, *, client=None) -> dict:  # type: ignore[override]
         """Ingest each shard in *inventory* in parallel; workers stream their own pairs."""
         if client is None:
@@ -517,17 +504,6 @@ def _for_each_result(client, fn, iterable, *, desc: str, on_result) -> None:
         for res in futures:
             on_result(res)
             pbar.update(1)
-
-
-def _append_ndjson(store: ObjectStore, key: str, items: list[dict]) -> None:
-    """Append items to an NDJSON object, creating or extending it."""
-    lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
-    try:
-        raw = bytes(obstore.get(store, key).bytes())
-        merged = raw.decode("utf-8") + lines
-        obstore.put(store, key, merged.encode("utf-8"))
-    except FileNotFoundError:
-        obstore.put(store, key, lines.encode("utf-8"))
 
 
 def _put_ndjson(store: ObjectStore, key: str, items: list[dict]) -> None:
