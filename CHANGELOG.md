@@ -9,7 +9,57 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- `EarthCatalog.search_uris()` / `EarthCatalog.duck_search()` methods — the
+  facade keeps only the basic operations (`search`, `search_to_arrow`,
+  `search_files`, `ingest_inventory`, `garbage_collect`,
+  `download_catalog`/`upload_catalog`, grid properties). The DuckDB searches
+  are now module functions with one shared implementation:
+  `earthcatalog.search.search_uris(catalog, ...)` /
+  `earthcatalog.search.duck_search(catalog, ...)`.
+- One-shot processing modules retired now that the store is normalized:
+  `earthcatalog/migrate.py` (legacy index migration) and
+  `earthcatalog/index_backfill.py`, plus their `migrate-indices` /
+  `index-backfill` CLI commands. Production catch-up is a plain
+  `earthcatalog ingest --mode auto` diff ingest.
+- Orphaned `earthcatalog/tools/` dev utility and the `scripts/ingest.py`
+  backward-compat shim.
+- Deprecated `EarthCatalog.bulk_ingest()` alias (use `ingest_inventory()`).
+- Dead private-name aliases in `inventory.py`; callers use the public
+  `iter_inventory*` names.
+
+### Changed
+- **Breaking:** the `EarthCatalog` facade moved to `earthcatalog.facade`
+  (re-exported from `earthcatalog.catalog` — existing imports keep working).
+  `catalog.py` (1058 → 434 lines) now holds `CatalogInfo` + the catalog
+  lifecycle only; `_open_sqlite` is public `open_sqlite` (private alias kept).
+- **Breaking:** the partitioner owns temporal binning. `AbstractPartitioner`
+  carries `time_bin` and `bin_value()`; the grid factory is a registry
+  (`register_grid`) threading `GridConfig.time_bin` through. `rebuild`
+  recreates tables with the preserved time-bin spec (month/day tables were
+  silently rebuilt as year), and the ingest pipeline + a new
+  `--time-bin` CLI option make month/day layouts reachable end to end.
+- **New grid:** native lat/lon rectangular partitioner (`--grid lat_lon`),
+  resolution = degrees per tile, ids `r{row}c{col}`. `--resolution` accepts
+  fractional degrees for it.
+- The query side now prunes with the same `build_partitioner` factory the
+  ingest side uses — `s2`, `utm` and `lat_lon` catalogs are queryable
+  (previously any search on them raised ValueError), and the geojson
+  STRtree is built once per catalog instead of per query.
+- `run()` (the `earthcatalog ingest` entry) roots the local-warehouse store
+  at the warehouse's parent, matching the pipeline's store-relative key
+  convention, and no longer configures an S3 upload destination for local
+  runs — local CLI ingests work for the first time (covered by the new
+  CLI-level daily-flow test).
+- S3 URI parsing (`earthcatalog.uris.parse_s3_uri`/`strip_bucket`) and store
+  construction (`earthcatalog.stores.make_s3_store`/`make_anonymous_store`)
+  each have one canonical home; ~15 inline copies were folded in.
+
 ### Fixed
+- CI workflows (`consolidate.yml`, `garbage_collect.yml`) now call
+  `earthcatalog info` instead of the deleted `scripts/info.py` (both were
+  failing at the catalog-info steps).
+- `earthcatalog rebuild` preserves the table's time-bin partition spec.
 - README canonical search example uses `catalog.search()` returning pystac
   Items for clarity.
 - `run_backfill` no longer builds a prefix-scoped warehouse store (fixed

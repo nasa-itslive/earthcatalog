@@ -33,7 +33,7 @@ def hive_warehouse(tmp_path):
 
     p = H3Partitioner(resolution=2)
     wh = tmp_path / "warehouse"
-    for (cell, year), group in group_by_partition(fan_out(items, p)).items():
+    for (cell, year), group in group_by_partition(fan_out(items, p), p).items():
         d = wh / f"grid_partition={cell}" / f"year={year or 'unknown'}"
         d.mkdir(parents=True)
         write_geoparquet(group, str(d / "part.parquet"))

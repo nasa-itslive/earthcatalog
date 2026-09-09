@@ -29,6 +29,9 @@ def _utm_zone(lon: float, lat: float) -> str:
 class UTMPartitioner(AbstractPartitioner):
     """Map geometries to UTM zones by their bounding box."""
 
+    def __init__(self, time_bin: str = "year") -> None:
+        super().__init__(time_bin=time_bin)
+
     def get_intersecting_keys(self, geom_wkb: bytes) -> list[str]:
         geom = wkb.loads(geom_wkb)
         if geom.is_empty:

@@ -241,7 +241,7 @@ class TestWriteGeoparquet:
 class TestGroupByPartition:
     def test_group_keys_and_properties(self, partitioner):
         rows = fan_out([BASE_ITEM], partitioner)
-        groups = group_by_partition(rows)
+        groups = group_by_partition(rows, partitioner)
         for (cell, year), items in groups.items():
             assert isinstance(cell, str)
             assert isinstance(year, str)  # hive value: "2021" / "unknown"
@@ -254,7 +254,7 @@ class TestGroupByPartition:
     def test_all_rows_accounted_for(self, partitioner):
         """Sum of group sizes must equal the total fan_out row count."""
         rows = fan_out(FIVE_ITEMS, partitioner)
-        groups = group_by_partition(rows)
+        groups = group_by_partition(rows, partitioner)
         assert sum(len(v) for v in groups.values()) == len(rows)
 
     def test_multi_year_items_split_into_separate_groups(self):
@@ -272,7 +272,7 @@ class TestGroupByPartition:
             "properties": {**BASE_ITEM["properties"], "datetime": "2024-06-15T00:00:00Z"},
         }
         rows = fan_out([item_2021, item_2024], p)
-        groups = group_by_partition(rows)
+        groups = group_by_partition(rows, p)
         years_seen = {year for (_cell, year) in groups}
         assert "2021" in years_seen
         assert "2024" in years_seen
@@ -281,7 +281,7 @@ class TestGroupByPartition:
         """Items without datetime must land in the ``unknown`` group."""
         no_dt = {**BASE_ITEM, "id": "nodatetime", "properties": {}}
         rows = fan_out([no_dt], partitioner)
-        groups = group_by_partition(rows)
+        groups = group_by_partition(rows, partitioner)
         assert any(year == "unknown" for (_cell, year) in groups)
 
     def test_within_group_sorted_by_platform_then_datetime(self):
@@ -307,7 +307,7 @@ class TestGroupByPartition:
             )
         ]
         rows = fan_out(items, p)
-        groups = group_by_partition(rows)
+        groups = group_by_partition(rows, p)
         for group_items in groups.values():
             keys = [
                 (it["properties"]["platform"], it["properties"]["datetime"]) for it in group_items

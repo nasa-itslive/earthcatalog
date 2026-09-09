@@ -11,7 +11,6 @@ daily-delta script.
 from __future__ import annotations
 
 import asyncio
-import configparser
 import csv
 import gzip
 import hashlib
@@ -32,48 +31,18 @@ import pyarrow.parquet as pq
 from obstore.store import ObjectStore, S3Store
 from tqdm import tqdm
 
-_STORES: dict[str, S3Store] = {}
+from earthcatalog import stores
+from earthcatalog.uris import parse_s3_uri
 
 
 def get_store(bucket: str) -> S3Store:
-    if bucket not in _STORES:
-        _STORES[bucket] = S3Store(
-            bucket=bucket,
-            region="us-west-2",
-            skip_signature=True,
-        )
-    return _STORES[bucket]
+    """Unsigned store for public buckets (delegates to :mod:`earthcatalog.stores`)."""
+    return stores.make_anonymous_store(bucket)
 
 
 def get_authenticated_store(bucket: str) -> S3Store:
-    key_id, secret, token = _aws_keys()
-
-    kwargs: dict = dict(bucket=bucket, region="us-west-2")
-    if key_id:
-        kwargs["aws_access_key_id"] = key_id
-    if secret:
-        kwargs["aws_secret_access_key"] = secret
-    if token:
-        kwargs["aws_session_token"] = token
-
-    return S3Store(**kwargs)
-
-
-def _aws_keys() -> tuple[str, str, str]:
-    """AWS credentials from the environment, else ~/.aws/credentials."""
-
-    key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    token = os.environ.get("AWS_SESSION_TOKEN", "")
-    if not (key_id and secret):
-        cfg = configparser.ConfigParser()
-        cfg.read(os.path.expanduser("~/.aws/credentials"))
-        profile = os.environ.get("AWS_PROFILE", "default")
-        if profile in cfg:
-            key_id = cfg[profile].get("aws_access_key_id", key_id)
-            secret = cfg[profile].get("aws_secret_access_key", secret)
-            token = cfg[profile].get("aws_session_token", token) or token
-    return key_id, secret, token
+    """Authenticated store (delegates to :mod:`earthcatalog.stores`)."""
+    return stores.make_s3_store(bucket)
 
 
 def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
@@ -89,7 +58,7 @@ def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
 
     if warehouse_path.startswith("s3://"):
         props["s3.region"] = region
-        key_id, secret, token = _aws_keys()
+        key_id, secret, token = stores.aws_credentials()
         if key_id and secret:
             props["s3.access-key-id"] = key_id
             props["s3.secret-access-key"] = secret
@@ -108,7 +77,7 @@ def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
 
 
 def _fetch_inventory_bytes(inventory_path: str) -> bytes:
-    bucket, key = inventory_path.removeprefix("s3://").split("/", 1)
+    bucket, key = parse_s3_uri(inventory_path)  # type: ignore[misc]
     return bytes(obstore.get(get_store(bucket), key).bytes())
 
 
@@ -203,8 +172,7 @@ def iter_inventory_parquet(
 
 
 def _parse_manifest(manifest_s3_uri: str) -> tuple[str, ObjectStore, list[str]]:
-    manifest_path = manifest_s3_uri.removeprefix("s3://")
-    manifest_bucket, manifest_key = manifest_path.split("/", 1)
+    manifest_bucket, manifest_key = parse_s3_uri(manifest_s3_uri)  # type: ignore[misc]
 
     dest_store_manifest = get_authenticated_store(manifest_bucket)
     raw = bytes(obstore.get(dest_store_manifest, manifest_key).bytes())
@@ -574,19 +542,3 @@ def fetch_items_async(
 ) -> list[dict]:
     """Synchronous wrapper: fetch *pairs* concurrently via the async path."""
     return asyncio.run(_fetch_all_async(pairs, concurrency))
-
-
-# Backward-compatible aliases (modules that imported the private names
-# from the deleted pipelines.incremental module can import from here).
-_iter_inventory_csv = iter_inventory_csv
-_iter_inventory_parquet = iter_inventory_parquet
-_iter_inventory_file_from_store = iter_inventory_file_from_store
-_iter_inventory_manifest = iter_inventory_manifest
-_iter_inventory = iter_inventory
-_fetch_item = fetch_item
-_get_store = get_store
-_get_authenticated_store = get_authenticated_store
-_fetch_inventory_bytes = _fetch_inventory_bytes
-_parse_last_modified = _parse_last_modified
-_coerce_last_modified = _coerce_last_modified
-_parse_manifest = _parse_manifest

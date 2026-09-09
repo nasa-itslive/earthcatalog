@@ -65,7 +65,7 @@ jobs:
 
       - name: Catalog info (before)
         run: |
-          uv run python scripts/info.py \
+          uv run earthcatalog info \
             --catalog   /tmp/earthcatalog.db \
             --warehouse ${{ env.WAREHOUSE }} || true
 
@@ -81,7 +81,7 @@ jobs:
       - name: Catalog info (after)
         if: always()
         run: |
-          uv run python scripts/info.py \
+          uv run earthcatalog info \
             --catalog   /tmp/earthcatalog.db \
             --warehouse ${{ env.WAREHOUSE }} || true
 

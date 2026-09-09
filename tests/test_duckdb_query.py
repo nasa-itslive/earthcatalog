@@ -65,7 +65,7 @@ def populated_table(tmp_path_factory):
     p = H3Partitioner(resolution=2)
     rows = fan_out(ITEMS, p)
     paths = []
-    for (cell, year), group in group_by_partition(rows).items():
+    for (cell, year), group in group_by_partition(rows, p).items():
         year_str = str(year) if year is not None else "unknown"
         out = str(tmp_path / f"part_{cell[:12]}_{year_str}.parquet")
         write_geoparquet(group, out)
@@ -134,7 +134,7 @@ class TestDuckDBQuery:
         p = H3Partitioner(resolution=2)
         rows = fan_out(ITEMS, p)
         paths = []
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, p).items():
             year_str = str(year) if year is not None else "unknown"
             out = str(tmp_path / f"chunk2_{cell[:12]}_{year_str}.parquet")
             write_geoparquet(group, out)

@@ -15,22 +15,27 @@ import pathlib
 
 LIB_ROOT = pathlib.Path(__file__).resolve().parent.parent / "earthcatalog"
 
-# catalog.py: 1058 after stamping earthcatalog.index_path in get_or_create
-# (includes the temporary bulk_ingest deprecation alias — lower this again
-# once the alias is removed).  Target: <600.
-# 1116 after the GC stats-refresh hook (stats.json maintenance)
-CATALOG_PY_MAX_LINES = 1120
+# catalog.py: 434 after Phase 5 — the facade moved to facade.py, DuckDB
+# searches to search.py, GC orchestration to gc.py, rendering to stats.py.
+# Target <600 achieved; budget kept at 600 as the regression ceiling.
+CATALOG_PY_MAX_LINES = 600
 
 # Per-module budget.  Tighten as modules are split.
 MODULE_LINE_BUDGETS: dict[str, int] = {
-    # Phase 4/6 target (slimmed, SQL deduped)
+    # CatalogInfo + catalog lifecycle (open/get_or_create/download/upload).
     "catalog.py": CATALOG_PY_MAX_LINES,
-    # 600: intersects row-filtering moved into iter_items (rustac's spatial
-    # filter silently matches nothing on parquet hrefs) + _item_intersects.
-    "search.py": 600,
+    # EarthCatalog facade — thin composition layer.
+    "facade.py": 320,
+    # 600 pre-Phase-5; +140 for the DuckDB search functions (duck_search,
+    # search_uris, cleared_env_s3) moved in from the old facade.  (The 600
+    # budget pre-dated that move: intersects row-filtering moved into
+    # iter_items + _item_intersects.)
+    "search.py": 760,
     # Phase 3 target (+ journal hooks, bounded fetch pool, dedupe DI).
     # Serial ndjson branch deleted in RPI-C (bulk-only now).
-    "ingest.py": 780,
+    # 802 after the temporal-drift guard + _PrePartitioned fallback
+    # (partitioner-owned temporal binning).
+    "ingest.py": 810,
     # Extracted from catalog.py — ingest orchestration + daily dry-run +
     # _last_run.json writer + full-mode reset + anti-join wiring
     # (+34: pre-ingest diff report and post-ingest index/Iceberg

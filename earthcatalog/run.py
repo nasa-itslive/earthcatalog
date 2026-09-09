@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end ingest entry point — store building, client resolution, run.
 
-Lives in the package (wheels only package ``earthcatalog*``); the
-``scripts/ingest.py`` module is a thin shim over :func:`run`.
+Lives in the package (wheels only package ``earthcatalog*``) behind the
+``earthcatalog ingest`` CLI command.
 
 Can also be imported and called directly from Python::
 
@@ -17,7 +17,6 @@ Can also be imported and called directly from Python::
 """
 
 import argparse
-import configparser
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -25,30 +24,15 @@ from pathlib import Path
 
 from obstore.store import LocalStore, S3Store
 
+from earthcatalog.uris import parse_s3_uri
+
 
 def _make_s3_store(bucket: str, prefix: str = "") -> S3Store:
-    key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-    token = os.environ.get("AWS_SESSION_TOKEN")
-    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
-    if not (key_id and secret):
-        cfg = configparser.ConfigParser()
-        cfg.read(os.path.expanduser("~/.aws/credentials"))
-        profile = os.environ.get("AWS_PROFILE", "default")
-        if profile in cfg:
-            key_id = cfg[profile].get("aws_access_key_id", key_id)
-            secret = cfg[profile].get("aws_secret_access_key", secret)
-            token = cfg[profile].get("aws_session_token", token) or token
-    kwargs: dict = dict(bucket=bucket, region=region)
-    if prefix:
-        kwargs["prefix"] = prefix
-    if key_id:
-        kwargs["aws_access_key_id"] = key_id
-    if secret:
-        kwargs["aws_secret_access_key"] = secret
-    if token:
-        kwargs["aws_session_token"] = token
-    return S3Store(**kwargs)
+    """Authenticated S3 store — the implementation lives in
+    :mod:`earthcatalog.stores`; kept as an alias for existing importers."""
+    from earthcatalog.stores import make_s3_store
+
+    return make_s3_store(bucket, prefix=prefix)
 
 
 def run(
@@ -58,7 +42,7 @@ def run(
     catalog: str = "/tmp/earthcatalog_v2.db",
     warehouse: str = "s3://its-live-data/test-space/stac/catalog/warehouse",
     # Where to upload earthcatalog.db inside the bucket (key only, no s3://bucket/)
-    catalog_key: str = "test-space/stac/catalog/earthcatalog.db",
+    catalog_key: str | None = "test-space/stac/catalog/earthcatalog.db",
     lock_key: str = "test-space/stac/catalog/.lock",
     chunk_size: int = 100_000,
     limit: int | None = None,
@@ -135,24 +119,36 @@ def run(
     # Build stores
     # ------------------------------------------------------------------
     if warehouse.startswith("s3://"):
-        wh_no_scheme = warehouse.removeprefix("s3://")
-        wh_bucket, wh_prefix = wh_no_scheme.split("/", 1)
+        wh_bucket, wh_prefix = parse_s3_uri(warehouse)  # type: ignore[union-attr,misc]
         # Bucket-level store: the pipeline uses full bucket keys
         # (warehouse_prefix / index_key), so a prefix here would double-prefix.
         warehouse_store: S3Store | LocalStore = _make_s3_store(wh_bucket)
     else:
         Path(warehouse).mkdir(parents=True, exist_ok=True)
-        warehouse_store = LocalStore(str(warehouse))
-        wh_bucket = "its-live-data"  # fallback for store_config
+        # Store-relative keys are "{basename(warehouse)}/..." and the index /
+        # stats.json are siblings of the warehouse dir — root the store at
+        # the PARENT, matching the pipeline's local-store convention (see
+        # IngestPipeline.run), never at the warehouse itself (that would
+        # double-nest every object).
+        warehouse_store = LocalStore(str(Path(warehouse).parent))
 
     # ------------------------------------------------------------------
     # Configure store_config (controls catalog upload destination)
     # ------------------------------------------------------------------
     from earthcatalog import store_config
 
-    store_config.set_store(_make_s3_store(wh_bucket))
-    store_config.set_catalog_key(catalog_key)
-    store_config.set_lock_key(lock_key)
+    local_run = not warehouse.startswith("s3://")
+    if local_run:
+        # A local warehouse has nowhere remote to persist to: the catalog db
+        # stays at the --catalog path and no upload step may fire.
+        catalog_key = None
+        store_config.set_store(warehouse_store)
+        store_config.set_catalog_key("")
+        store_config.set_lock_key("")
+    else:
+        store_config.set_store(_make_s3_store(wh_bucket))
+        store_config.set_catalog_key(catalog_key or "")
+        store_config.set_lock_key(lock_key)
 
     if warehouse.startswith("s3://"):
         # Pull the remote catalog db BEFORE opening the local sqlite:
@@ -238,12 +234,12 @@ def run(
     from earthcatalog.catalog import (
         EarthCatalog,
         _catalog_info,
-        _open_sqlite,
         get_or_create,
+        open_sqlite,
     )
     from earthcatalog.ingest_config import IngestConfig
 
-    cat = _open_sqlite(db_path=catalog, warehouse_path=warehouse)
+    cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
     table = get_or_create(cat, grid_config=grid)
     ec = EarthCatalog(
         catalog=cat,
@@ -388,14 +384,15 @@ def main() -> None:
     parser.add_argument(
         "--grid",
         default="h3",
-        choices=["h3", "s2", "utm", "geojson"],
-        help="Grid system for fresh full builds.",
+        choices=["h3", "s2", "utm", "geojson", "lat_lon"],
+        help="Grid system for fresh full builds. lat_lon takes --resolution in "
+        "degrees per tile.",
     )
     parser.add_argument(
         "--resolution",
-        type=int,
+        type=float,
         default=None,
-        help="Grid resolution (h3/s2). Default: h3=1, s2=2.",
+        help="Grid resolution (h3/s2 level; lat_lon degrees per tile). Default: h3=1, s2=2, lat_lon=2.",
     )
     parser.add_argument(
         "--boundaries",
@@ -406,6 +403,12 @@ def main() -> None:
         "--id-field",
         default=None,
         help="GeoJSON feature property used as the partition key (--grid geojson).",
+    )
+    parser.add_argument(
+        "--time-bin",
+        default="year",
+        choices=["year", "month", "day"],
+        help="Temporal binning for the warehouse layout (default: year).",
     )
     args = parser.parse_args()
 
@@ -420,6 +423,7 @@ def main() -> None:
         resolution=args.resolution,
         boundaries_path=args.boundaries,
         id_field=args.id_field,
+        time_bin=args.time_bin,
     )
 
     run(

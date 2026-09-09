@@ -281,7 +281,7 @@ class TestFaultMatrix:
         def half_written(store, partitioner, prefix, items, on_file=None, layout=None):
             fo = fan_out(items, partitioner) if partitioner else items
             grid, level, time_bin = layout or ("h3", "1", "year")
-            (cell, bin_val), group = next(iter(group_by_partition(fo, time_bin).items()))
+            (cell, bin_val), group = next(iter(group_by_partition(fo, partitioner or ing_mod._YEAR_PARTITIONER).items()))
             prefix_ = partition_prefix(prefix, grid, level, cell, time_bin, bin_val)
             k = f"{prefix_}part_leaked.parquet"
             write_geoparquet_s3(group, store, k)

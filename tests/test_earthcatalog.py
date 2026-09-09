@@ -67,7 +67,7 @@ def populated_warehouse(tmp_path):
 
     p = H3Partitioner(resolution=2)
     rows = fan_out(items, p)
-    groups = group_by_partition(rows)
+    groups = group_by_partition(rows, p)
 
     paths = []
     for (cell, year), group in groups.items():
@@ -114,7 +114,7 @@ def memory_store_with_catalog(tmp_path):
 
     p = H3Partitioner(resolution=2)
     rows = fan_out([item], p)
-    for (cell, year), group in group_by_partition(rows).items():
+    for (cell, year), group in group_by_partition(rows, p).items():
         out = str(tmp_path / f"part_{cell}_{year}.parquet")
         write_geoparquet(group, out)
         tbl.add_files([out])
@@ -141,7 +141,10 @@ class TestNewCatalogOpenAPI:
         ec = ec_open(store=MemoryStore(), base=wh)
         assert isinstance(ec, EarthCatalog)
         assert ec.grid_type == "h3"
-        assert ec.grid_resolution == 1
+        # Resolution is None until stamped; the h3 partitioner factory
+        # applies the effective default (1) at query time.
+        assert ec.grid_resolution is None
+        assert ec._info.partitioner().resolution == 1
         assert hasattr(ec, "search_files")
         assert hasattr(ec, "search")
 
@@ -291,10 +294,10 @@ class TestStoreIntegration:
         assert isinstance(ec, EarthCatalog)
 
 
-class TestBulkIngest:
+class TestIngestInventory:
     """Minimal tests for EarthCatalog.ingest_inventory()."""
 
-    def test_bulk_ingest_derives_params(self, tmp_path, monkeypatch):
+    def test_ingest_inventory_derives_params(self, tmp_path, monkeypatch):
         """ingest_inventory builds an Index and runs a single-node Ingester."""
         from earthcatalog import EarthCatalog
         from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
@@ -351,45 +354,6 @@ class TestBulkIngest:
 
         assert captured.get("kwargs", {}).get("partitioner") is not None
         assert captured.get("store") == store
-
-    def test_bulk_ingest_alias_is_deprecated(self, tmp_path, monkeypatch):
-        """The old bulk_ingest name still works but warns."""
-        from earthcatalog import EarthCatalog
-        from earthcatalog.catalog import _catalog_info, _open_sqlite, get_or_create
-        from earthcatalog.config import GridConfig
-
-        store = MemoryStore()
-        db = str(tmp_path / "catalog.db")
-        wh = str(tmp_path / "warehouse")
-        cat = _open_sqlite(db, wh)
-        tbl = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
-        ec = EarthCatalog(
-            catalog=cat,
-            table=tbl,
-            info=_catalog_info(tbl),
-            store=store,
-            catalog_key="catalog.db",
-        )
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-
-        import earthcatalog.pipeline as _pipemod
-
-        class _FakePipeline:
-            def __init__(self, catalog, config=None):
-                pass
-
-            def run(self, inventory_path, *, mode="auto"):
-                return {"items": 0, "rows": 0}
-
-        monkeypatch.setattr(_pipemod, "IngestPipeline", _FakePipeline)
-
-        import warnings
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            ec.bulk_ingest("inventory.parquet", mode="full")
-
-        assert any(issubclass(x.category, DeprecationWarning) for x in w)
 
     def test_scatter_only_then_resume_from_scatter_manifest(self, tmp_path, monkeypatch):
         """Two-step distributed workflow: scatter_only writes shards + a

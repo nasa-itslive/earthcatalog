@@ -56,7 +56,7 @@ def _write_and_add(iceberg_table_fixture, items, resolution=2):
     p = H3Partitioner(resolution=resolution)
     rows = fan_out(items, p)
     paths = []
-    for (cell, year), group in group_by_partition(rows).items():
+    for (cell, year), group in group_by_partition(rows, p).items():
         year_str = str(year) if year is not None else "unknown"
         out = str(tmp_path / f"part_{cell[:12]}_{year_str}.parquet")
         write_geoparquet(group, out)
@@ -79,7 +79,7 @@ class TestRoundTrip:
         rows = fan_out(ITEMS, p)
         total_n = 0
         paths = []
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, p).items():
             year_str = str(year) if year is not None else "unknown"
             out = str(tmp_path / f"part_{cell[:12]}_{year_str}.parquet")
             total_n += write_geoparquet(group, out)
@@ -127,7 +127,7 @@ class TestRoundTrip:
             rows = fan_out(ITEMS, p)
             paths = []
             total = 0
-            for (cell, year), group in group_by_partition(rows).items():
+            for (cell, year), group in group_by_partition(rows, p).items():
                 year_str = str(year) if year is not None else "unknown"
                 out = str(tmp_path / f"{suffix}_{cell[:12]}_{year_str}.parquet")
                 total += write_geoparquet(group, out)
@@ -189,7 +189,7 @@ class TestRoundTrip:
         rows = fan_out([ITEMS[0]], p)
         paths = []
         n = 0
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, p).items():
             year_str = str(year) if year is not None else "unknown"
             out = str(tmp_path / f"single_{cell[:12]}_{year_str}.parquet")
             n += write_geoparquet(group, out)

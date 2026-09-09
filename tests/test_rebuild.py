@@ -61,3 +61,43 @@ def test_legacy_and_v2_layouts_both_registered(monkeypatch):
     monkeypatch.setattr(rebuild_mod.obstore, "list", fake_list)
     paths = _list_warehouse_keys(_FakeLocalStore(), "/tmp/warehouse")
     assert len(paths) == 3
+
+
+def test_rebuild_preserves_month_partition_spec(monkeypatch, tmp_path):
+    """A month-binned table must be recreated with the month spec — not the
+    hardcoded year spec (which would silently mis-file every partition)."""
+    from earthcatalog import catalog as catalog_mod
+    from earthcatalog.schema import PROP_TIME_BIN, build_partition_spec
+
+    created = {}
+
+    class _Table:
+        properties = {PROP_TIME_BIN: "month"}
+
+        def add_files(self, paths):
+            pass
+
+    class _FakeCatalog:
+        def load_table(self, name):
+            return _Table()
+
+        def create_namespace(self, ns):
+            pass
+
+        def drop_table(self, name):
+            pass
+
+        def create_table(self, identifier, schema, partition_spec, properties):
+            created["spec"] = partition_spec
+            return _Table()
+
+    monkeypatch.setattr(catalog_mod, "open_sqlite", lambda **kw: _FakeCatalog())
+    monkeypatch.setattr(rebuild_mod, "_list_warehouse_keys", lambda *a: [])
+
+    n = rebuild_mod.rebuild_iceberg_from_warehouse(
+        str(tmp_path / "catalog.db"), str(tmp_path / "warehouse"), _FakeLocalStore(),
+        upload=False,
+    )
+    assert n == 0
+    assert created["spec"] == build_partition_spec("month")
+    assert [f.name for f in created["spec"].fields] == ["grid_partition", "month"]

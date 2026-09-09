@@ -53,7 +53,8 @@ class GeoJSONPartitioner(AbstractPartitioner):
         The GeoJSON feature property to use as the partition key string.
     """
 
-    def __init__(self, boundaries_path: str, id_field: str = "id") -> None:
+    def __init__(self, boundaries_path: str, id_field: str = "id", time_bin: str = "year") -> None:
+        super().__init__(time_bin=time_bin)
         raw = _load_bytes(boundaries_path)
         features = json.loads(raw)["features"]
 

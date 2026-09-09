@@ -1,8 +1,11 @@
 # Project State — daily-ingest rework
 
-Last updated: **2026-09-06 evening** · Branch: `feature/garbage-collection` ·
-Suite: **320 passed** (`pytest -m "not integration and not performance and not e2e"`)
-· 9 commits landed today (see `git log --oneline d6a75ca..HEAD`, note `origin/main` is ~4 months stale).
+Last updated: **2026-09-09** · Branch: `refactoring-simpler` ·
+Suite: **374 passed** (`pytest -m "not integration and not performance and not e2e"`)
+· Structure refactor landed: partitioner owns temporal binning (h3/s2/utm/
+geojson/lat_lon, year/month/day), facade split out (`earthcatalog/facade.py`),
+one-shot modules removed, CLI-level daily-flow test in the PR gate (see
+CHANGELOG [Unreleased] for the breaking changes).
 
 ---
 
@@ -157,22 +160,24 @@ earthcatalog ingest --diff <new.parquet> --mode delta \
   (6 cells green). Scope: **serial direct stage** (see Open item).
 - **`--mode full` really rebuilds** — index object deleted + `_staging/`
   swept with the table drop (A1).
-- **`earthcatalog/migrate.py` + `earthcatalog migrate-indices`** — legacy
-  `*_id_hashes.parquet` / `*_source_index.parquet` → unified index;
-  validated sidecar, atomic swap, idempotent (A8). Single resolver
+- **Unified index** — legacy `*_id_hashes.parquet` / `*_source_index.parquet`
+  files were folded into the unified index by the (now-removed, one-shot)
+  `migrate-indices` command. Single resolver
   `resolve_index_path()` (`earthcatalog.index_path` property → conventional
   path; legacy property deliberately not followed).
 - **Bulk profile** — scatter/map-reduce landed (step 0); DaskIngester head
   pre-filters shards against the index before `client.map` (A5).
 - **CLI/packaging (A7)** — entry point lives in `earthcatalog/run.py`;
-  `scripts/ingest.py` is a shim; wheel smoke test added to CI.
+  the `earthcatalog ingest` CLI is the single front door (shim removed);
+  wheel smoke test in CI.
 - **`--dry-run`** (counts, no writes) and **`_last_run.json`** written to the
   warehouse every run.
 - **A11/A12** — year=NULL sentinel (GC partition lookup matches
   `year=unknown/`); dead `_GC_FILE_RE` removed; docs + plan_simplification
   reconciled; `scripts/daily_delta.py` and the two-job workflow deleted —
   `daily_delta.yml` is now one job (diff → ingest, concurrency group,
-  timeout 120 min), still dispatch-only.
+  timeout 120 min), live on a 14:00 UTC daily schedule (plus manual
+  `workflow_dispatch`).
 
 ## Real-data verification (T0 + E2E, all numbers real)
 
@@ -279,10 +284,11 @@ runner-sized. Real-data verified end to end (see table above).
 - **RPI-4 · Consolidation `--audit`** — per-partition row counts vs
   `Index.count_active()` into `_last_run.json` (crash-orphan visibility,
   plan §5).
-- **RPI-5 · Production backlog decision** — the real index at `catalog/` is
-  394,964 keys behind; decide: run `migrate-indices` + a catch-up diff ingest
-  there, or rebuild the test warehouse under refactoring first. Needs a user
-  call.
+- **RPI-5 · Production backlog decision** — RESOLVED: the store is
+  normalized; the one-shot `migrate.py` / `index_backfill.py` modules and
+  their CLI commands were removed. Production catch-up is a plain
+  diff ingest (`earthcatalog ingest --mode auto`) against the latest
+  inventory manifest.
 - **RPI-6 · Enable workflows** — only after AWS secrets exist in the repo and
   RPI-1 lands; first run in `--dry-run`.
 - **RPI-7 · Optional** — ndjson-stage fault cells (de-scoped by design),
@@ -294,7 +300,7 @@ runner-sized. Real-data verified end to end (see table above).
 ```bash
 source ~/.pyenv/versions/miniforge3-latest/etc/profile.d/conda.sh && mamba activate earthcatalog
 cd ~/github/nasa-itslive/earthcatalog
-pytest -q -m "not integration and not performance and not e2e"   # expect: 320 passed
+pytest -q -m "not integration and not performance and not e2e"   # expect: 374 passed
 
 # live dry-run / ingest (scratch only!)
 export AWS_ACCESS_KEY_ID="$(aws configure get aws_access_key_id)"

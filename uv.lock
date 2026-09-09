@@ -1070,7 +1070,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "bokeh" },
     { name = "coiled" },
     { name = "dask-labextension" },
     { name = "jupyterlab" },
@@ -1092,7 +1091,6 @@ dev = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "bokeh" },
     { name = "coiled" },
     { name = "dask-labextension" },
     { name = "jupyterlab" },
@@ -1114,7 +1112,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bokeh", marker = "extra == 'dev'" },
     { name = "coiled", marker = "extra == 'dev'" },
     { name = "cql2" },
     { name = "dask", extras = ["distributed"] },
@@ -1156,7 +1153,6 @@ provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "bokeh" },
     { name = "coiled" },
     { name = "dask-labextension" },
     { name = "jupyterlab" },

@@ -112,7 +112,7 @@ def _build_warehouse(tmp_path, n_items: int = 1000, n_years: int = 4):
     p = H3Partitioner(resolution=2)
     rows = fan_out(items, p)
     paths = []
-    for (cell, year), group in group_by_partition(rows).items():
+    for (cell, year), group in group_by_partition(rows, p).items():
         out = str(tmp_path / f"part_{cell[:12]}_{year}.parquet")
         write_geoparquet(group, out)
         paths.append(out)

@@ -66,7 +66,7 @@ def warehouse(tmp_path_factory):
 
     p = H3Partitioner(resolution=2)
     rows = fan_out(ITEMS, p)
-    groups = group_by_partition(rows)
+    groups = group_by_partition(rows, p)
 
     written_files = []
     all_paths = []

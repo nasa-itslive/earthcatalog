@@ -16,7 +16,8 @@ from earthcatalog.partitioner import AbstractPartitioner
 class S2Partitioner(AbstractPartitioner):
     """Assign geometries to S2 cells at a fixed level."""
 
-    def __init__(self, resolution: int = 2) -> None:
+    def __init__(self, resolution: int = 2, time_bin: str = "year") -> None:
+        super().__init__(time_bin=time_bin)
         self.resolution = resolution
 
     def get_intersecting_keys(self, geom_wkb: bytes) -> list[str]:

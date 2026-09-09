@@ -22,6 +22,7 @@ from pyiceberg.table import Table
 from earthcatalog import inventory as _inventory
 from earthcatalog.index import Index
 from earthcatalog.journal import BatchJournal, new_run_id, recover_journals
+from earthcatalog.partitioner import AbstractPartitioner
 from earthcatalog.schema import layout_of, partition_prefix
 from earthcatalog.transform import (
     _sort_key,
@@ -29,6 +30,20 @@ from earthcatalog.transform import (
     group_by_partition,
     write_geoparquet_s3,
 )
+
+
+class _PrePartitioned(AbstractPartitioner):
+    """Temporal-only stand-in for items that already carry grid_partition.
+
+    Used when a caller (tests, pre-fanned-out inputs) passes no partitioner:
+    fan-out is skipped, but the temporal bin still comes from a partitioner.
+    """
+
+    def get_intersecting_keys(self, geom_wkb: bytes) -> list[str]:
+        return []
+
+
+_YEAR_PARTITIONER = _PrePartitioned(time_bin="year")
 
 
 class Ingester:
@@ -312,19 +327,6 @@ class DaskIngester(Ingester):
                         buckets.add((cell, bv))
         return buckets
 
-    def _compact_ndjson_bucket(
-        self, cell: str, bin_val: str
-    ) -> tuple[list[str], list[dict], int, list[str]]:
-        """Compact one ``(cell, bin_value)`` bucket — see :func:`_compact_bucket`."""
-        return _compact_bucket(
-            self._store,
-            self._ndjson_prefix,
-            self._warehouse_prefix,
-            (cell, bin_val),
-            delta=self._delta,
-            layout=self._layout,
-        )
-
     def run(self, inventory, *, client=None) -> dict:  # type: ignore[override]
         """Ingest each shard in *inventory* in parallel; workers stream their own pairs."""
         if client is None:
@@ -504,17 +506,6 @@ def _for_each_result(client, fn, iterable, *, desc: str, on_result) -> None:
             pbar.update(1)
 
 
-def _append_ndjson(store: ObjectStore, key: str, items: list[dict]) -> None:
-    """Append items to an NDJSON object, creating or extending it."""
-    lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
-    try:
-        raw = bytes(obstore.get(store, key).bytes())
-        merged = raw.decode("utf-8") + lines
-        obstore.put(store, key, merged.encode("utf-8"))
-    except FileNotFoundError:
-        obstore.put(store, key, lines.encode("utf-8"))
-
-
 def _put_ndjson(store: ObjectStore, key: str, items: list[dict]) -> None:
     """Write items to a fresh NDJSON object (single PUT, no read-modify-write)."""
     lines = "\n".join(json.dumps(it, default=str) for it in items) + "\n"
@@ -538,6 +529,11 @@ def _write_direct(
     ``(new_paths, index_rows, rows)``.
     """
     grid, level, time_bin = layout
+    if partitioner is not None and partitioner.time_bin != time_bin:
+        raise ValueError(
+            f"partitioner time_bin {partitioner.time_bin!r} disagrees with the "
+            f"table layout {time_bin!r} — bins and paths would diverge"
+        )
     fo = fan_out(items, partitioner) if partitioner else items
     if not fo:
         return [], [], 0
@@ -559,7 +555,7 @@ def _write_direct(
         seen_pairs.add(pair)
         index_rows.append(_to_index_row(it))
 
-    for (cell, bin_val), group in group_by_partition(fo, time_bin).items():
+    for (cell, bin_val), group in group_by_partition(fo, partitioner or _YEAR_PARTITIONER).items():
         prefix = partition_prefix(warehouse_prefix, grid, level, cell, time_bin, bin_val)
         key = f"{prefix}part_{uuid.uuid4().hex[:8]}.parquet"
         n, _ = write_geoparquet_s3(group, store, key)
@@ -624,8 +620,13 @@ def _write_ndjson_shard(
     items = _fetch_items(fetch_fn, pairs, fetch_concurrency)
 
     grid, level, time_bin = layout
+    if partitioner is not None and partitioner.time_bin != time_bin:
+        raise ValueError(
+            f"partitioner time_bin {partitioner.time_bin!r} disagrees with the "
+            f"table layout {time_bin!r} — bins and paths would diverge"
+        )
     fo = fan_out(items, partitioner) if partitioner else items
-    buckets = group_by_partition(fo, time_bin)
+    buckets = group_by_partition(fo, partitioner or _YEAR_PARTITIONER)
 
     for (cell, bin_val), group in buckets.items():
         prefix = partition_prefix(ndjson_prefix, grid, level, cell, time_bin, bin_val)

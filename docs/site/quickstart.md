@@ -96,12 +96,14 @@ rustac applies spatial, temporal, and CQL2 filters per file.
 
 Uses DuckDB's parallel I/O — **~2× faster** than the other methods
 across all query types.  Returns a ``pandas.DataFrame`` (no pystac
-conversion overhead).
+conversion overhead).  It is a module function in ``earthcatalog.search``:
 
 ```python
 import cql2
+from earthcatalog.search import duck_search
 
-df = catalog.duck_search(
+df = duck_search(
+    catalog,
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
@@ -146,7 +148,10 @@ URLs extracted from the ``assets`` column.  Reads only 2 columns from
 S3, making it the fastest method for URL-only workflows.
 
 ```python
-df = catalog.search_uris(
+from earthcatalog.search import search_uris
+
+df = search_uris(
+    catalog,
     intersects={"type": "Point", "coordinates": [-45, 70]},
     filter=cql2.parse_text('percent_valid_pixels >= 80').to_json(),
     max_items=1000,

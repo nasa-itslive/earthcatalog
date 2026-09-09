@@ -586,3 +586,155 @@ def build_query(
         conditions.append(_cql2_to_sql(raw_filter))
     where = " AND ".join(conditions) if conditions else "TRUE"
     return f"SELECT {select} FROM read_parquet([{path_list}]) WHERE {where}"
+
+
+# ---------------------------------------------------------------------------
+# DuckDB-backed search functions + credential hygiene
+# ---------------------------------------------------------------------------
+# These are module-level (not EarthCatalog methods) so the facade stays a
+# thin composition layer.  They duck-type their *catalog* argument (only
+# ``.info`` and ``.table`` are accessed).
+
+
+def cleared_env_s3(store=None):
+    """Context manager factory: clear AWS cred env vars so rustac/DuckDB use
+    unsigned requests.
+
+    rustac and DuckDB read ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY``
+    from the environment rather than using the obstore store's auth.  When
+    the store was created as anonymous (``skip_signature``) or the
+    environment has no credentials, the returned context manager temporarily
+    removes them and sets ``AWS_NO_SIGN_REQUEST=yes``.
+    """
+    import os
+    from contextlib import contextmanager
+
+    anonymous = not os.environ.get("AWS_ACCESS_KEY_ID")
+    if not anonymous and store is not None and hasattr(store, "config"):
+        anonymous = store.config.get("skip_signature") in (True, "true")
+
+    @contextmanager
+    def _ctx():
+        if not anonymous:
+            yield
+            return
+        saved = {
+            "AWS_ACCESS_KEY_ID": os.environ.pop("AWS_ACCESS_KEY_ID", None),
+            "AWS_SECRET_ACCESS_KEY": os.environ.pop("AWS_SECRET_ACCESS_KEY", None),
+            "AWS_SESSION_TOKEN": os.environ.pop("AWS_SESSION_TOKEN", None),
+        }
+        os.environ["AWS_NO_SIGN_REQUEST"] = "yes"
+        try:
+            yield
+        finally:
+            os.environ.pop("AWS_NO_SIGN_REQUEST", None)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    return _ctx()
+
+
+def _duck_connect():
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    con.execute("SET s3_access_key_id='';")
+    con.execute("SET s3_secret_access_key='';")
+    con.execute("SET s3_session_token='';")
+    return con
+
+
+def _duck_sql(info, table, kwargs: dict, select: str = "*") -> tuple[str, int | None] | None:
+    """Prune via Iceberg metadata and build the DuckDB SQL for one search.
+
+    Returns ``(sql, max_items)``, or ``None`` when the prune finds no files.
+    """
+    geom = _extract_geometry(**kwargs)
+    start_dt, end_dt = _extract_datetime_range(**kwargs)
+    paths = info.file_paths(table, geom, start_datetime=start_dt, end_datetime=end_dt)
+    if not paths:
+        return None
+    max_items = kwargs.get("max_items")
+    # NB: LIMIT is omitted from the SQL on purpose — it triggers a much
+    # slower plan for multi-file reads; slicing happens on the result.
+    sql = build_query(paths, geom, start_dt, end_dt, kwargs.get("filter"), select=select)
+    return sql, max_items
+
+
+def duck_search(catalog, **kwargs):
+    """Search using DuckDB, returning results as a ``pandas.DataFrame``.
+
+    Accepts the same kwargs as :meth:`EarthCatalog.search` (``intersects``,
+    ``bbox``, ``datetime``, ``filter``, ``max_items``, etc.).  DuckDB reads
+    Parquet files in parallel internally, making this ~2x faster than
+    :meth:`EarthCatalog.search` across all query types.  Returns a DataFrame
+    with flat columns — no pystac conversion overhead.
+
+    Examples::
+
+        from earthcatalog.search import duck_search
+
+        df = duck_search(
+            catalog,
+            intersects={"type": "Point", "coordinates": [-45, 70]},
+            datetime="1980-01-01/2015-12-31",
+            max_items=100,
+        )
+    """
+    import pandas as pd
+
+    prepared = _duck_sql(catalog.info, catalog.table, kwargs)
+    if prepared is None:
+        return pd.DataFrame()
+    sql, max_items = prepared
+    df = _duck_connect().execute(sql).fetchdf()
+    if max_items is not None and len(df) > max_items:
+        df = df.head(max_items)
+    return df
+
+
+def search_uris(catalog, **kwargs):
+    """Return asset URIs as a DataFrame with ``(id, uri)`` columns.
+
+    Accepts the same kwargs as :meth:`EarthCatalog.search`.  Uses Iceberg
+    pruning + DuckDB, reading **only** the ``id`` and ``assets`` columns —
+    the fastest way to get download URLs for thousands of items.
+
+    Examples::
+
+        from earthcatalog.search import search_uris
+
+        df = search_uris(
+            catalog,
+            intersects={"type": "Point", "coordinates": [-45, 70]},
+            datetime="2020-01-01/2020-12-31",
+            max_items=100,
+        )
+        for _, row in df.iterrows():
+            print(row.id, row.uri)
+    """
+    import json
+
+    import pandas as pd
+
+    prepared = _duck_sql(catalog.info, catalog.table, kwargs, select="id, assets")
+    if prepared is None:
+        return pd.DataFrame({"id": [], "uri": []})
+    sql, max_items = prepared
+    arrow = _duck_connect().execute(sql).to_arrow_table()
+    if max_items is not None and arrow.num_rows > max_items:
+        arrow = arrow.slice(0, max_items)
+
+    ids = arrow.column("id").to_pylist()
+    uris = []
+    for a in arrow.column("assets").to_pylist():
+        href = None
+        if a:
+            try:
+                href = json.loads(a).get("data", {}).get("href")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        uris.append(href)
+    return pd.DataFrame({"id": ids, "uri": uris})

@@ -44,6 +44,7 @@ import io
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 
 import obstore
 import pyarrow as pa
@@ -83,8 +84,8 @@ def resolve_index_path(table: Table | None, default_index_path: str) -> str:
     ``{warehouse_root}_index.parquet``), else ``""``.  The legacy
     ``earthcatalog.hash_index_path`` property is deliberately NOT followed:
     it names the retired ``*_id_hashes.parquet`` file whose schema this
-    Index cannot read — run :func:`earthcatalog.migrate.migrate_indices`
-    on such warehouses (which stamps the property as its final step).
+    Index cannot read (those warehouses were migrated to the unified
+    index; the one-shot migration tool has since been removed).
     """
     from .schema import PROP_INDEX_PATH
 
@@ -343,3 +344,29 @@ class Index:
                     if h is not None:
                         hashes.add(bytes(h))
         return hashes
+
+
+def count_active_items(index_path: str, store=None) -> int:
+    """Number of active (non-deleted) rows in the index at *index_path*.
+
+    *index_path* may be an ``s3://`` URI (read through the bucket-level
+    *store*) or a local filesystem path (parts layout ``{base}/`` or legacy
+    ``{base}.parquet``).  Returns 0 when the path is unusable — best-effort
+    by design (info display must never crash on a missing index).
+    """
+    from obstore.store import LocalStore
+
+    if index_path.startswith("s3://"):
+        if store is None:
+            return 0
+        from .uris import parse_s3_uri
+
+        parsed = parse_s3_uri(index_path)
+        if not parsed or not parsed[1]:
+            return 0
+        return Index(store, parsed[1]).count_active()
+
+    p = Path(index_path)
+    if not p.exists() and not p.with_suffix("").is_dir():
+        return 0
+    return Index(LocalStore(str(p.parent)), p.name).count_active()

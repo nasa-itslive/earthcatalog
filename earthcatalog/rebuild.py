@@ -10,6 +10,8 @@ from __future__ import annotations
 import obstore
 from obstore.store import ObjectStore
 
+from earthcatalog.uris import parse_s3_uri
+
 
 def _list_warehouse_keys(
     warehouse_store: ObjectStore,
@@ -32,9 +34,9 @@ def _list_warehouse_keys(
     # For S3 stores the list prefix is the warehouse path within the bucket.
     # For LocalStore the store is already scoped to the warehouse root.
     prefix = ""
-    if warehouse_root.startswith("s3://"):
-        _bucket, _, path = warehouse_root.removeprefix("s3://").partition("/")
-        prefix = path.rstrip("/") + "/"
+    parsed = parse_s3_uri(warehouse_root)
+    if parsed:
+        prefix = parsed[1].rstrip("/") + "/"
 
     paths: list[str] = []
     for batch in obstore.list(warehouse_store, prefix=prefix):
@@ -43,9 +45,8 @@ def _list_warehouse_keys(
             if k.endswith(".parquet") and (hive_re_v2.search(k) or hive_re_v1.search(k)):
                 # obstore keys are bucket-relative on S3 (they already include
                 # the warehouse path); joining the full root would double it.
-                if warehouse_root.startswith("s3://"):
-                    bucket = warehouse_root.removeprefix("s3://").split("/", 1)[0]
-                    paths.append(f"s3://{bucket}/{k}")
+                if parsed:
+                    paths.append(f"s3://{parsed[0]}/{k}")
                 else:
                     paths.append(f"{root}/{k}")
     return paths
@@ -94,12 +95,12 @@ def rebuild_iceberg_from_warehouse(
         FULL_NAME,
         ICEBERG_SCHEMA,
         NAMESPACE,
-        PARTITION_SPEC,
-        _open_sqlite,
+        open_sqlite,
         upload_catalog,
     )
+    from earthcatalog.schema import PROP_TIME_BIN, build_partition_spec
 
-    catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
+    catalog = open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
 
     try:
         existing = catalog.load_table(FULL_NAME)
@@ -121,7 +122,7 @@ def rebuild_iceberg_from_warehouse(
     table = catalog.create_table(
         identifier=FULL_NAME,
         schema=ICEBERG_SCHEMA,
-        partition_spec=PARTITION_SPEC,
+        partition_spec=build_partition_spec(preserved_props.get(PROP_TIME_BIN, "year")),
         properties=preserved_props,
     )
 

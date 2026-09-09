@@ -41,9 +41,9 @@ from pyarrow.compute import (  # type: ignore[attr-defined]
 from pybloom_live import ScalableBloomFilter
 
 from earthcatalog.index import Index
-from earthcatalog.inventory import _iter_inventory
+from earthcatalog.inventory import iter_inventory
 from earthcatalog.schema import partition_prefix
-from earthcatalog.stats import parse_s3_uri
+from earthcatalog.stats import apply_gc, parse_s3_uri
 
 _DEFAULT_ERROR_RATE = 0.0001
 _DEFAULT_CONCURRENCY = 64
@@ -59,7 +59,7 @@ def build_inventory_bloom(
         mode=ScalableBloomFilter.SMALL_SET_GROWTH,
     )
     n = 0
-    for bucket, key in _iter_inventory(inventory_path):
+    for bucket, key in iter_inventory(inventory_path):
         if key.endswith(".stac.json"):
             bloom.add(f"s3://{bucket}/{key}")
             n += 1
@@ -385,3 +385,110 @@ def run_garbage_collection(
         discover_fn=discover_fn,
     )
     return {"candidates": len(candidates), "confirmed": len(orphans), **summary}
+
+
+def garbage_collect_for_catalog(
+    catalog,
+    table,
+    store: ObjectStore | None,
+    catalog_key: str | None,
+    inventory_path: str,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Garbage-collect on behalf of an :class:`EarthCatalog` facade, then
+    repair the Iceberg table and refresh the stats snapshot.
+
+    Detects deletions via a Bloom filter of the current inventory keys,
+    rewrites only the affected GeoParquet files, rebuilds the Iceberg
+    catalog from the current warehouse state (so subsequent searches
+    reflect the changes), and refreshes ``stats.json``.
+
+    Returns the run summary dict: ``candidates``, ``confirmed``,
+    ``orphaned``, ``files_rewritten``, ``rows_removed``,
+    ``partitions_affected``, ``copies_outside_index``, ``residual_copies``.
+    """
+    from earthcatalog.index import Index, resolve_index_path
+    from earthcatalog.rebuild import rebuild_iceberg_from_warehouse
+    from earthcatalog.schema import layout_of
+    from earthcatalog.stats import index_locations, refresh_after, stats_key_for
+
+    warehouse_root = catalog.properties.get("warehouse", "")
+
+    # Derive the key prefix *within the store* for _list_partition_files.
+    # store is a bucket-level S3Store, so keys inside it look like
+    # "test-space/stac/catalog/warehouse/grid=.../year=.../...".
+    # Stripping "s3://bucket/" from warehouse_root gives us that prefix.
+    parsed = parse_s3_uri(warehouse_root)
+    if parsed:
+        warehouse_prefix = parsed[1].rstrip("/") + "/"
+    else:
+        warehouse_prefix = warehouse_root.rstrip("/") + "/"
+
+    def _strip(uri: str) -> str:
+        parsed = parse_s3_uri(uri)
+        return parsed[1] if parsed else uri
+
+    # Unified index — same path the ingest pipeline writes to.
+    index_key = _strip(
+        resolve_index_path(table, f"{warehouse_root.rstrip('/')}_index.parquet")
+    )
+    assert store is not None
+
+    result = run_garbage_collection(
+        inventory_path=inventory_path,
+        store=store,
+        index=Index(store, index_key),
+        warehouse_prefix=warehouse_prefix,
+        dry_run=dry_run,
+        layout=layout_of(table.properties),
+        # Iceberg metadata widens cleanup beyond index-named partitions
+        # (copies can lack pointer rows) and enables the fixpoint guarantee.
+        discover_fn=iceberg_orphan_file_scan(table),
+    )
+
+    # After files have been physically rewritten the Iceberg table still
+    # points to the now-deleted part_*.parquet paths and has no knowledge
+    # of the new gc_*.parquet files.  Rebuild the table so searches work.
+    if not dry_run and result.get("files_rewritten", 0) > 0:
+        import os
+
+        uri = catalog.properties.get("uri", "")
+        local_db = uri.removeprefix("sqlite:///") if uri else None
+
+        if local_db and os.path.exists(local_db) and store and catalog_key:
+            n = rebuild_iceberg_from_warehouse(
+                catalog_path=local_db,
+                warehouse_root=warehouse_root,
+                warehouse_store=store,
+                upload=False,  # we upload manually below with our store + key
+            )
+            obstore.put(store, catalog_key, Path(local_db).read_bytes())
+            print(f"Iceberg catalog rebuilt and uploaded ({n:,} files).")
+        else:
+            print(
+                "WARN: could not rebuild Iceberg catalog after GC — "
+                "local_db or catalog_key unavailable."
+            )
+
+    if not dry_run:
+        # Refresh the catalog-stats snapshot at the durable commit
+        # moment (GC removed confirmed items from warehouse and index).
+
+        def _apply(s):
+            return apply_gc(
+                s,
+                confirmed=result.get("confirmed", 0),
+                rows_removed=result.get("rows_removed", 0),
+            )
+
+        refresh_after(
+            store,
+            stats_key_for(warehouse_root),
+            table,
+            Index(store, index_key),
+            index_locations(table, store, warehouse_root),
+            apply=_apply,
+        )
+
+    return result

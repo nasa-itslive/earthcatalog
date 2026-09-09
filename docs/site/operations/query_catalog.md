@@ -4,15 +4,15 @@ Five search methods, from fastest to most flexible:
 
 | Method | Returns | Speed | When to use |
 |---|---|---|---|
-| `duck_search()` | `pandas.DataFrame` (all columns) | **~2×** | Fastest results, any query |
-| `search_uris()` | `DataFrame(id, uri)` | fastest for URLs | Bulk download URL extraction |
+| `search.duck_search()` | `pandas.DataFrame` (all columns) | **~2×** | Fastest results, any query |
+| `search.search_uris()` | `DataFrame(id, uri)` | fastest for URLs | Bulk download URL extraction |
 | `search()` | lazy `EarthCatalogItemSearch` → `pystac.Item` | 1× | Need pystac objects, lazy iteration |
 | `search_to_arrow()` | `pyarrow.Table` | 1× | Arrow-native workflows |
 | `search_files()` | `list[str]` (file paths) | — | Custom DuckDB SQL |
 
 ---
 
-## Fastest — `duck_search()`
+## Fastest — `search.duck_search()`
 
 Uses DuckDB internally for parallel Parquet I/O.  **~2× faster** than
 the other methods across all query types.  Returns a ``pandas.DataFrame``
@@ -26,7 +26,10 @@ from obstore.store import S3Store
 store = S3Store(bucket='its-live-data', region='us-west-2', skip_signature=True)
 catalog = ec.open(store=store, base='s3://its-live-data/test-space/stac/catalog')
 
-df = catalog.duck_search(
+from earthcatalog.search import duck_search
+
+df = duck_search(
+    catalog,
     intersects={"type": "Point", "coordinates": [0, 60]},
     datetime="2020-01-01/2020-12-31",
     filter=cql2.parse_text('platform = "sentinel-1"').to_json(),
@@ -280,14 +283,19 @@ For large result sets the savings are significant.
 If you prefer the simpler API at the cost of reading all columns:
 
 ```python
-df = catalog.duck_search(...)
+from earthcatalog.search import duck_search
+
+df = duck_search(catalog, ...)
 urls = [json.loads(a).get("data", {}).get("href") for a in df["assets"] if a]
 ```
 
-Or use the dedicated method that does all of the above:
+Or use the dedicated function that does all of the above:
 
 ```python
-df = catalog.search_uris(
+from earthcatalog.search import search_uris
+
+df = search_uris(
+    catalog,
     intersects={"type": "Point", "coordinates": [-45, 70]},
     datetime="2020-01-01/2020-12-31",
     max_items=100,

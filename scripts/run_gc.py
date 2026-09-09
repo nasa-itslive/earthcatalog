@@ -65,16 +65,17 @@ args = parser.parse_args()
 # Open EarthCatalog
 # ---------------------------------------------------------------------------
 
-from earthcatalog.catalog import EarthCatalog, _open_sqlite  # noqa: E402
+from earthcatalog.catalog import EarthCatalog, open_sqlite  # noqa: E402
 from earthcatalog.run import _make_s3_store  # noqa: E402
+from earthcatalog.uris import parse_s3_uri  # noqa: E402
 
 region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
 
 # Derive bucket from warehouse URI
 warehouse = args.warehouse.rstrip("/")
-if warehouse.startswith("s3://"):
-    rest = warehouse[5:]
-    bucket = rest.split("/", 1)[0]
+parsed = parse_s3_uri(warehouse)
+if parsed:
+    bucket = parsed[0]
 else:
     print("ERROR: --warehouse must be an s3:// URI")
     sys.exit(1)
@@ -84,7 +85,7 @@ else:
 store = _make_s3_store(bucket)
 
 # Open the SQLite catalog directly (catalog was already downloaded by CI)
-cat_obj = _open_sqlite(db_path=args.catalog, warehouse_path=warehouse)
+cat_obj = open_sqlite(db_path=args.catalog, warehouse_path=warehouse)
 
 ec = EarthCatalog.__new__(EarthCatalog)
 ec._catalog = cat_obj

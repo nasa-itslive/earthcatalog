@@ -26,6 +26,8 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+from earthcatalog.uris import parse_s3_uri
+
 DEFAULT_REGION = "us-west-2"
 DEFAULT_MAX_MEMORY = "10GB"
 
@@ -64,9 +66,9 @@ def resolve_files(source: str) -> list[str]:
 def _files_from_manifest(manifest_uri: str) -> list[str]:
     import obstore
 
-    if manifest_uri.startswith("s3://"):
-        no_scheme = manifest_uri.removeprefix("s3://")
-        bucket, key = no_scheme.split("/", 1)
+    parsed = parse_s3_uri(manifest_uri)
+    if parsed:
+        bucket, key = parsed
         store = _s3_store(bucket)
         raw = bytes(obstore.get(store, key).bytes())
     else:
@@ -87,8 +89,9 @@ def _files_from_manifest(manifest_uri: str) -> list[str]:
 def _files_from_list(list_uri: str) -> list[str]:
     import obstore
 
-    if list_uri.startswith("s3://"):
-        bucket, key = list_uri.removeprefix("s3://").split("/", 1)
+    parsed = parse_s3_uri(list_uri)
+    if parsed:
+        bucket, key = parsed
         store = _s3_store(bucket)
         text = bytes(obstore.get(store, key).bytes()).decode()
     else:

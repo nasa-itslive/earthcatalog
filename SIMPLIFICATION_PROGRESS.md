@@ -1,8 +1,11 @@
 # Simplification Progress Report
 
 **Session:** Implementation Phase (Commits 8b5d589 → 2650d24)  
-**Branch:** main  
-**Status:** Phase 1-3 complete; Phase 4 (RPI-1) deferred; Phase 5 (reporting) in progress
+**Branch:** main (original pass); superseded/extended by `refactoring-simpler`  
+**Status:** Phases 1-3 complete on `main`. The "Follow-up Pass" section at the
+bottom of this file (branch `refactoring-simpler`) completed the structural
+refactor this pass set up — see `CHANGELOG.md` for the authoritative,
+up-to-date list of changes and breaking changes.
 
 ---
 
@@ -206,3 +209,39 @@ All changes verified with:
 This simplification pass removed ~180 lines of dead code and 13 unused symbols, consolidated ~13 duplicate S3/inventory-filtering patterns into shared helpers, and retired a stale CLI duplicate. The daily ingest path is already using the direct stage as designed, and all test coverage remains green. The package's architecture is cleaner and easier to maintain, with better separation of concerns (S3 URI parsing, inventory filtering) and reduced "God object" complexity in `catalog.py`.
 
 **Next maintainer steps:** Address the 3 high-priority items above, particularly RPI-1 verification and search-scope review, before considering the package "simplified" per the stated goal.
+
+---
+
+## Follow-up Pass (2026-09-09, branch `refactoring-simpler`)
+
+Completed the structural refactor the previous pass set up:
+
+- **catalog.py 1484 → 434 lines** (architecture budget tightened 1120 → 600):
+  the `EarthCatalog` facade moved to `earthcatalog/facade.py` (re-exported,
+  imports unchanged); DuckDB searches became `earthcatalog.search`
+  module functions sharing one SQL builder; GC orchestration moved to
+  `gc.garbage_collect_for_catalog`; HTML rendering + the manifest stats
+  cache moved to `stats.py`; `_open_sqlite` is public `open_sqlite`.
+- **The partitioner owns temporal binning** (`time_bin` + `bin_value()` on
+  `AbstractPartitioner`, registry-based factory with `register_grid`);
+  `rebuild` preserves the time-bin partition spec; `--time-bin` CLI option;
+  the read path prunes via the same factory — s2/utm catalogs are queryable.
+- **Native lat/lon grid** (`--grid lat_lon`, degrees-per-tile resolution,
+  `r{row}c{col}` ids), fractional `--resolution` supported.
+- **One-shot modules removed** (`migrate.py`, `index_backfill.py`) now that
+  the store is normalized; `--time-bin` closes the month/day gap.
+- **Shared helpers**: `earthcatalog/uris.py` (parse_s3_uri/strip_bucket) and
+  `earthcatalog/stores.py` (make_s3_store/make_anonymous_store) replaced
+  ~15 inline copies.
+- **CI guarantee for the daily path**: `tests/test_daily_flow.py` runs the
+  exact `daily_delta.yml` command sequence (`diff` → `ingest --diff` →
+  idempotent re-run → search) hermetically in the PR gate, and
+  `test_e2e_incremental.py` (diff→ingest→gc) runs there too. The new test
+  immediately caught and fixed a real bug: `run()`'s local-warehouse store
+  was rooted at the warehouse dir instead of its parent, so every local CLI
+  ingest failed at `add_files`.
+- **Dead code**: `bulk_ingest`, 11 inventory aliases, `_HIVE_RE_V2`,
+  `_append_ndjson`, `DaskIngester._compact_ndjson_bucket`; an AST scan now
+  confirms zero unreferenced functions in the package.
+
+Suite: 374 passed (hermetic gate), ruff + mypy clean.
