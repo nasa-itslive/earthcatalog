@@ -407,6 +407,12 @@ def main() -> None:
         default=None,
         help="GeoJSON feature property used as the partition key (--grid geojson).",
     )
+    parser.add_argument(
+        "--time-bin",
+        default="year",
+        choices=["year", "month", "day"],
+        help="Temporal binning for the warehouse layout (default: year).",
+    )
     args = parser.parse_args()
 
     since = None
@@ -420,6 +426,7 @@ def main() -> None:
         resolution=args.resolution,
         boundaries_path=args.boundaries,
         id_field=args.id_field,
+        time_bin=args.time_bin,
     )
 
     run(

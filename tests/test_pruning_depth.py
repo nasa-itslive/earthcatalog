@@ -66,7 +66,7 @@ def warehouse(tmp_path):
     p = H3Partitioner(resolution=2)
     wh = tmp_path / "warehouse"
     for year_label, items in [("2020", items_2020), ("2021", items_2021)]:
-        for (cell, year), group in group_by_partition(fan_out(items, p)).items():
+        for (cell, year), group in group_by_partition(fan_out(items, p), p).items():
             d = wh / f"grid_partition={cell}" / f"year={year or year_label}"
             d.mkdir(parents=True)
             write_geoparquet(group, str(d / "part.parquet"))

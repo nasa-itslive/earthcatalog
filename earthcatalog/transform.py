@@ -118,20 +118,25 @@ def fan_out(
 
 def group_by_partition(
     fan_out_items: list[dict],
-    time_bin: str = "year",
+    partitioner: AbstractPartitioner,
 ) -> dict[tuple[str, str], list[dict]]:
     """
-    Group fan-out items by ``(grid_partition, <time_bin> value)`` and sort
+    Group fan-out items by ``(grid_partition, temporal bin)`` and sort
     each group by ``(platform, datetime)``.
+
+    The *partitioner* supplies the temporal bin for each item
+    (``partitioner.bin_value(props["datetime"])``) — it owns temporal
+    binning, so the grouping follows whatever ``time_bin`` the partitioner
+    was configured with.
 
     Each resulting group satisfies both Iceberg partition constraints:
 
     * ``IdentityTransform`` on ``grid_partition`` — every item in the group
       has the same ``grid_partition`` value, so Parquet column statistics give
       a single min == max that ``add_files()`` can use unambiguously.
-    * the temporal transform on ``datetime`` (year/month/day per *time_bin*)
-      — every item in the group has the same bin value, so the partition-level
-      Parquet statistics are also unambiguous.
+    * the temporal transform on ``datetime`` (year/month/day per the
+      partitioner's *time_bin*) — every item in the group has the same bin
+      value, so the partition-level Parquet statistics are also unambiguous.
 
     The within-group sort by ``(platform, datetime)`` maximises Parquet
     row-group min/max statistics for predicate pushdown on those columns.
@@ -141,24 +146,22 @@ def group_by_partition(
     fan_out_items:
         Output of :func:`fan_out` — each item has exactly one
         ``grid_partition`` value in its ``properties``.
-    time_bin:
-        ``"year"`` (default), ``"month"`` or ``"day"`` — must match the
-        table's partition spec.
+    partitioner:
+        The partitioner whose ``get_intersecting_keys`` produced the fan-out;
+        its ``time_bin`` must match the table's partition spec.
 
     Returns
     -------
     dict mapping ``(cell_id, bin_value)`` → sorted list of synthetic STAC
-    items.  ``bin_value`` is the formatted hive value (``"2025"`,
+    items.  ``bin_value`` is the formatted hive value (``"2025"``,
     ``"2025-12"``, ``"2025-12-20"``) or ``"unknown"`` for items that carry
     no ``datetime`` property.
     """
-    from .schema import bin_value
-
     groups: dict[tuple[str, str], list[dict]] = {}
     for item in fan_out_items:
         props = item["properties"]
         cell = props.get("grid_partition", "__none__")
-        bv = bin_value(props.get("datetime"), time_bin)
+        bv = partitioner.bin_value(props.get("datetime"))
         key = (cell, bv)
         groups.setdefault(key, []).append(item)
 

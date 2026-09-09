@@ -1,7 +1,10 @@
 """Iceberg catalog constants, schema, partition spec, and helpers.
 
 Pure data module — no behaviour, no side effects.  Keeps catalog.py focused
-on lifecycle and the EarthCatalog facade.
+on lifecycle and the EarthCatalog facade.  The temporal bin *formatting*
+lives in :mod:`earthcatalog.partitioner` (the partitioner owns temporal
+binning); it is re-exported here for callers that historically imported it
+from this module.
 """
 
 from __future__ import annotations
@@ -22,6 +25,16 @@ from pyiceberg.types import (
     StringType,
     TimestamptzType,
 )
+
+from earthcatalog.partitioner import TIME_BINS, bin_value  # noqa: F401 — re-export
+
+__all__ = [
+    "TIME_BINS",
+    "bin_value",
+    "partition_bin_value",
+    "partition_prefix",
+    "partition_year",
+]
 
 NAMESPACE = "earthcatalog"
 TABLE_NAME = "stac_items"
@@ -48,8 +61,6 @@ PROP_TIME_BIN = "earthcatalog.time_bin"
 _HIVE_RE = re.compile(
     r"grid_partition=(?P<cell>[^/]+)/year=(?P<year>[^/]+)/(?P<file>[^/]+\.parquet)$"
 )
-
-TIME_BINS = ("year", "month", "day")
 
 _PROP_BY_BIN = {"year": "year", "month": "month", "day": "day"}
 _TRANSFORM_BY_BIN: dict[str, Any] = {
@@ -80,34 +91,6 @@ def partition_prefix(
         f"{warehouse_prefix.rstrip('/')}/grid={grid}/level={level}/"
         f"tile={tile}/{time_bin}={bin_value}/"
     )
-
-
-def bin_value(value: str | datetime | None, time_bin: str = "year") -> str:
-    """Format a temporal value for the hive path: ``2025`` / ``2025-12`` /
-    ``2025-12-20``.
-
-    Accepts the ISO strings STAC items carry or a datetime.  Missing or
-    unparseable values map to ``"unknown"`` — files without a datetime live
-    in the ``unknown`` partition and index rows must agree.
-    """
-    if time_bin not in TIME_BINS:
-        raise ValueError(f"unknown time bin: {time_bin!r}")
-    if value is None:
-        return "unknown"
-    if isinstance(value, datetime):
-        value = value.astimezone(UTC).isoformat()
-    s = str(value)
-    y, m, d = s[:4], s[5:7], s[8:10]
-    if not (y.isdigit() and len(y) == 4):
-        return "unknown"
-    if time_bin == "year":
-        return y
-    if m.isdigit() and len(m) == 2:
-        if time_bin == "month":
-            return f"{y}-{m}"
-        if d.isdigit() and len(d) == 2:
-            return f"{y}-{m}-{d}"
-    return "unknown"
 
 
 def layout_of(props: Mapping[str, str]) -> tuple[str, str, str]:

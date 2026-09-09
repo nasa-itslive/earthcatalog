@@ -105,7 +105,9 @@ def _ingest_one(tmp_path, grid_config: GridConfig, item: dict):
     cat = _open_sqlite(db_path=str(tmp_path / "catalog.db"), warehouse_path=str(wh))
     table = get_or_create(cat, grid_config=grid_config)
 
-    partitioner = H3Partitioner(resolution=grid_config.resolution)
+    partitioner = H3Partitioner(
+        resolution=grid_config.resolution, time_bin=grid_config.time_bin
+    )
     item["properties"]["grid_partition"] = partitioner.get_intersecting_keys(
         shapely.geometry.shape(item["geometry"]).wkb
     )[0]

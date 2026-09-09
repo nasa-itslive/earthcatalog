@@ -162,7 +162,7 @@ class TestStats:
         p = H3Partitioner(resolution=2)
         rows = fan_out([item], p)
         paths = []
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, p).items():
             out = str(tmp_path / f"part_{cell}_{year}.parquet")
             write_geoparquet(group, out)
             paths.append(out)
@@ -208,7 +208,7 @@ class TestStats:
         p = H3Partitioner(resolution=2)
         rows = fan_out(items, p)
         paths = []
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, p).items():
             out = str(tmp_path / f"part_{cell}_{year}.parquet")
             write_geoparquet(group, out)
             paths.append(out)
@@ -253,7 +253,7 @@ class TestStats:
         p = H3Partitioner(resolution=2)
         rows = fan_out([item], p)
         paths = []
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, p).items():
             out = str(tmp_path / f"part_{cell}_{year}.parquet")
             write_geoparquet(group, out)
             paths.append(out)
@@ -331,7 +331,7 @@ def _build_multiyear_warehouse(tmp_path, years):
     p = H3Partitioner(resolution=2)
     rows = fan_out(items, p)
     paths = []
-    for idx, ((cell, year), group) in enumerate(group_by_partition(rows).items()):
+    for idx, ((cell, year), group) in enumerate(group_by_partition(rows, p).items()):
         out = str(tmp_path / f"part_{cell}_{year}_{idx}.parquet")
         write_geoparquet(group, out)
         paths.append(out)

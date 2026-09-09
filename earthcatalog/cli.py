@@ -139,6 +139,11 @@ def ingest(
         "--id-field",
         help="GeoJSON feature property used as the partition key (--grid geojson).",
     ),
+    time_bin: str = typer.Option(
+        "year",
+        "--time-bin",
+        help="Temporal binning for the warehouse layout: 'year' | 'month' | 'day'.",
+    ),
     catalog_key: str | None = typer.Option(
         None,
         "--catalog-key",
@@ -173,6 +178,7 @@ def ingest(
         resolution=resolution,
         boundaries_path=boundaries,
         id_field=id_field,
+        time_bin=time_bin,
     )
 
     if bool(inventory) == bool(diff):

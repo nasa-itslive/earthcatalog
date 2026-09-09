@@ -64,7 +64,7 @@ class TestIcebergRebuildAfterGC:
 
         partitioner = H3Partitioner(resolution=2)
         rows = fan_out([item_keep, item_del], partitioner)
-        groups = group_by_partition(rows)
+        groups = group_by_partition(rows, partitioner)
         part_paths = []
         for (cell, year), group in groups.items():
             year_str = str(year) if year is not None else "unknown"
@@ -129,7 +129,7 @@ class TestIcebergRebuildAfterGC:
         tbl = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
         partitioner = H3Partitioner(resolution=2)
         rows = fan_out([item], partitioner)
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, partitioner).items():
             year_str = str(year) if year is not None else "unknown"
             out_dir = Path(wh_path) / f"grid_partition={cell}" / f"year={year_str}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -199,7 +199,7 @@ class TestIcebergRebuildAfterGC:
 
         partitioner = H3Partitioner(resolution=3)
         rows = fan_out([item], partitioner)
-        for (cell, year), group in group_by_partition(rows).items():
+        for (cell, year), group in group_by_partition(rows, partitioner).items():
             year_str = str(year) if year is not None else "unknown"
             out_dir = Path(wh_path) / f"grid_partition={cell}" / f"year={year_str}"
             out_dir.mkdir(parents=True, exist_ok=True)

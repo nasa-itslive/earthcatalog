@@ -67,7 +67,7 @@ def populated_warehouse(tmp_path):
 
     p = H3Partitioner(resolution=2)
     rows = fan_out(items, p)
-    groups = group_by_partition(rows)
+    groups = group_by_partition(rows, p)
 
     paths = []
     for (cell, year), group in groups.items():
@@ -114,7 +114,7 @@ def memory_store_with_catalog(tmp_path):
 
     p = H3Partitioner(resolution=2)
     rows = fan_out([item], p)
-    for (cell, year), group in group_by_partition(rows).items():
+    for (cell, year), group in group_by_partition(rows, p).items():
         out = str(tmp_path / f"part_{cell}_{year}.parquet")
         write_geoparquet(group, out)
         tbl.add_files([out])

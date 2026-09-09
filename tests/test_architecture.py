@@ -30,7 +30,9 @@ MODULE_LINE_BUDGETS: dict[str, int] = {
     "search.py": 600,
     # Phase 3 target (+ journal hooks, bounded fetch pool, dedupe DI).
     # Serial ndjson branch deleted in RPI-C (bulk-only now).
-    "ingest.py": 780,
+    # 802 after the temporal-drift guard + _PrePartitioned fallback
+    # (partitioner-owned temporal binning).
+    "ingest.py": 810,
     # Extracted from catalog.py — ingest orchestration + daily dry-run +
     # _last_run.json writer + full-mode reset + anti-join wiring
     # (+34: pre-ingest diff report and post-ingest index/Iceberg

@@ -99,7 +99,7 @@ class IngestPipeline:
             scatter_staging_prefix,
             write_inventory_shards,
         )
-        from .schema import FULL_NAME, NAMESPACE
+        from .schema import FULL_NAME, NAMESPACE, PROP_TIME_BIN
 
         if not os.environ.get("AWS_ACCESS_KEY_ID"):
             raise RuntimeError(
@@ -123,6 +123,7 @@ class IngestPipeline:
             resolution=cat._info.grid_resolution,
             boundaries_path=cat._info.boundaries_path,
             id_field=cat._info.id_field,
+            time_bin=cat._table.properties.get(PROP_TIME_BIN, "year"),
         )
         partitioner = build_partitioner(grid_cfg)
 

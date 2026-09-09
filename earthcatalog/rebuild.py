@@ -94,10 +94,10 @@ def rebuild_iceberg_from_warehouse(
         FULL_NAME,
         ICEBERG_SCHEMA,
         NAMESPACE,
-        PARTITION_SPEC,
         _open_sqlite,
         upload_catalog,
     )
+    from earthcatalog.schema import PROP_TIME_BIN, build_partition_spec
 
     catalog = _open_sqlite(db_path=catalog_path, warehouse_path=warehouse_root)
 
@@ -121,7 +121,7 @@ def rebuild_iceberg_from_warehouse(
     table = catalog.create_table(
         identifier=FULL_NAME,
         schema=ICEBERG_SCHEMA,
-        partition_spec=PARTITION_SPEC,
+        partition_spec=build_partition_spec(preserved_props.get(PROP_TIME_BIN, "year")),
         properties=preserved_props,
     )
 
