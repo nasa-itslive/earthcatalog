@@ -25,6 +25,40 @@ def test_info_prints_catalog_summary(tmp_path):
     assert "Summary" in result.output
 
 
+def test_info_verify_is_read_only_without_update(tmp_path):
+    """`info --verify` must not write stats.json — it only reports drift.
+    Persisting the recomputed snapshot requires the explicit --update flag."""
+    db = str(tmp_path / "catalog.db")
+    wh = str(tmp_path / "warehouse")
+    catalog = _open_sqlite(db_path=db, warehouse_path=wh)
+    get_or_create(catalog, grid_config=GridConfig(type="h3", resolution=2))
+
+    # First run bootstraps stats.json (no snapshot existed yet), written
+    # exactly beside the warehouse dir — not nested under some duplicated
+    # path inside it (see stats._resolve).
+    result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh])
+    assert result.exit_code == 0, result.output
+    assert "bootstrapped" in result.output
+    stats_path = tmp_path / "stats.json"
+    assert stats_path.exists()
+    assert list(tmp_path.rglob("stats.json")) == [stats_path]
+    before = stats_path.read_text()
+
+    # --verify alone must not touch stats.json.
+    result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh, "--verify"])
+    assert result.exit_code == 0, result.output
+    assert "[verify]" in result.output
+    assert "updated" not in result.output
+    assert stats_path.read_text() == before
+
+    # --verify --update explicitly persists the recomputed snapshot.
+    result = runner.invoke(
+        app, ["info", "--catalog", db, "--warehouse", wh, "--verify", "--update"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "stats.json updated" in result.output
+
+
 def test_info_defaults_to_production_catalog():
     """No flags: info reads the default production catalog and its
     stats snapshot (the old "specify --catalog" error is gone — the

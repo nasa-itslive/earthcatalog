@@ -12,6 +12,7 @@ from earthcatalog.stats import (
     apply_gc,
     apply_ingest,
     load,
+    save,
     stats_key_for,
 )
 
@@ -25,6 +26,37 @@ def test_stats_key_for_s3():
         stats_key_for("s3://its-live-data/test-space/stac/catalog/warehouse")
         == "s3://its-live-data/test-space/stac/catalog/stats.json"
     )
+
+
+def test_stats_key_for_local_is_sibling_of_warehouse():
+    assert stats_key_for("/tmp/xyz/warehouse") == "/tmp/xyz/stats.json"
+
+
+def test_local_save_load_lands_beside_warehouse_regardless_of_store_root(tmp_path):
+    """Callers root their local ``store`` differently (warehouse dir, its
+    parent, etc.) for other purposes — ``save``/``load`` must still land
+    stats.json exactly at ``stats_key_for``'s absolute path instead of
+    nesting it under whatever arbitrary directory ``store`` happens to be
+    rooted at (regression: this used to write to a duplicated
+    ``<root>/<abs-path-with-leading-slash-stripped>`` location)."""
+    from obstore.store import LocalStore
+
+    warehouse = tmp_path / "warehouse"
+    warehouse.mkdir()
+    key = stats_key_for(str(warehouse))
+    assert key == str(tmp_path / "stats.json")
+
+    # A store rooted somewhere else entirely — must be ignored for the
+    # absolute local-path case.
+    decoy_store = LocalStore(str(warehouse))
+    save(decoy_store, key, {"unique_items": 1})
+
+    assert (tmp_path / "stats.json").exists()
+    assert not (tmp_path / "warehouse" / "stats.json").exists()
+
+    loaded = load(decoy_store, key)
+    assert loaded is not None
+    assert loaded["unique_items"] == 1
 
 
 def test_ingest_delta_then_gc_delta():

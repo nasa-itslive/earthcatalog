@@ -57,10 +57,32 @@ def _store_key(key: str) -> str:
     return key
 
 
+def _resolve(store: ObjectStore, key: str) -> tuple[ObjectStore, str]:
+    """Pick the store the *key* actually belongs to.
+
+    ``stats_key_for`` returns an absolute filesystem path for local
+    warehouses (a sibling of ``earthcatalog.db``), but callers each root
+    their own ``store`` differently for other purposes (e.g. the
+    warehouse directory itself, or its parent) — none of which reliably
+    matches that absolute path as a relative key. Rather than require
+    every caller to hand us a filesystem-root-rooted store just for
+    stats, resolve absolute local paths against a dedicated root store
+    so ``stats.json`` always lands exactly where ``stats_key_for``
+    said it would. Non-absolute keys (``s3://`` URIs, or bare keys used
+    in tests with e.g. ``MemoryStore``) go through *store* unchanged.
+    """
+    if key.startswith("/"):
+        from obstore.store import LocalStore
+
+        return LocalStore(), key
+    return store, _store_key(key)
+
+
 def load(store: ObjectStore, key: str) -> dict[str, Any] | None:
     """Read the stored snapshot; ``None`` when absent or unreadable."""
+    store, rel_key = _resolve(store, key)
     try:
-        doc = json.loads(bytes(obstore.get(store, _store_key(key)).bytes()))
+        doc = json.loads(bytes(obstore.get(store, rel_key).bytes()))
     except FileNotFoundError:
         return None
     except Exception:
@@ -69,8 +91,9 @@ def load(store: ObjectStore, key: str) -> dict[str, Any] | None:
 
 
 def save(store: ObjectStore, key: str, stats: dict[str, Any]) -> None:
+    store, rel_key = _resolve(store, key)
     doc = {"stats_version": STATS_VERSION, **stats}
-    obstore.put(store, _store_key(key), json.dumps(doc, indent=1).encode())
+    obstore.put(store, rel_key, json.dumps(doc, indent=1).encode())
 
 
 def now_iso() -> str:

@@ -616,14 +616,23 @@ def info(
     verify: bool = typer.Option(
         False,
         "--verify",
-        help="Recompute the stats snapshot from the data and report drift.",
+        help="Recompute the stats snapshot from the data and report drift. "
+        "Read-only — pass --update to also persist the recomputed snapshot.",
+    ),
+    update: bool = typer.Option(
+        False,
+        "--update",
+        help="With --verify, write the recomputed snapshot back to stats.json. "
+        "Has no effect without --verify.",
     ),
 ) -> None:
     """Print a catalog summary: grid metadata, file/row counts, year distribution.
 
     With no arguments this reads the default production catalog and its
     maintained ``stats.json`` snapshot — instant, no data scans.
-    ``--verify`` recomputes the snapshot the expensive way.
+    ``--verify`` recomputes the snapshot the expensive way and reports drift;
+    it is read-only unless ``--update`` is also given, which persists the
+    recomputed snapshot to ``stats.json``.
     """
     import os
     from pathlib import Path
@@ -748,6 +757,8 @@ def info(
             typer.echo(f"    {s['grid_partition']}: {s['row_count']:,} rows")
 
     # (Re)compute the snapshot the expensive way: bootstrap or --verify.
+    # This is read-only unless there is no snapshot yet (bootstrap) or the
+    # caller explicitly asked to persist it with --verify --update.
     locations = stats_mod.index_locations(table, idx_store, warehouse)
     computed = stats_mod.compute_full(table, idx, locations)
     if stored is not None:
@@ -762,9 +773,12 @@ def info(
                 typer.echo(f"    {k}: {old} -> {new}")
         else:
             typer.echo("  [verify] stored stats matched the recomputation")
+        if update:
+            stats_mod.save(idx_store, skey, computed)
+            typer.echo("  [verify] stats.json updated")
     else:
         typer.echo("  Stats snapshot: bootstrapped")
-    stats_mod.save(idx_store, skey, computed)
+        stats_mod.save(idx_store, skey, computed)
 
     typer.echo(f"  Unique items  : {computed['unique_items']:,}")
     typer.echo(f"  Index rows    : {computed['index_rows']:,}")
