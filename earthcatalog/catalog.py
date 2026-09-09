@@ -308,26 +308,9 @@ def _catalog_info(table) -> CatalogInfo:
 
 def _open_sqlite(db_path: str, warehouse_path: str) -> SqlCatalog:
     """Open a PyIceberg SqlCatalog from local paths (internal use)."""
-    import os
+    from .inventory import sql_catalog_props
 
-    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
-    props: dict = {"uri": f"sqlite:///{db_path}", "warehouse": warehouse_path}
-
-    if warehouse_path.startswith("s3://"):
-        props["s3.region"] = region
-        key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
-        secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-        token = os.environ.get("AWS_SESSION_TOKEN", "")
-        if key_id and secret:
-            props["s3.access-key-id"] = key_id
-            props["s3.secret-access-key"] = secret
-            if token:
-                props["s3.session-token"] = token
-        else:
-            props["s3.anonymous"] = "true"
-            props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
-
-    return SqlCatalog(NAMESPACE, **props)
+    return SqlCatalog(NAMESPACE, **sql_catalog_props(db_path, warehouse_path))
 
 
 def download_catalog(
@@ -480,9 +463,6 @@ def open(
     if _warehouse_path.startswith("s3://"):
         props["s3.region"] = region
         if anonymous:
-            props["s3.anonymous"] = "true"
-            props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
-        else:
             props["s3.anonymous"] = "true"
             props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
 
@@ -893,11 +873,12 @@ class EarthCatalog:
         Returns
         -------
         Summary dict: ``candidates``, ``confirmed``, ``orphaned``,
-        ``files_rewritten``, ``rows_removed``, ``partitions_affected``.
+        ``files_rewritten``, ``rows_removed``, ``partitions_affected``,
+        ``copies_outside_index``, ``residual_copies``.
         """
         import os
 
-        from earthcatalog.gc import run_garbage_collection
+        from earthcatalog.gc import iceberg_orphan_file_scan, run_garbage_collection
         from earthcatalog.index import Index
 
         warehouse_root = self._catalog.properties.get("warehouse", "")
@@ -930,6 +911,9 @@ class EarthCatalog:
             warehouse_prefix=warehouse_prefix,
             dry_run=dry_run,
             layout=layout_of(self._table.properties),
+            # Iceberg metadata widens cleanup beyond index-named partitions
+            # (copies can lack pointer rows) and enables the fixpoint guarantee.
+            discover_fn=iceberg_orphan_file_scan(self._table),
         )
 
         # After files have been physically rewritten the Iceberg table still

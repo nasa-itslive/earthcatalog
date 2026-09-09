@@ -443,6 +443,158 @@ def consolidate(
 
 
 # ---------------------------------------------------------------------------
+# `index-backfill` sub-command — complete pointer coverage, locally first
+# ---------------------------------------------------------------------------
+
+
+@app.command("index-backfill")
+def index_backfill_command(
+    warehouse: str = typer.Option(
+        "s3://its-live-data/test-space/stac/catalog/warehouse",
+        "--warehouse",
+        help="Warehouse root (s3:// URI). Scanned read-only; never modified.",
+    ),
+    work_dir: str = typer.Option(
+        "./index_backfill_work",
+        "--work-dir",
+        help="Local work dir for staged index parts, the warehouse scan cache, and the manifest.",
+    ),
+    index_key: str = typer.Option(
+        None,
+        "--index-key",
+        help="Index base key within the warehouse store (default: warehouse_index).",
+    ),
+    chunk_rows: int = typer.Option(1_000_000, "--chunk-rows", help="Rows per emitted index part."),
+    run_id: str = typer.Option(
+        None,
+        "--run-id",
+        help="Part name prefix (default: backfill-YYYYMMDD). Deterministic, so re-runs resume.",
+    ),
+    stage: bool = typer.Option(False, "--stage", help="Download the current index parts locally first."),
+    rescan: bool = typer.Option(False, "--rescan", help="Force a fresh warehouse scan (cache is reused otherwise)."),
+    build: bool = typer.Option(False, "--build", help="Emit the missing pointer parts into the local work dir."),
+    verify: bool = typer.Option(
+        False, "--verify", help="Full cards-vs-copies verification over the local index (gate before upload)."
+    ),
+    upload: bool = typer.Option(False, "--upload", help="GATED: copy the built parts to the live index."),
+    rollback: bool = typer.Option(False, "--rollback", help="Delete exactly the manifest's parts from the live index."),
+) -> None:
+    """Backfill missing (granule x cell) index pointers from warehouse metadata.
+
+    Local-first: stage the index, cache one read-only warehouse scan, build
+    and verify locally, then upload in a separate explicit step.
+    """
+    from pathlib import Path as _Path
+
+    import duckdb
+    from obstore.store import LocalStore
+
+    from earthcatalog import index_backfill as ib
+    from earthcatalog.run import _make_s3_store
+
+    wd = _Path(work_dir)
+    bucket = warehouse.removeprefix("s3://").split("/", 1)[0]
+    remote_store = _make_s3_store(bucket)
+    # On a bucket-level store the base key is the full path: the index is a
+    # sibling of the warehouse dir ({warehouse}_index/).
+    key = index_key
+    if key is None:
+        if warehouse.startswith("s3://"):
+            key = f"{warehouse.removeprefix('s3://').split('/', 1)[1].rstrip('/')}_index"
+        else:
+            key = f"{warehouse.rstrip('/')}_index"
+    manifest: ib.BackfillManifest | None = None
+    if (wd / "manifest.json").exists():
+        manifest = ib.BackfillManifest.load(wd)
+
+    if rollback:
+        if manifest is None:
+            typer.echo(f"ERROR: no manifest in {wd} — nothing to roll back")
+            raise typer.Exit(1)
+        n = ib.rollback(manifest, remote_store, key)
+        typer.echo(f"Rolled back {n} part(s) from the live index.")
+        return
+
+    if stage:
+        staged = ib.stage_index_parts(remote_store, key, wd)
+        typer.echo(f"Staged {len(staged)} index part(s) into {wd / 'index'}")
+
+    con = duckdb.connect()
+    con.execute("SET memory_limit='24GB';")
+    # Let the big anti-join spill to temp instead of OOMing on the
+    # insertion-order buffer; ORDER BY still makes chunk boundaries exact.
+    con.execute("SET preserve_insertion_order=false;")
+    con.execute(f"SET temp_directory='{wd / 'tmp'}';")
+    if warehouse.startswith("s3://"):
+        con.execute("INSTALL aws; LOAD aws; CALL load_aws_credentials();")
+        con.execute("SET s3_region='us-west-2';")
+
+    cache = wd / "warehouse_triples.parquet"
+    if rescan and cache.exists():
+        cache.unlink()
+    scan = ib.scan_warehouse(remote_store, warehouse, wd, con)
+    typer.echo(
+        f"Warehouse scan: {scan['rows']:,} record copies"
+        + (" (cached)" if scan["cached"] else f" from {scan.get('files', '?')} files")
+    )
+
+    locs = ib.staged_locations(wd)
+    if not locs:
+        typer.echo(f"ERROR: no staged index parts in {wd} — run with --stage first")
+        raise typer.Exit(1)
+
+    rep = ib.report(cache, locs, con)
+    typer.echo(
+        f"Index today : {rep['index_rows']:,} rows, {rep['distinct_keys']:,} distinct keys\n"
+        f"Missing     : {rep['missing_pairs']:,} (granule x cell) pointers\n"
+        f"No s3_key   : {rep['granules_without_key']:,} granules\n"
+        + "".join(f"  top cell  : {t['grid_partition']} ({t['missing']:,} missing)\n" for t in rep["top_cells"])
+    )
+
+    if build:
+        rid = run_id or f"backfill-{_now_stamp()}"
+        stage_root = wd / "index"
+        stage_root.mkdir(parents=True, exist_ok=True)
+        local_store = LocalStore(str(stage_root))
+        manifest = ib.build(
+            cache,
+            locs,
+            local_store,
+            key,
+            wd,
+            con,
+            run_id=rid,
+            chunk_rows=chunk_rows,
+        )
+        typer.echo(f"Built {len(manifest.parts)} part(s), {manifest.rows_written:,} rows — manifest at {wd / 'manifest.json'}")
+
+    if verify:
+        v = ib.verify(cache, ib.staged_locations(wd), con)
+        typer.echo(
+            f"Index rows          : {v['index_rows']:,}\n"
+            f"Warehouse copies    : {v['warehouse_rows']:,}\n"
+            f"Distinct keys       : {v['distinct_keys']:,}\n"
+            f"Duplicate pairs     : {v['duplicate_pairs']:,}\n"
+            f"Cards w/o copy      : {v['cards_without_copy']:,}\n"
+            f"Copies w/o card     : {v['copies_without_card']:,}"
+        )
+
+    if upload:
+        if manifest is None:
+            typer.echo("ERROR: nothing built yet — run with --build first")
+            raise typer.Exit(1)
+        local_store = LocalStore(str(wd / "index"))
+        n = ib.upload(manifest, local_store, key, remote_store)
+        typer.echo(f"Uploaded {n:,} rows ({len(manifest.parts)} part(s)) to the live index.")
+
+
+def _now_stamp() -> str:
+    from datetime import datetime as _dt
+
+    return _dt.now().strftime("%Y%m%d")
+
+
+# ---------------------------------------------------------------------------
 # `info` sub-command — catalog summary
 # ---------------------------------------------------------------------------
 

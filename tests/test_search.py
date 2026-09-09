@@ -12,6 +12,12 @@ from earthcatalog.search import (
     build_query,
 )
 
+# polygon containing Point(0, 60)
+_GEOM_AT_POINT = {
+    "type": "Polygon",
+    "coordinates": [[[-1, 59], [1, 59], [1, 61], [-1, 61], [-1, 59]]],
+}
+
 
 class TestBuildQuery:
     def test_where_true_when_no_filters(self):
@@ -105,7 +111,11 @@ class TestFileSearchEngine:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet", "b.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}"}])
+        monkeypatch.setattr(
+            rustac,
+            "search_sync",
+            lambda href, **kw: [{"id": f"item-{href}", "geometry": _GEOM_AT_POINT}],
+        )
         results = eng.search(intersects={"type": "Point", "coordinates": [0, 60]})
         assert len(results) == 2
 
@@ -114,7 +124,11 @@ class TestFileSearchEngine:
         import rustac
 
         monkeypatch.setattr(
-            rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}"} for _ in range(5)]
+            rustac,
+            "search_sync",
+            lambda href, **kw: [
+                {"id": f"item-{href}-{i}", "geometry": _GEOM_AT_POINT} for i in range(5)
+            ],
         )
         results = eng.search(intersects={"type": "Point", "coordinates": [0, 60]}, max_items=3)
         assert len(results) == 3
@@ -125,6 +139,36 @@ class TestFileSearchEngine:
 
         monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: ["should-not-run"])
         assert eng.search(intersects={"type": "Point", "coordinates": [0, 60]}) == []
+
+    def test_intersects_never_reaches_rustac_and_is_row_filtered(self, monkeypatch):
+        """rustac's spatial filter silently matches nothing on parquet hrefs,
+        so the engine must strip ``intersects`` and row-filter locally."""
+        import shapely
+
+        inside = {"id": "inside", "geometry": _GEOM_AT_POINT, "properties": {}}
+        far = {
+            "id": "far",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[100, 40], [102, 40], [102, 42], [100, 42], [100, 40]]],
+            },
+            "properties": {},
+        }
+        no_geom = {"id": "no-geom", "properties": {}}
+        forwarded = []
+
+        def fake_rustac(href, **kw):
+            forwarded.append(kw)
+            return [inside, far, no_geom]
+
+        import rustac
+
+        monkeypatch.setattr(rustac, "search_sync", fake_rustac)
+        eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet"])
+        results = eng.search(intersects={"type": "Point", "coordinates": [0, 60]})
+        assert [it["id"] for it in results] == ["inside"]
+        assert forwarded and all("intersects" not in kw for kw in forwarded)
+        assert shapely is not None  # shapely used via _item_intersects
 
 
 class TestEarthCatalogItemSearch:
@@ -141,7 +185,7 @@ class TestEarthCatalogItemSearch:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["a.parquet", "b.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}"}])
+        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}", "geometry": _GEOM_AT_POINT}])
         sr = EarthCatalogItemSearch(
             params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
         )
@@ -181,11 +225,11 @@ class TestEarthCatalogItemSearch:
         eng = _FileSearchEngine(prune_fn=lambda geom, **kw: ["f.parquet"])
         import rustac
 
-        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": "item"}])
+        monkeypatch.setattr(rustac, "search_sync", lambda href, **kw: [{"id": "item", "geometry": _GEOM_AT_POINT}])
         sr = EarthCatalogItemSearch(
             params={"intersects": {"type": "Point", "coordinates": [0, 60]}}, engine=eng
         )
-        assert list(sr) == [{"id": "item"}]
+        assert list(sr) == [{"id": "item", "geometry": _GEOM_AT_POINT}]
 
     def test_pages(self, monkeypatch):
         """Each file produces one page."""
@@ -193,7 +237,7 @@ class TestEarthCatalogItemSearch:
         import rustac
 
         def fake(href, **kw):
-            return [{"id": f"item-{href}-{i}"} for i in range(2)]
+            return [{"id": f"item-{href}-{i}", "geometry": _GEOM_AT_POINT} for i in range(2)]
 
         monkeypatch.setattr(rustac, "search_sync", fake)
         sr = EarthCatalogItemSearch(
@@ -210,7 +254,7 @@ class TestEarthCatalogItemSearch:
         import rustac
 
         monkeypatch.setattr(
-            rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}-{i}"} for i in range(5)]
+            rustac, "search_sync", lambda href, **kw: [{"id": f"item-{href}-{i}", "geometry": _GEOM_AT_POINT} for i in range(5)]
         )
         sr = EarthCatalogItemSearch(
             params={"intersects": {"type": "Point", "coordinates": [0, 60]}, "max_items": 3},

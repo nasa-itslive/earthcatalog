@@ -25,7 +25,9 @@ CATALOG_PY_MAX_LINES = 1120
 MODULE_LINE_BUDGETS: dict[str, int] = {
     # Phase 4/6 target (slimmed, SQL deduped)
     "catalog.py": CATALOG_PY_MAX_LINES,
-    "search.py": 580,
+    # 600: intersects row-filtering moved into iter_items (rustac's spatial
+    # filter silently matches nothing on parquet hrefs) + _item_intersects.
+    "search.py": 600,
     # Phase 3 target (+ journal hooks, bounded fetch pool, dedupe DI).
     # Serial ndjson branch deleted in RPI-C (bulk-only now).
     "ingest.py": 780,
