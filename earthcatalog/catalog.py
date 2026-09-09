@@ -893,11 +893,12 @@ class EarthCatalog:
         Returns
         -------
         Summary dict: ``candidates``, ``confirmed``, ``orphaned``,
-        ``files_rewritten``, ``rows_removed``, ``partitions_affected``.
+        ``files_rewritten``, ``rows_removed``, ``partitions_affected``,
+        ``copies_outside_index``, ``residual_copies``.
         """
         import os
 
-        from earthcatalog.gc import run_garbage_collection
+        from earthcatalog.gc import iceberg_orphan_file_scan, run_garbage_collection
         from earthcatalog.index import Index
 
         warehouse_root = self._catalog.properties.get("warehouse", "")
@@ -930,6 +931,9 @@ class EarthCatalog:
             warehouse_prefix=warehouse_prefix,
             dry_run=dry_run,
             layout=layout_of(self._table.properties),
+            # Iceberg metadata widens cleanup beyond index-named partitions
+            # (copies can lack pointer rows) and enables the fixpoint guarantee.
+            discover_fn=iceberg_orphan_file_scan(self._table),
         )
 
         # After files have been physically rewritten the Iceberg table still
