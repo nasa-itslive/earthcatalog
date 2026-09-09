@@ -46,19 +46,7 @@ def get_store(bucket: str) -> S3Store:
 
 
 def get_authenticated_store(bucket: str) -> S3Store:
-    key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
-    token = os.environ.get("AWS_SESSION_TOKEN")
-
-    if not (key_id and secret):
-        creds_file = os.path.expanduser("~/.aws/credentials")
-        cfg = configparser.ConfigParser()
-        cfg.read(creds_file)
-        profile = os.environ.get("AWS_PROFILE", "default")
-        if profile in cfg:
-            key_id = cfg[profile].get("aws_access_key_id", key_id)
-            secret = cfg[profile].get("aws_secret_access_key", secret)
-            token = cfg[profile].get("aws_session_token", token) or token
+    key_id, secret, token = _aws_keys()
 
     kwargs: dict = dict(bucket=bucket, region="us-west-2")
     if key_id:
@@ -69,6 +57,49 @@ def get_authenticated_store(bucket: str) -> S3Store:
         kwargs["aws_session_token"] = token
 
     return S3Store(**kwargs)
+
+
+def _aws_keys() -> tuple[str, str, str]:
+    """AWS credentials from the environment, else ~/.aws/credentials."""
+
+    key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    token = os.environ.get("AWS_SESSION_TOKEN", "")
+    if not (key_id and secret):
+        cfg = configparser.ConfigParser()
+        cfg.read(os.path.expanduser("~/.aws/credentials"))
+        profile = os.environ.get("AWS_PROFILE", "default")
+        if profile in cfg:
+            key_id = cfg[profile].get("aws_access_key_id", key_id)
+            secret = cfg[profile].get("aws_secret_access_key", secret)
+            token = cfg[profile].get("aws_session_token", token) or token
+    return key_id, secret, token
+
+
+def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
+    """PyIceberg SqlCatalog properties for *warehouse_path*.
+
+    Authenticated from the environment or the shared credentials file —
+    pyiceberg's pyarrow IO does not read ~/.aws/credentials on its own, so
+    without this a local (non-env) run would write metadata anonymously and
+    be denied.
+    """
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
+    props: dict = {"uri": f"sqlite:///{db_path}", "warehouse": warehouse_path}
+
+    if warehouse_path.startswith("s3://"):
+        props["s3.region"] = region
+        key_id, secret, token = _aws_keys()
+        if key_id and secret:
+            props["s3.access-key-id"] = key_id
+            props["s3.secret-access-key"] = secret
+            if token:
+                props["s3.session-token"] = token
+        else:
+            props["s3.anonymous"] = "true"
+            props["s3.endpoint"] = f"https://s3.{region}.amazonaws.com"
+
+    return props
 
 
 # ---------------------------------------------------------------------------

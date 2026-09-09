@@ -65,9 +65,8 @@ args = parser.parse_args()
 # Open EarthCatalog
 # ---------------------------------------------------------------------------
 
-from obstore.store import S3Store  # noqa: E402
-
 from earthcatalog.catalog import EarthCatalog, _open_sqlite  # noqa: E402
+from earthcatalog.run import _make_s3_store  # noqa: E402
 
 region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
 
@@ -80,7 +79,9 @@ else:
     print("ERROR: --warehouse must be an s3:// URI")
     sys.exit(1)
 
-store = S3Store(bucket=bucket, region=region)
+# _make_s3_store resolves credentials explicitly (env, then ~/.aws/credentials);
+# a bare S3Store can stall on the IMDS fallback on non-EC2 machines.
+store = _make_s3_store(bucket)
 
 # Open the SQLite catalog directly (catalog was already downloaded by CI)
 cat_obj = _open_sqlite(db_path=args.catalog, warehouse_path=warehouse)

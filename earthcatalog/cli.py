@@ -473,6 +473,9 @@ def index_backfill_command(
     stage: bool = typer.Option(False, "--stage", help="Download the current index parts locally first."),
     rescan: bool = typer.Option(False, "--rescan", help="Force a fresh warehouse scan (cache is reused otherwise)."),
     build: bool = typer.Option(False, "--build", help="Emit the missing pointer parts into the local work dir."),
+    verify: bool = typer.Option(
+        False, "--verify", help="Full cards-vs-copies verification over the local index (gate before upload)."
+    ),
     upload: bool = typer.Option(False, "--upload", help="GATED: copy the built parts to the live index."),
     rollback: bool = typer.Option(False, "--rollback", help="Delete exactly the manifest's parts from the live index."),
 ) -> None:
@@ -517,7 +520,10 @@ def index_backfill_command(
         typer.echo(f"Staged {len(staged)} index part(s) into {wd / 'index'}")
 
     con = duckdb.connect()
-    con.execute("SET memory_limit='6GB';")
+    con.execute("SET memory_limit='24GB';")
+    # Let the big anti-join spill to temp instead of OOMing on the
+    # insertion-order buffer; ORDER BY still makes chunk boundaries exact.
+    con.execute("SET preserve_insertion_order=false;")
     con.execute(f"SET temp_directory='{wd / 'tmp'}';")
     if warehouse.startswith("s3://"):
         con.execute("INSTALL aws; LOAD aws; CALL load_aws_credentials();")
@@ -561,6 +567,17 @@ def index_backfill_command(
             chunk_rows=chunk_rows,
         )
         typer.echo(f"Built {len(manifest.parts)} part(s), {manifest.rows_written:,} rows — manifest at {wd / 'manifest.json'}")
+
+    if verify:
+        v = ib.verify(cache, ib.staged_locations(wd), con)
+        typer.echo(
+            f"Index rows          : {v['index_rows']:,}\n"
+            f"Warehouse copies    : {v['warehouse_rows']:,}\n"
+            f"Distinct keys       : {v['distinct_keys']:,}\n"
+            f"Duplicate pairs     : {v['duplicate_pairs']:,}\n"
+            f"Cards w/o copy      : {v['cards_without_copy']:,}\n"
+            f"Copies w/o card     : {v['copies_without_card']:,}"
+        )
 
     if upload:
         if manifest is None:

@@ -122,6 +122,10 @@ class _FileSearchEngine:
         it receives the ``datetime`` kwarg.  Instead, temporal filtering is
         applied here (row level) after rustac returns, complementing the
         year-level Iceberg partition pruning done upstream.
+
+        ``intersects`` is stripped too — rustac's spatial filter silently
+        matches nothing on parquet hrefs — so the row-level intersect check
+        runs here, complementing the file-level Iceberg pruning.
         """
         if not files:
             return
@@ -129,7 +133,8 @@ class _FileSearchEngine:
         max_items = kwargs.get("max_items")
         seen = 0
         start_dt, end_dt = _extract_datetime_range(**kwargs)
-        _rustac_kwargs = {k: v for k, v in kwargs.items() if k != "datetime"}
+        geom = _extract_geometry(**kwargs)
+        _rustac_kwargs = {k: v for k, v in kwargs.items() if k not in ("datetime", "intersects")}
 
         with _suppress_stderr():
             for f in files:
@@ -146,7 +151,11 @@ class _FileSearchEngine:
                 items = _rustac_search_sync(f, **file_kwargs)
                 if not items:
                     continue
-                filtered = [it for it in items if _item_in_datetime_range(it, start_dt, end_dt)]
+                filtered = [
+                    it
+                    for it in items
+                    if _item_in_datetime_range(it, start_dt, end_dt) and _item_intersects(it, geom)
+                ]
                 if filtered:
                     yield filtered
                     seen += len(filtered)
@@ -459,6 +468,17 @@ def _format_bytes(n: int) -> str:
             return f"{size:.1f} {unit}" if unit != "B" else f"{n} {unit}"
         size /= 1024
     return f"{size:.1f} PB"
+
+
+def _item_intersects(item: dict, geom) -> bool:
+    """Row-level spatial check (rustac cannot filter intersects itself)."""
+    if geom is None:
+        return True
+    if not item.get("geometry"):
+        return False
+    from shapely.geometry import shape
+
+    return shape(item["geometry"]).intersects(geom)
 
 
 def _item_in_datetime_range(item: dict, start: str | None, end: str | None) -> bool:

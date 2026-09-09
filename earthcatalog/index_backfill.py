@@ -178,6 +178,13 @@ class BackfillManifest:
         return cls(**data)
 
 
+def _copy_if_absent(con, sql: str, dest: Path) -> Path:
+    """Materialize one pipeline stage to *dest* (idempotent across re-runs)."""
+    if not dest.exists():
+        con.execute(f"COPY ({sql}) TO '{dest}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    return dest
+
+
 def build(
     cache: Path,
     index_locs: list[str],
@@ -191,27 +198,51 @@ def build(
 ) -> BackfillManifest:
     """Emit missing (granule x cell) pointers as ``{run_id}--{seq}`` parts.
 
-    The missing-pair query is ordered, so chunk boundaries are deterministic
-    and an interrupted run resumes exactly where it stopped: parts already
-    on the store are skipped.  New pointer rows inherit the granule's
-    original ``ingested_at`` so per-day provenance is preserved.
+    Runs as staged, disk-backed queries so no single join materializes the
+    whole catalog in memory: (1) distinct warehouse pairs, (2) the missing
+    pairs after the anti-join, (3) the s3_key map restricted to the granules
+    that actually need a pointer, (4) the ordered, enriched stream.  The
+    final stream is ordered, so chunk boundaries are deterministic and an
+    interrupted run resumes exactly where it stopped: parts already on the
+    store are skipped.  New pointer rows inherit the granule's original
+    ``ingested_at`` so per-day provenance is preserved.
     """
     trips = str(cache)
     cards = _card_sources(index_locs)
+    wh_pairs = _copy_if_absent(
+        con,
+        f"SELECT DISTINCT stac_id, grid_partition, year FROM read_parquet('{trips}')",
+        work_dir / "bf_wh_pairs.parquet",
+    )
+    missing = _copy_if_absent(
+        con,
+        f"""
+        SELECT w.stac_id, w.grid_partition, w.year FROM read_parquet('{wh_pairs}') w
+        WHERE NOT EXISTS (
+          SELECT 1 FROM (SELECT DISTINCT stac_id, grid_partition FROM read_parquet([{cards}])) c
+          WHERE c.stac_id = w.stac_id AND c.grid_partition = w.grid_partition
+        )
+        """,
+        work_dir / "bf_missing.parquet",
+    )
+    keymap = _copy_if_absent(
+        con,
+        f"""
+        SELECT k.stac_id, any_value(k.s3_key) AS s3_key, any_value(k.ingested_at) AS ingested_at
+        FROM read_parquet([{cards}]) k
+        WHERE k.s3_key <> '' AND k.stac_id IN (SELECT DISTINCT stac_id FROM read_parquet('{missing}'))
+        GROUP BY 1
+        """,
+        work_dir / "bf_keymap.parquet",
+    )
     query = f"""
         SELECT w.stac_id,
                coalesce(k.s3_key, '') AS s3_key,
                w.grid_partition,
                w.year,
                k.ingested_at
-        FROM (SELECT DISTINCT stac_id, grid_partition, year FROM read_parquet('{trips}')) w
-        LEFT JOIN (SELECT stac_id, any_value(s3_key) AS s3_key, any_value(ingested_at) AS ingested_at
-                   FROM read_parquet([{cards}]) WHERE s3_key <> '' GROUP BY 1) k
-          ON k.stac_id = w.stac_id
-        WHERE NOT EXISTS (
-          SELECT 1 FROM (SELECT DISTINCT stac_id, grid_partition FROM read_parquet([{cards}])) c
-          WHERE c.stac_id = w.stac_id AND c.grid_partition = w.grid_partition
-        )
+        FROM read_parquet('{missing}') w
+        LEFT JOIN read_parquet('{keymap}') k USING (stac_id)
         ORDER BY w.stac_id, w.grid_partition
     """
     idx = Index(out_store, index_key)
