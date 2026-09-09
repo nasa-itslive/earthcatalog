@@ -25,26 +25,41 @@ def test_info_prints_catalog_summary(tmp_path):
     assert "Summary" in result.output
 
 
-def test_info_verify_is_read_only_without_update(tmp_path):
-    """`info --verify` must not write stats.json — it only reports drift.
-    Persisting the recomputed snapshot requires the explicit --update flag."""
+def test_info_never_writes_stats_json_without_update(tmp_path):
+    """`info` is entirely read-only unless --update is explicitly passed —
+    this must hold even on a first run where no stats.json snapshot exists
+    yet remotely (bootstrap), and even with --verify (which only reports
+    drift)."""
     db = str(tmp_path / "catalog.db")
     wh = str(tmp_path / "warehouse")
     catalog = _open_sqlite(db_path=db, warehouse_path=wh)
     get_or_create(catalog, grid_config=GridConfig(type="h3", resolution=2))
+    stats_path = tmp_path / "stats.json"
 
-    # First run bootstraps stats.json (no snapshot existed yet), written
-    # exactly beside the warehouse dir — not nested under some duplicated
-    # path inside it (see stats._resolve).
+    # Plain `info`, no snapshot exists yet: must not write anything.
     result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh])
     assert result.exit_code == 0, result.output
-    assert "bootstrapped" in result.output
-    stats_path = tmp_path / "stats.json"
+    assert "none stored yet" in result.output
+    assert not stats_path.exists()
+    assert list(tmp_path.rglob("stats.json")) == []
+
+    # --verify, still no snapshot stored: still must not write anything.
+    result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh, "--verify"])
+    assert result.exit_code == 0, result.output
+    assert "updated" not in result.output
+    assert not stats_path.exists()
+
+    # --update explicitly bootstraps it, written exactly beside the
+    # warehouse dir — not nested under some duplicated path inside it
+    # (see stats._resolve).
+    result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh, "--update"])
+    assert result.exit_code == 0, result.output
+    assert "stats.json bootstrapped" in result.output
     assert stats_path.exists()
     assert list(tmp_path.rglob("stats.json")) == [stats_path]
     before = stats_path.read_text()
 
-    # --verify alone must not touch stats.json.
+    # --verify alone (snapshot now exists) must not touch stats.json.
     result = runner.invoke(app, ["info", "--catalog", db, "--warehouse", wh, "--verify"])
     assert result.exit_code == 0, result.output
     assert "[verify]" in result.output
