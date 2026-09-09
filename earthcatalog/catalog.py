@@ -110,22 +110,44 @@ def _build_stats_cache(table) -> list[dict]:
 
 @dataclass
 class CatalogInfo:
-    """Grid metadata read from Iceberg table properties."""
+    """Grid metadata read from Iceberg table properties.
+
+    The query-side partitioner is built lazily from these properties (same
+    factory the ingest side uses) and cached — one partitioner per catalog,
+    so every search prunes with exactly the grid the data was written with.
+    """
 
     grid_type: str
     grid_resolution: int | None
     boundaries_path: str | None
     id_field: str | None
+    time_bin: str = "year"
     _cached_stats: list[dict] | None = field(default=None, repr=False)
     _cached_top_cells: list[dict] | None = field(default=None, repr=False)
+    _partitioner: object | None = field(default=None, repr=False, compare=False)
+
+    def partitioner(self):
+        """The cached read-side partitioner (spatial keys + temporal bin)."""
+        if self._partitioner is None:
+            from .config import GridConfig
+            from .grids import build_partitioner
+
+            self._partitioner = build_partitioner(
+                GridConfig(
+                    type=self.grid_type,
+                    resolution=self.grid_resolution,
+                    boundaries_path=self.boundaries_path,
+                    id_field=self.id_field,
+                    time_bin=self.time_bin,
+                )
+            )
+        return self._partitioner
 
     def cells_for_geometry(self, geom) -> list[str]:
         """Return the partition keys that intersect *geom*."""
-        if self.grid_type == "h3":
-            return self._h3_cells(geom)
-        if self.grid_type == "geojson":
-            return self._geojson_keys(geom)
-        raise ValueError(f"Unknown grid type: {self.grid_type!r}")
+        from shapely import wkb
+
+        return self.partitioner().get_intersecting_keys(wkb.dumps(geom))
 
     def cell_list_sql(self, geom) -> str:
         """Return a SQL fragment suitable for ``WHERE grid_partition IN (...)``."""
@@ -180,7 +202,7 @@ class CatalogInfo:
 
         start_year = q_start.year - year_lookback if q_start is not None else None
         end_year = q_end.year + 1 if q_end is not None else None
-        time_bin = table.properties.get(PROP_TIME_BIN, "year")
+        time_bin = self.time_bin
 
         paths = []
         for task in table.scan(row_filter=expr).plan_files():
@@ -252,48 +274,28 @@ class CatalogInfo:
         except Exception:
             return 0
 
-    def _h3_cells(self, geom) -> list[str]:
-        from shapely import wkb
-
-        from earthcatalog.grids.h3_partitioner import H3Partitioner
-
-        res = self.grid_resolution if self.grid_resolution is not None else 1
-        return H3Partitioner(resolution=res).get_intersecting_keys(wkb.dumps(geom))
-
-    def _geojson_keys(self, geom) -> list[str]:
-        if not self.boundaries_path:
-            raise ValueError(
-                "boundaries_path is required for geojson grid type. "
-                "Re-ingest with a GridConfig that specifies boundaries_path."
-            )
-        from shapely import wkb
-
-        from earthcatalog.grids.geojson_partitioner import GeoJSONPartitioner
-
-        return GeoJSONPartitioner(
-            boundaries_path=self.boundaries_path,
-            id_field=self.id_field or "id",
-        ).get_intersecting_keys(wkb.dumps(geom))
-
     def __repr__(self) -> str:
-        if self.grid_type == "h3":
-            return f"CatalogInfo(grid_type='h3', resolution={self.grid_resolution})"
-        return (
-            f"CatalogInfo(grid_type='geojson', "
-            f"boundaries_path={self.boundaries_path!r}, id_field={self.id_field!r})"
-        )
+        parts = [f"grid_type={self.grid_type!r}"]
+        if self.grid_resolution is not None:
+            parts.append(f"resolution={self.grid_resolution}")
+        if self.time_bin != "year":
+            parts.append(f"time_bin={self.time_bin!r}")
+        if self.boundaries_path is not None:
+            parts.append(f"boundaries_path={self.boundaries_path!r}")
+        return f"CatalogInfo({', '.join(parts)})"
 
 
 def _catalog_info(table) -> CatalogInfo:
     props = table.properties
     grid_type = props.get(PROP_GRID_TYPE, "h3")
     raw_res = props.get(PROP_GRID_RESOLUTION)
-    grid_resolution = int(raw_res) if raw_res is not None else (1 if grid_type == "h3" else None)
+    grid_resolution = int(raw_res) if raw_res is not None else None
     return CatalogInfo(
         grid_type=grid_type,
         grid_resolution=grid_resolution,
         boundaries_path=props.get(PROP_GRID_BOUNDARIES_PATH),
         id_field=props.get(PROP_GRID_ID_FIELD),
+        time_bin=props.get(PROP_TIME_BIN, "year"),
     )
 
 

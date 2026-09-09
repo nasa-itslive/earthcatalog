@@ -56,10 +56,13 @@ class TestFromTable:
         info = _catalog_info(h3_table)
         assert info.grid_resolution == 2
 
-    def test_legacy_defaults_to_h3_resolution_1(self, legacy_table):
+    def test_legacy_defaults_to_h3_partitioner_resolution_1(self, legacy_table):
+        """Legacy tables carry no resolution property; the h3 factory default
+        (resolution 1) is applied by the partitioner, not by CatalogInfo."""
         info = _catalog_info(legacy_table)
         assert info.grid_type == "h3"
-        assert info.grid_resolution == 1
+        assert info.grid_resolution is None
+        assert info.partitioner().resolution == 1
 
     def test_properties_stored_in_table(self, h3_table):
         props = h3_table.properties
@@ -126,9 +129,16 @@ class TestCellsForGeometry:
         assert len(cells_r2) > len(cells_r1)
 
     def test_unknown_grid_type_raises(self, tmp_path):
-        info = CatalogInfo(grid_type="s2", grid_resolution=5, boundaries_path=None, id_field=None)
+        info = CatalogInfo(grid_type="nope", grid_resolution=5, boundaries_path=None, id_field=None)
         with pytest.raises(ValueError, match="Unknown grid type"):
             info.cells_for_geometry(Point(0, 0))
+
+    def test_s2_grid_is_queryable(self):
+        """s2/utm grids were historically write-only (cells_for_geometry
+        raised); the factory-based read path queries them like h3."""
+        info = CatalogInfo(grid_type="s2", grid_resolution=2, boundaries_path=None, id_field=None)
+        cells = info.cells_for_geometry(Point(0, 0))
+        assert len(cells) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -141,7 +141,10 @@ class TestNewCatalogOpenAPI:
         ec = ec_open(store=MemoryStore(), base=wh)
         assert isinstance(ec, EarthCatalog)
         assert ec.grid_type == "h3"
-        assert ec.grid_resolution == 1
+        # Resolution is None until stamped; the h3 partitioner factory
+        # applies the effective default (1) at query time.
+        assert ec.grid_resolution is None
+        assert ec._info.partitioner().resolution == 1
         assert hasattr(ec, "search_files")
         assert hasattr(ec, "search")
 
