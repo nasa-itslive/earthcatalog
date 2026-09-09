@@ -32,6 +32,7 @@ from obstore.store import ObjectStore, S3Store
 from tqdm import tqdm
 
 from earthcatalog import stores
+from earthcatalog.uris import parse_s3_uri
 
 
 def get_store(bucket: str) -> S3Store:
@@ -76,7 +77,7 @@ def sql_catalog_props(db_path: str, warehouse_path: str) -> dict:
 
 
 def _fetch_inventory_bytes(inventory_path: str) -> bytes:
-    bucket, key = inventory_path.removeprefix("s3://").split("/", 1)
+    bucket, key = parse_s3_uri(inventory_path)  # type: ignore[misc]
     return bytes(obstore.get(get_store(bucket), key).bytes())
 
 
@@ -171,8 +172,7 @@ def iter_inventory_parquet(
 
 
 def _parse_manifest(manifest_s3_uri: str) -> tuple[str, ObjectStore, list[str]]:
-    manifest_path = manifest_s3_uri.removeprefix("s3://")
-    manifest_bucket, manifest_key = manifest_path.split("/", 1)
+    manifest_bucket, manifest_key = parse_s3_uri(manifest_s3_uri)  # type: ignore[misc]
 
     dest_store_manifest = get_authenticated_store(manifest_bucket)
     raw = bytes(obstore.get(dest_store_manifest, manifest_key).bytes())

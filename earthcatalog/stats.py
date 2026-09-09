@@ -30,7 +30,7 @@ import obstore
 from obstore.store import ObjectStore
 
 from .schema import PROP_TIME_BIN, partition_year
-from .uris import parse_s3_uri  # noqa: F401  (re-export: canonical home is uris.py)
+from .uris import parse_s3_uri, strip_bucket  # noqa: F401  (parse_s3_uri re-export)
 
 STATS_VERSION = 1
 
@@ -38,8 +38,9 @@ def stats_key_for(warehouse: str) -> str:
     """Store key for stats.json — the top of the catalog, beside
     ``earthcatalog.db``: ``s3://bucket/prefix/warehouse`` → ``prefix/stats.json``.
     """
-    if warehouse.startswith("s3://"):
-        bucket, _, path = warehouse.removeprefix("s3://").partition("/")
+    parsed = parse_s3_uri(warehouse)
+    if parsed:
+        bucket, path = parsed
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
         key = f"{parent}/stats.json" if parent else "stats.json"
         return f"s3://{bucket}/{key}"
@@ -52,9 +53,7 @@ def _store_key(key: str) -> str:
     """Store-relative object key: callers pass ``stats_key_for`` output
     (an ``s3://`` URI for remote warehouses); bucket-level stores need the
     scheme and bucket stripped."""
-    if key.startswith("s3://"):
-        return key.removeprefix("s3://").partition("/")[2]
-    return key
+    return strip_bucket(key) if key.startswith("s3://") else key
 
 
 def _resolve(store: ObjectStore, key: str) -> tuple[ObjectStore, str]:
@@ -108,8 +107,9 @@ def index_locations(table, store: ObjectStore, warehouse: str) -> list[str]:
     from .index import Index, resolve_index_path
 
     key = resolve_index_path(table, f"{warehouse.rstrip('/')}_index.parquet")
-    if key.startswith("s3://"):
-        bucket, _, rel = key.removeprefix("s3://").partition("/")
+    parsed = parse_s3_uri(key)
+    if parsed:
+        bucket, rel = parsed
         return [f"s3://{bucket}/{loc}" for loc in Index(store, rel).locations()]
     if os.path.isabs(key):
         base = Path(key).parent
