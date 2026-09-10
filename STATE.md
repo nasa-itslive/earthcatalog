@@ -77,7 +77,8 @@ db backed up at `refactoring/backups/earthcatalog-pre-catchup-20260907.db`.
 
 **Production flip — applied (2026-09-08, user GO).** `daily_delta.yml`
 defaults now target `catalog/` (warehouse, catalog db, lock, diffs) and run
-on a daily 14:00 UTC schedule (manifests are stamped T01-00Z; 13h buffer).
+on a daily 14:07 UTC schedule (manifests are stamped T01-00Z; 13h buffer;
+off-hour minute avoids GitHub's top-of-the-hour scheduler delays).
 `consolidate.yml` runs Sundays 08:00 UTC after the GC slot.
 
 **Consolidation — shipped + fully run (2026-09-08).** `earthcatalog/consolidate.py`
@@ -176,7 +177,7 @@ earthcatalog ingest --diff <new.parquet> --mode delta \
   `year=unknown/`); dead `_GC_FILE_RE` removed; docs + plan_simplification
   reconciled; `scripts/daily_delta.py` and the two-job workflow deleted —
   `daily_delta.yml` is now one job (diff → ingest, concurrency group,
-  timeout 120 min), live on a 14:00 UTC daily schedule (plus manual
+  timeout 120 min), live on a 14:07 UTC daily schedule (plus manual
   `workflow_dispatch`).
 
 ## Real-data verification (T0 + E2E, all numbers real)

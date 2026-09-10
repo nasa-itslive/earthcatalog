@@ -11,12 +11,14 @@ name: Daily Catalog Update
 # Every write path (warehouse, catalog db, lock, diffs) is a dispatch input;
 # the defaults are the PRODUCTION catalog paths.  Override them to point a
 # run at the refactoring/ scratch pad instead.  The `concurrency` group is
-# the single-writer guard.  Scheduled daily at 14:00 UTC (inventory manifests
+# the single-writer guard.  Scheduled daily at 14:07 UTC (inventory manifests
 # are stamped T01-00Z, so 13h of buffer guarantees yesterday's manifest).
+# The off-hour minute avoids the top-of-the-hour scheduler congestion that
+# delays GitHub cron runs by hours at peak.
 
 on:
   schedule:
-    - cron: "0 14 * * *"
+    - cron: "7 14 * * *"
   workflow_dispatch:
     inputs:
       current_manifest:
