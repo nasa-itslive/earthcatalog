@@ -63,6 +63,19 @@ jobs:
           fi
           echo "args=$ARGS" >> "$GITHUB_OUTPUT"
 
+      - name: Download catalog
+        run: |
+          uv run python -c "
+          from obstore.store import S3Store
+          from earthcatalog import store_config
+          from earthcatalog.catalog import download_catalog
+
+          store = S3Store(bucket='its-live-data', region='us-west-2')
+          store_config.set_store(store)
+          store_config.set_catalog_key('${{ env.CATALOG_KEY }}')
+          download_catalog('/tmp/earthcatalog.db')
+          "
+
       - name: Catalog info (before)
         run: |
           uv run earthcatalog info \
