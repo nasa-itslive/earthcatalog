@@ -5,8 +5,10 @@ name: Consolidate
 
 on:
   schedule:
-    # Sundays 08:00 UTC — after the weekend garbage-collection slot.
-    - cron: "0 8 * * 0"
+    # Sundays 08:13 UTC — after the weekend garbage-collection slot. The
+    # off-hour minute avoids the top-of-the-hour scheduler congestion that
+    # delays GitHub cron runs by hours at peak.
+    - cron: "13 8 * * 0"
   workflow_dispatch:
     inputs:
       min_files:

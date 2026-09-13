@@ -79,7 +79,8 @@ db backed up at `refactoring/backups/earthcatalog-pre-catchup-20260907.db`.
 defaults now target `catalog/` (warehouse, catalog db, lock, diffs) and run
 on a daily 14:07 UTC schedule (manifests are stamped T01-00Z; 13h buffer;
 off-hour minute avoids GitHub's top-of-the-hour scheduler delays).
-`consolidate.yml` runs Sundays 08:00 UTC after the GC slot.
+`consolidate.yml` runs Sundays 08:13 UTC after the GC slot (off-hour minute,
+same reasoning).
 
 **Consolidation — shipped + fully run (2026-09-08).** `earthcatalog/consolidate.py`
 replaces the legacy script: metadata-only planning, memory-bounded streaming
