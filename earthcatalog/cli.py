@@ -300,6 +300,34 @@ def diff(
 # ---------------------------------------------------------------------------
 
 
+def _local_catalog_has_table(catalog_path: str, warehouse_path: str) -> bool:
+    """Best-effort check that the local SQLite catalog already has our table.
+
+    A bare ``os.path.exists`` check is not enough to decide whether the
+    real catalog needs downloading from S3: opening a ``SqlCatalog`` at a
+    path that doesn't have our data yet (e.g. a scratch file left behind
+    by an earlier ``earthcatalog info --catalog <path>`` invocation that
+    never downloaded anything) still creates a valid-but-empty SQLite file
+    with PyIceberg's own bookkeeping tables. That file *exists* but has no
+    ``earthcatalog.stac_items`` registered — trusting existence alone
+    skips the S3 download and ``consolidate`` fails with
+    ``NoSuchTableError`` even though a good catalog sits in S3.
+    """
+    import os
+
+    from pyiceberg.exceptions import NoSuchTableError
+
+    from earthcatalog.catalog import FULL_NAME, open_sqlite
+
+    if not os.path.exists(catalog_path):
+        return False
+    try:
+        open_sqlite(db_path=catalog_path, warehouse_path=warehouse_path).load_table(FULL_NAME)
+        return True
+    except NoSuchTableError:
+        return False
+
+
 @app.command()
 def consolidate(
     catalog: str = typer.Option(
@@ -339,7 +367,7 @@ def consolidate(
 
     from obstore.store import LocalStore, S3Store
 
-    from earthcatalog.catalog import download_catalog, open_sqlite, upload_catalog
+    from earthcatalog.catalog import FULL_NAME, download_catalog, open_sqlite, upload_catalog
     from earthcatalog.consolidate import run as run_consolidation
     from earthcatalog.run import _make_s3_store
 
@@ -352,14 +380,14 @@ def consolidate(
         catalog_key = os.environ.get(
             "EARTHCATALOG_CATALOG_KEY", f"{warehouse_prefix}/earthcatalog.db"
         )
-        if not os.path.exists(catalog):
+        if not _local_catalog_has_table(catalog, warehouse):
             download_catalog(catalog, store=store, catalog_key=catalog_key)
     else:
         store = LocalStore(str(_Path(warehouse).parent))
         warehouse_prefix = _Path(warehouse).name
 
     cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
-    table = cat.load_table("earthcatalog.stac_items")
+    table = cat.load_table(FULL_NAME)
 
     reports = run_consolidation(
         store,
