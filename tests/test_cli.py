@@ -156,3 +156,14 @@ def test_ingest_rejects_inventory_and_diff():
     )
     assert result.exit_code == 1
     assert "exactly one" in result.output
+
+
+def test_consolidate_noops_when_catalog_table_missing(tmp_path):
+    db = str(tmp_path / "catalog.db")
+    wh = tmp_path / "warehouse"
+    wh.mkdir()
+
+    result = runner.invoke(app, ["consolidate", "--catalog", db, "--warehouse", str(wh)])
+
+    assert result.exit_code == 0, result.output
+    assert "0 partition(s) consolidated" in result.output

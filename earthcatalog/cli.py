@@ -339,7 +339,9 @@ def consolidate(
 
     from obstore.store import LocalStore, S3Store
 
-    from earthcatalog.catalog import download_catalog, open_sqlite, upload_catalog
+    from pyiceberg.exceptions import NoSuchTableError
+
+    from earthcatalog.catalog import FULL_NAME, download_catalog, open_sqlite, upload_catalog
     from earthcatalog.consolidate import run as run_consolidation
     from earthcatalog.run import _make_s3_store
 
@@ -359,7 +361,11 @@ def consolidate(
         warehouse_prefix = _Path(warehouse).name
 
     cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
-    table = cat.load_table("earthcatalog.stac_items")
+    try:
+        table = cat.load_table(FULL_NAME)
+    except NoSuchTableError:
+        typer.echo(f"0 partition(s) {'targeted' if dry_run else 'consolidated'}")
+        return
 
     reports = run_consolidation(
         store,
