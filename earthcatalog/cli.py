@@ -544,11 +544,11 @@ def info(
     elif not catalog and catalog_s3:
         catalog_path = catalog_s3  # local warehouse: the db sits beside it
 
-    if not update:
+    if not verify and not update:
         # info is a public, anonymous-read command by design — strip any
         # local credentials so behavior doesn't depend on what happens to
-        # be configured. --update needs real write credentials, so it
-        # keeps them.
+        # be configured. --verify / --update recompute from the (possibly
+        # private) index, so they keep real credentials.
         os.environ.pop("AWS_ACCESS_KEY_ID", None)
         os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
         os.environ.pop("AWS_SESSION_TOKEN", None)
@@ -584,18 +584,19 @@ def info(
     parsed_warehouse = parse_s3_uri(warehouse)
     if parsed_warehouse:
         bucket, _ = parsed_warehouse
-        if update:
-            # Writing needs real, authenticated credentials.
+        if update or verify:
+            # Recomputing (--verify / --update) must read the index, which may
+            # be private: use real, authenticated credentials. The default
+            # read-only path stays anonymous.
             idx_store = _make_s3_store(bucket)
         else:
-            # Read-only (default / --verify): anonymous, unsigned access —
-            # matching how the catalog db itself was downloaded above.
-            # Relying on _make_s3_store here would silently build an
-            # unauthenticated *signed* client whenever no local AWS
-            # credentials happen to be configured, whose requests S3
-            # rejects outright — Index.locations() swallows that failure
-            # and reports zero unique items / index rows instead of the
-            # real counts.
+            # Read-only (default): anonymous, unsigned access — matching how
+            # the catalog db itself was downloaded above.  Relying on
+            # _make_s3_store here would silently build an unauthenticated
+            # *signed* client whenever no local AWS credentials happen to be
+            # configured, whose requests S3 rejects outright —
+            # Index.locations() swallows that failure and reports zero unique
+            # items / index rows instead of the real counts.
             region = (
                 os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-west-2"
             )

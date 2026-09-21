@@ -17,8 +17,16 @@ from earthcatalog.stats import (
 )
 
 
+class _EmptyScan:
+    def plan_files(self):
+        return []
+
+
 class _FakeTable:
     properties = {"earthcatalog.time_bin": "year"}
+
+    def scan(self):
+        return _EmptyScan()
 
 
 def test_stats_key_for_s3():
@@ -107,3 +115,52 @@ def test_unknown_time_bin_partition_labels():
     from earthcatalog.schema import partition_bin_value
 
     assert partition_bin_value("year", None) == "unknown"
+
+
+def test_compute_full_counts_items_not_fanout_rows(tmp_path):
+    """A source item spanning two tiles is two index rows but ONE ingested
+    item: ``items_per_day`` and ``unique_items`` must count distinct
+    ``s3_key``, not fan-out rows (the inaccuracy the report showed)."""
+    from obstore.store import LocalStore
+
+    from earthcatalog.index import Index
+    from earthcatalog.stats import compute_full
+
+    store = LocalStore(str(tmp_path))
+    idx = Index(store, "warehouse_index.parquet")
+    idx.append(
+        [
+            {
+                "stac_id": "x",
+                "s3_key": "s3://b/x.stac.json",
+                "grid_partition": "cellA",
+                "year": 2020,
+                "ingested_at": "2026-09-05T01:00:00+00:00",
+            },
+            {
+                "stac_id": "x",
+                "s3_key": "s3://b/x.stac.json",
+                "grid_partition": "cellB",
+                "year": 2020,
+                "ingested_at": "2026-09-05T01:00:00+00:00",
+            },
+        ]
+    )
+    idx.append(
+        [
+            {
+                "stac_id": "y",
+                "s3_key": "s3://b/y.stac.json",
+                "grid_partition": "cellA",
+                "year": 2020,
+                "ingested_at": "2026-09-06T01:00:00+00:00",
+            }
+        ]
+    )
+
+    locations = [str(tmp_path / loc) for loc in idx.locations()]
+    stats = compute_full(_FakeTable(), idx, locations)
+
+    assert stats["index_rows"] == 3  # raw fan-out rows
+    assert stats["unique_items"] == 2  # distinct source keys
+    assert stats["items_per_day"] == {"2026-09-05": 1, "2026-09-06": 1}

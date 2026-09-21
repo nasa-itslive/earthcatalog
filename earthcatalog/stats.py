@@ -34,6 +34,7 @@ from .uris import parse_s3_uri, strip_bucket  # noqa: F401  (parse_s3_uri re-exp
 
 STATS_VERSION = 1
 
+
 def stats_key_for(warehouse: str) -> str:
     """Store key for stats.json — the top of the catalog, beside
     ``earthcatalog.db``: ``s3://bucket/prefix/warehouse`` → ``prefix/stats.json``.
@@ -190,7 +191,15 @@ def recompute_warehouse(stats: dict[str, Any], table) -> dict[str, Any]:
 def compute_full(table, index, locations: list[str]) -> dict[str, Any]:
     """Expensive, exact: distinct keys / per-day from the index column data,
     the warehouse side from metadata.  *locations* are full URIs of every
-    index part (the caller knows the bucket)."""
+    index part (the caller knows the bucket).
+
+    Everything keyed on items counts **distinct ``s3_key``**: an item that
+    fans out across several H3 tiles is one index row per cell, but one
+    ingest.  ``unique_items`` counts active (non-deleted) keys;
+    ``items_per_day`` counts keys by ``ingested_at`` day (matching
+    :meth:`earthcatalog.index.Index.items_per_day`), so multi-cell items
+    are not double-counted.
+    """
     import duckdb
 
     stats: dict[str, Any] = {
@@ -201,8 +210,9 @@ def compute_full(table, index, locations: list[str]) -> dict[str, Any]:
     }
     if locations:
         con = duckdb.connect()
-        con.execute("INSTALL aws; LOAD aws; CALL load_aws_credentials();")
-        con.execute("SET s3_region='us-west-2';")
+        if any(loc.startswith("s3://") for loc in locations):
+            con.execute("INSTALL aws; LOAD aws; CALL load_aws_credentials();")
+            con.execute("SET s3_region='us-west-2';")
         loc_list = ", ".join(f"'{loc}'" for loc in locations)
 
         def scalar(sql: str) -> int:
@@ -210,14 +220,14 @@ def compute_full(table, index, locations: list[str]) -> dict[str, Any]:
             return int(row[0]) if row else 0
 
         stats["unique_items"] = scalar(
-            f"SELECT count(DISTINCT s3_key) FROM read_parquet([{loc_list}])"
+            f"SELECT count(DISTINCT s3_key) FROM read_parquet([{loc_list}]) WHERE NOT deleted"
         )
         stats["index_rows"] = scalar(f"SELECT count(*) FROM read_parquet([{loc_list}])")
         stats["deleted_rows"] = scalar(
             f"SELECT count(*) FROM read_parquet([{loc_list}]) WHERE deleted"
         )
         per_day = con.execute(
-            f"SELECT CAST(ingested_at AS DATE) AS day, count(*) "
+            f"SELECT CAST(ingested_at AS DATE) AS day, count(DISTINCT s3_key) "
             f"FROM read_parquet([{loc_list}]) GROUP BY day ORDER BY day"
         ).fetchall()
         stats["items_per_day"] = {str(day): int(n) for day, n in per_day}
@@ -347,7 +357,9 @@ def render_catalog_html(info, table, store, catalog_properties: dict) -> str:
             ("Unique items", f"{unique:,}"),
             ("Partitions", f"{len(stat_rows):,}"),
         ]
-        stats_table = "<table style='border-collapse: collapse; width: 100%; font-size: 13px; margin: 0;'>"
+        stats_table = (
+            "<table style='border-collapse: collapse; width: 100%; font-size: 13px; margin: 0;'>"
+        )
         for label, value in stat_display:
             stats_table += f"""
                 <tr style='border-bottom: 1px solid currentColor;'>
