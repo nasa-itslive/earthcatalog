@@ -28,9 +28,9 @@ on:
         required: false
         default: "50"
       limit_tiles:
-        description: "Cap partitions consolidated per implementation (0 = all)"
+        description: "Cap partitions consolidated per implementation (0 = all; raise to scale up)"
         required: false
-        default: "0"
+        default: "50"
       keep:
         description: "Keep the scratch prefix (debugging)"
         type: boolean
@@ -43,6 +43,7 @@ env:
   AWS_REGION: us-west-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   bench:

@@ -294,11 +294,13 @@ def main() -> int:
     print(
         f"[bench] store={args.store} shape={args.partitions} partitions x "
         f"{args.files_per_partition} files = {total_files} files, "
-        f"{args.rows_per_file} rows/file"
+        f"{args.rows_per_file} rows/file, limit_tiles={args.limit_tiles}",
+        flush=True,
     )
 
     try:
         t0 = time.perf_counter()
+        print("[bench] building scratch warehouse A (legacy copy)...", flush=True)
         table_a = _build(
             store,
             prefix_a,
@@ -307,6 +309,7 @@ def main() -> int:
             db_path=f"{tmp_dir}/a.db",
             write=True,
         )
+        print(f"[bench] A ready in {time.perf_counter() - t0:.1f}s; cloning to B...", flush=True)
         _clone(store, prefix_a, prefix_b)
         table_b = _build(
             store,
@@ -316,7 +319,13 @@ def main() -> int:
             db_path=f"{tmp_dir}/b.db",
             write=False,
         )
-        print(f"[bench] scratch warehouse ready in {time.perf_counter() - t0:.1f}s")
+        print(f"[bench] scratch warehouse ready in {time.perf_counter() - t0:.1f}s", flush=True)
+
+        planned = improved.plan(table_a, min_files=args.min_files, limit_tiles=args.limit_tiles)
+        print(
+            f"[bench] consolidating {len(planned)} partition(s) per side (of {args.partitions})",
+            flush=True,
+        )
 
         def flush_a() -> None:
             obstore.put(store, catalog_a, pathlib.Path(f"{tmp_dir}/a.db").read_bytes())
@@ -324,11 +333,19 @@ def main() -> int:
         def flush_b() -> None:
             obstore.put(store, catalog_b, pathlib.Path(f"{tmp_dir}/b.db").read_bytes())
 
+        print("[bench] running legacy (baseline)...", flush=True)
         t_legacy, reports_legacy = _time_legacy(store, table_a, prefix_a, args, flush_a)
-        print(f"[bench] legacy   : {t_legacy:8.1f}s  ({len(reports_legacy)} partitions)")
+        print(
+            f"[bench] legacy   : {t_legacy:8.1f}s  ({len(reports_legacy)} partitions)",
+            flush=True,
+        )
 
+        print("[bench] running improved...", flush=True)
         t_improved, reports_improved = _time_improved(store, table_b, prefix_b, args, flush_b)
-        print(f"[bench] improved : {t_improved:8.1f}s  ({len(reports_improved)} partitions)")
+        print(
+            f"[bench] improved : {t_improved:8.1f}s  ({len(reports_improved)} partitions)",
+            flush=True,
+        )
 
         check = _verify(table_a, table_b)
         files_a = _count_parquet(store, prefix_a)
@@ -350,7 +367,7 @@ def main() -> int:
             "files_improved_after": files_b,
             **check,
         }
-        print("[bench] " + json.dumps(result, indent=2))
+        print("[bench] " + json.dumps(result, indent=2), flush=True)
         if not (check["rows_equal"] and check["ids_equal"] and files_a == files_b):
             print("[bench] VERIFICATION FAILED", file=sys.stderr)
             return 1
@@ -377,7 +394,7 @@ def main() -> int:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         if not args.keep:
-            print(f"[bench] cleaning {base}")
+            print(f"[bench] cleaning {base}", flush=True)
             _delete_prefix(store, base)
             if args.store == "local":
                 shutil.rmtree(pathlib.Path(uri_root) / base, ignore_errors=True)
