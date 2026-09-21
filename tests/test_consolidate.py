@@ -224,3 +224,134 @@ def test_dry_run_writes_nothing(warehouse):
     assert reports and reports[0]["dry_run"] is True
     assert _part_file_count(store) == 3
     assert sum(1 for _ in table.scan().plan_files()) == 3
+
+
+# ---------------------------------------------------------------------------
+# Batching + publish-before-delete durability
+# ---------------------------------------------------------------------------
+
+
+def _make_item_variant(key: str) -> dict:
+    """Item whose (cell, year) partition is derived from the key stem.
+
+    ``p{p}-{j}.stac.json`` → cell ``cell{p}``, year ``2020 + p``; distinct
+    keys in the same partition share it so a batch_size=1 ingest lays down
+    one file per item, giving multiple partitions with several files each.
+    """
+    item = _make_item(key)
+    p = int(key.split("/")[-1].split("-")[0][1:])
+    item["properties"]["grid_partition"] = f"cell{p}"
+    item["properties"]["datetime"] = f"{2020 + p}-05-01T00:00:00Z"
+    return item
+
+
+@pytest.fixture()
+def multi_warehouse(tmp_path):
+    """3 (tile, year) partitions, 3 small parts each (9 files)."""
+    store = LocalStore(str(tmp_path))
+    wh = tmp_path / "warehouse"
+    wh.mkdir(parents=True)
+    cat = _open_sqlite(db_path=str(tmp_path / "catalog.db"), warehouse_path=str(wh))
+    table = get_or_create(cat, grid_config=GridConfig(type="h3", resolution=2))
+    keys = [f"p{p}-{j}.stac.json" for p in range(3) for j in range(3)]
+    Ingester(
+        store=store,
+        index=Index(store, "seed_index.parquet"),
+        table=table,
+        fetch_fn=lambda b, k: _make_item_variant(k),
+        warehouse_prefix="warehouse",
+        warehouse_root=str(wh),
+        batch_size=1,  # one part per item → 3 parts per partition
+    ).run([("data-bucket", k) for k in keys])
+    return store, table, str(wh)
+
+
+def _exists(store, key: str) -> bool:
+    import obstore
+
+    try:
+        bytes(obstore.get(store, key).bytes())
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def test_flush_batches_commits(multi_warehouse, monkeypatch):
+    """flush_every commits/uploads in batches, not once per partition."""
+    store, table, _ = multi_warehouse
+    import earthcatalog.consolidate as C
+
+    commits = {"n": 0}
+    orig_commit = C._commit_batch
+
+    def counting_commit(table, rewrites):
+        commits["n"] += 1
+        return orig_commit(table, rewrites)
+
+    monkeypatch.setattr(C, "_commit_batch", counting_commit)
+
+    flushes = []
+    reports = run(
+        store,
+        table,
+        "warehouse",
+        min_files=3,
+        flush_every=2,
+        on_flush=lambda: flushes.append(1),
+    )
+
+    assert len(reports) == 3
+    assert commits["n"] == 2  # 3 partitions → batches of 2 + 1
+    assert len(flushes) == 2
+    assert table.scan().count() == 9
+    assert _part_file_count(store) == 3
+
+
+def test_registered_scan_is_once_per_flush(multi_warehouse, monkeypatch):
+    """The whole-table 'still referenced?' scan runs per flush, never per
+    partition (the O(partitions × files) cost of the old implementation)."""
+    store, table, _ = multi_warehouse
+    import earthcatalog.consolidate as C
+
+    calls = {"n": 0}
+    orig = C._registered_paths
+
+    def counting(table):
+        calls["n"] += 1
+        return orig(table)
+
+    monkeypatch.setattr(C, "_registered_paths", counting)
+
+    run(store, table, "warehouse", min_files=3, flush_every=2, on_flush=lambda: None)
+
+    assert calls["n"] == 2  # one per flush, not one per partition
+
+
+def test_old_objects_deleted_only_after_publish(multi_warehouse):
+    """For every batch, its old objects still exist when the catalog is
+    published, and are gone once the run returns — publish before delete."""
+    store, table, _ = multi_warehouse
+    from earthcatalog.consolidate import _key
+
+    plans = plan(table, min_files=3)
+    batches = [plans[i : i + 2] for i in range(0, len(plans), 2)]
+
+    def _present(batch) -> bool:
+        return all(_exists(store, _key(u, "warehouse")) for p in batch for u in p.files)
+
+    observed: list[list[bool]] = []
+    run(
+        store,
+        table,
+        "warehouse",
+        min_files=3,
+        flush_every=2,
+        on_flush=lambda: observed.append([_present(b) for b in batches]),
+    )
+
+    # Two flushes: at the k-th publish the k-th batch's objects are intact.
+    assert observed[0][0] is True
+    assert observed[1][1] is True
+    # And by the end every old object is gone.
+    assert not any(_exists(store, _key(u, "warehouse")) for p in plans for u in p.files)
+    assert table.scan().count() == 9

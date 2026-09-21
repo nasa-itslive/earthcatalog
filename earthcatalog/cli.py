@@ -355,12 +355,32 @@ def consolidate(
         "--dry-run",
         help="Report consolidation targets without writing anything.",
     ),
+    flush_every: int = typer.Option(
+        25,
+        "--flush-every",
+        help="Publish the catalog every N partitions; old objects are deleted only "
+        "after the publish that registered their replacement (0 = only at the end).",
+    ),
+    fetch_workers: int = typer.Option(
+        8,
+        "--fetch-workers",
+        help="Concurrent source-file downloads per partition.",
+    ),
+    lock_key: str | None = typer.Option(
+        None,
+        "--lock-key",
+        help="Advisory lock key (defaults to EARTHCATALOG_LOCK_KEY, else the "
+        "catalog db's parent directory).",
+    ),
 ) -> None:
     """Merge a partition's small parts into one file, atomically in Iceberg.
 
     Metadata-only planning; the replacement is a single Iceberg transaction
-    (drop old files, append the merged one), and old objects are deleted
-    only after that commit succeeds.
+    (drop old files, append the merged one).  The run holds the catalog's
+    advisory lock, publishes the catalog every ``--flush-every`` partitions,
+    and deletes old objects only after the publish that registered their
+    replacement — a timeout can no longer leave the remote metadata pointing
+    at deleted objects.
     """
     import os
     from pathlib import Path as _Path
@@ -369,6 +389,7 @@ def consolidate(
 
     from earthcatalog.catalog import FULL_NAME, download_catalog, open_sqlite, upload_catalog
     from earthcatalog.consolidate import run as run_consolidation
+    from earthcatalog.lock import S3Lock
     from earthcatalog.run import _make_s3_store
 
     catalog_key = None
@@ -380,57 +401,80 @@ def consolidate(
         catalog_key = os.environ.get(
             "EARTHCATALOG_CATALOG_KEY", f"{warehouse_prefix}/earthcatalog.db"
         )
-        if not _local_catalog_has_table(catalog, warehouse):
-            download_catalog(catalog, store=store, catalog_key=catalog_key)
     else:
         store = LocalStore(str(_Path(warehouse).parent))
         warehouse_prefix = _Path(warehouse).name
 
-    cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
-    table = cat.load_table(FULL_NAME)
+    if lock_key is None:
+        lock_key = os.environ.get("EARTHCATALOG_LOCK_KEY")
+    if lock_key is None and catalog_key:
+        parent = catalog_key.rsplit("/", 1)[0] if "/" in catalog_key else ""
+        lock_key = f"{parent}/.lock" if parent else ".lock"
+    if lock_key is None:
+        lock_key = ".lock"
 
-    reports = run_consolidation(
-        store,
-        table,
-        warehouse_prefix,
-        min_files=min_files,
-        limit_tiles=limit_tiles,
-        dry_run=dry_run,
-    )
-    for r in reports:
-        typer.echo(
-            f"{r['tile']}/{r['bin_value']}: "
-            + (
-                f"[dry-run] {r['files']} files, {r['rows']:,} rows, {r['bytes']:,} bytes"
-                if r.get("dry_run")
-                else f"{r['files_before']} → {r['files_after']} files, "
-                f"{r['rows']:,} rows, {r['rows_removed_dupes']:,} dupes removed"
-            )
-        )
-    typer.echo(f"{len(reports)} partition(s) {'targeted' if dry_run else 'consolidated'}")
+    with S3Lock(owner="consolidate", store=store, key=lock_key):
+        if catalog_key and not _local_catalog_has_table(catalog, warehouse):
+            download_catalog(catalog, store=store, catalog_key=catalog_key)
 
-    if not dry_run and catalog_key:
-        upload_catalog(catalog, store=store, catalog_key=catalog_key)
+        cat = open_sqlite(db_path=catalog, warehouse_path=warehouse)
+        table = cat.load_table(FULL_NAME)
 
-        # Refresh the catalog-stats snapshot at the durable commit moment.
-        from earthcatalog import stats as stats_mod
-        from earthcatalog.index import Index
+        def _flush() -> None:
+            if catalog_key:
+                upload_catalog(catalog, store=store, catalog_key=catalog_key)
 
-        def _apply(s):
-            return stats_mod.apply_consolidation(
-                s,
-                rows_removed_dupes=sum(r["rows_removed_dupes"] for r in reports),
-                files_saved=sum(r["files_before"] - r["files_after"] for r in reports),
+        def _on_report(r: dict) -> None:
+            typer.echo(
+                f"{r['tile']}/{r['bin_value']}: {r['files_before']} → "
+                f"{r['files_after']} files, {r['rows']:,} rows, "
+                f"{r['rows_removed_dupes']:,} dupes removed"
             )
 
-        stats_mod.refresh_after(
+        reports = run_consolidation(
             store,
-            stats_mod.stats_key_for(warehouse),
             table,
-            Index(store, os.path.basename(catalog_key)),
-            stats_mod.index_locations(table, store, warehouse),
-            apply=_apply,
+            warehouse_prefix,
+            min_files=min_files,
+            limit_tiles=limit_tiles,
+            dry_run=dry_run,
+            flush_every=flush_every or None,
+            on_flush=_flush if catalog_key else None,
+            on_report=None if dry_run else _on_report,
+            fetch_workers=fetch_workers,
         )
+
+        if dry_run:
+            for r in reports:
+                typer.echo(
+                    f"{r['tile']}/{r['bin_value']}: [dry-run] {r['files']} files, "
+                    f"{r['rows']:,} rows, {r['bytes']:,} bytes"
+                )
+        typer.echo(f"{len(reports)} partition(s) {'targeted' if dry_run else 'consolidated'}")
+
+        if not dry_run and catalog_key:
+            # Ensure the final catalog is published even when the last flush
+            # already did (idempotent PUT), then refresh the stats snapshot.
+            upload_catalog(catalog, store=store, catalog_key=catalog_key)
+
+            from earthcatalog import stats as stats_mod
+            from earthcatalog.index import Index
+
+            def _apply(s):
+                return stats_mod.apply_consolidation(
+                    s,
+                    rows_removed_dupes=sum(r["rows_removed_dupes"] for r in reports),
+                    files_saved=sum(r["files_before"] - r["files_after"] for r in reports),
+                )
+
+            stats_mod.refresh_after(
+                store,
+                stats_mod.stats_key_for(warehouse),
+                table,
+                Index(store, os.path.basename(catalog_key)),
+                stats_mod.index_locations(table, store, warehouse),
+                apply=_apply,
+            )
 
 
 # ---------------------------------------------------------------------------

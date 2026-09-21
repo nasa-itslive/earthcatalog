@@ -1,0 +1,88 @@
+# On-demand real-S3 benchmark: baseline (c242d18) vs current consolidation.
+#
+# Builds a production-shaped SCRATCH warehouse under --prefix (default
+# test-space/stac/bench/consolidate), runs both implementations over
+# identical copies on real S3 from a GitHub-hosted runner, verifies they
+# leave identical data, and reports the speedup.  The scratch prefix is
+# deleted afterwards unless keep=true.  This never touches the production
+# warehouse or catalog: the script refuses prefixes without "bench"/"scratch".
+name: Bench consolidation
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "Scratch key prefix (must contain 'bench' or 'scratch')"
+        required: false
+        default: "test-space/stac/bench/consolidate"
+      partitions:
+        description: "Number of (tile, year) partitions"
+        required: false
+        default: "120"
+      files_per_partition:
+        description: "Small parts per partition"
+        required: false
+        default: "10"
+      rows_per_file:
+        description: "Rows per small part"
+        required: false
+        default: "50"
+      limit_tiles:
+        description: "Cap partitions consolidated per implementation (0 = all)"
+        required: false
+        default: "0"
+      keep:
+        description: "Keep the scratch prefix (debugging)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  bench:
+    name: Legacy vs improved on real S3
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install earthcatalog
+        run: uv sync
+
+      - name: Run benchmark
+        run: |
+          LIMIT="${{ github.event.inputs.limit_tiles || '0' }}"
+          ARGS=""
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then ARGS="$ARGS --limit-tiles $LIMIT"; fi
+          if [ "${{ github.event.inputs.keep }}" = "true" ]; then ARGS="$ARGS --keep"; fi
+          uv run python benchmarks/consolidate_bench.py \
+            --store s3 --bucket its-live-data \
+            --prefix "${{ github.event.inputs.prefix || 'test-space/stac/bench/consolidate' }}" \
+            --partitions "${{ github.event.inputs.partitions || '120' }}" \
+            --files-per-partition "${{ github.event.inputs.files_per_partition || '10' }}" \
+            --rows-per-file "${{ github.event.inputs.rows_per_file || '50' }}" \
+            --summary-file "$GITHUB_STEP_SUMMARY" \
+            --json-out bench-consolidate.json \
+            $ARGS
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-consolidate
+          path: bench-consolidate.json
+          if-no-files-found: ignore

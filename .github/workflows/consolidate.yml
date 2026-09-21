@@ -1,14 +1,18 @@
-# Weekly maintenance, run AFTER garbage collection: merges small part
-# files into one file per (tile, temporal bin) partition with a single
-# atomic Iceberg transaction per partition.  Dispatch-only — no schedule.
+# Daily maintenance (after the daily ingest slot): merges small part files
+# into one file per (tile, temporal bin) partition with a single atomic
+# Iceberg transaction per partition.  Each run is bounded by --limit-tiles
+# (biggest offenders first) so it comfortably fits the 120-minute runner
+# timeout; the CLI holds the catalog lock, publishes the catalog every
+# --flush-every partitions, and deletes old objects only after the publish
+# that registered their replacement.
 name: Consolidate
 
 on:
   schedule:
-    # Sundays 08:13 UTC — after the weekend garbage-collection slot. The
-    # off-hour minute avoids the top-of-the-hour scheduler congestion that
-    # delays GitHub cron runs by hours at peak.
-    - cron: "13 8 * * 0"
+    # Daily, 08:13 UTC — before the daily ingest (14:07 UTC), off the hour
+    # to avoid the top-of-the-hour scheduler congestion that delays GitHub
+    # cron runs by hours at peak.
+    - cron: "13 8 * * *"
   workflow_dispatch:
     inputs:
       min_files:
@@ -16,9 +20,13 @@ on:
         required: false
         default: "4"
       limit_tiles:
-        description: "Cap partitions per run (biggest offenders first; empty = all)"
+        description: "Cap partitions per run (biggest offenders first; 0 = all)"
         required: false
-        default: ""
+        default: "300"
+      flush_every:
+        description: "Publish the catalog + delete old objects every N partitions"
+        required: false
+        default: "25"
       dry_run:
         description: "Report consolidation targets without writing"
         type: boolean
@@ -27,12 +35,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: earthcatalog-consolidate
+  cancel-in-progress: false
+
 env:
   AWS_REGION:        us-west-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   WAREHOUSE:         s3://its-live-data/test-space/stac/catalog/warehouse
   CATALOG_KEY:       test-space/stac/catalog/earthcatalog.db
+  LOCK_KEY:          test-space/stac/catalog/.lock
 
 jobs:
   consolidate:
@@ -57,8 +70,10 @@ jobs:
         id: flags
         run: |
           ARGS="--min-files ${{ github.event.inputs.min_files || '4' }}"
-          if [ -n "${{ github.event.inputs.limit_tiles }}" ]; then
-            ARGS="$ARGS --limit-tiles ${{ github.event.inputs.limit_tiles }}"
+          ARGS="$ARGS --flush-every ${{ github.event.inputs.flush_every || '25' }}"
+          LIMIT="${{ github.event.inputs.limit_tiles || '300' }}"
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+            ARGS="$ARGS --limit-tiles $LIMIT"
           fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
@@ -87,10 +102,12 @@ jobs:
       - name: Consolidate
         env:
           EARTHCATALOG_CATALOG_KEY: ${{ env.CATALOG_KEY }}
+          EARTHCATALOG_LOCK_KEY: ${{ env.LOCK_KEY }}
         run: |
           uv run earthcatalog consolidate \
             --catalog   /tmp/earthcatalog.db \
             --warehouse ${{ env.WAREHOUSE }} \
+            --lock-key  ${{ env.LOCK_KEY }} \
             ${{ steps.flags.outputs.args }}
 
       - name: Catalog info (after)
@@ -105,5 +122,6 @@ jobs:
         run: |
           echo "### Consolidation Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "Min files: \`${{ github.event.inputs.min_files || '4' }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Limit tiles: \`${{ github.event.inputs.limit_tiles || 'all' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Limit tiles: \`${{ github.event.inputs.limit_tiles || '300' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Flush every: \`${{ github.event.inputs.flush_every || '25' }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Dry run: \`${{ github.event.inputs.dry_run || 'false' }}\`" >> "$GITHUB_STEP_SUMMARY"

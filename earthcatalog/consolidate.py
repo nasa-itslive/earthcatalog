@@ -3,20 +3,45 @@
 The daily ingest appends one small part per batch, so hot (tile, bin)
 partitions accumulate many small files — slow prunes, lots of S3 requests.
 Consolidation rewrites a partition into one file and replaces the old
-entries with a single atomic Iceberg commit (append the new file, delete
-the old entries in the same transaction), so search never sees the
-partition doubled or missing.  Old objects are deleted only after the
-commit succeeds; a crash leaves the new file orphaned and harmless.
+entries with an atomic Iceberg transaction (append the new file, delete the
+old entries), so search never sees the partition doubled or missing.  Old
+objects are deleted only after the commit succeeds **and** the catalog
+holding that commit has been published: :func:`run` flushes the (local)
+catalog through ``on_flush`` before it unlinks anything, so a cancelled or
+timed-out job can never leave the remote metadata pointing at deleted
+objects.
 
-All planning is metadata-only (``plan``): the audit report and the dry-run
-never read or write Parquet.
+Performance notes (why this is CI-friendly at the ~9k-file scale):
+
+* Planning is metadata-only (``plan``): the audit report and the dry-run
+  never read or write Parquet.
+* Rewrites are **batched into one Iceberg transaction per flush** instead
+  of one transaction per partition.  pyiceberg's per-partition
+  ``add_files`` re-reads every manifest to check for duplicates and each
+  partition commits two snapshots; batching turns O(partitions) manifest
+  scans and snapshot deep-copies into O(flushes).  This is the dominant
+  win at production scale.
+* ``add_files(..., check_duplicate_files=False)`` — the new part name is
+  freshly allocated, so the whole-table duplicate scan is pure overhead.
+* The "which old objects are still referenced?" check is **one** manifest
+  scan per flush, not one per partition.
+* Source files are fetched with a bounded thread pool (obstore releases the
+  GIL); parsing/dedupe/writing stays sequential so memory peaks at one
+  partition's compressed bytes plus one decoded file.
+* The next ``part_NNNNNN`` sequence number is derived from the directory
+  listing already taken for the crash-window check — no extra LIST.
+* Old objects are unlinked with a bounded thread pool after the commit is
+  published, with per-key retries; failures are non-fatal orphans.
 """
 
 from __future__ import annotations
 
 import io
 import re
+import time
 from collections import defaultdict
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import obstore
@@ -27,6 +52,13 @@ from obstore.store import ObjectStore
 from .schema import partition_bin_value
 
 _PART_SEQ = re.compile(r"part_(\d+)\.parquet$")
+_SNAPSHOT_PROPS = {"earthcatalog.consolidated": "true"}
+
+# Bounded pools: GitHub-hosted runners have 4 vCPUs and modest bandwidth.
+# Fetching is network-bound (obstore releases the GIL); delete is too.
+DEFAULT_FETCH_WORKERS = 8
+DEFAULT_DELETE_WORKERS = 16
+_DELETE_RETRIES = 3
 
 
 @dataclass(frozen=True)
@@ -42,6 +74,16 @@ class PartitionPlan:
     @property
     def key(self) -> tuple[str, str]:
         return (self.tile, self.bin_value)
+
+
+@dataclass
+class _Rewrite:
+    """One partition rewritten but not yet committed to Iceberg."""
+
+    report: dict
+    predicate: object
+    new_uri: str | None
+    old_uris: tuple[str, ...]
 
 
 def plan(
@@ -89,13 +131,13 @@ def plan(
     return plans[:limit_tiles] if limit_tiles is not None else plans
 
 
-def _next_seq(dir_key: str, store: ObjectStore) -> int:
+def _next_seq(listed: Iterable[str]) -> int:
+    """Next ``part_NNNNNN`` sequence from an already-taken directory listing."""
     seqs = [0]
-    for listing in obstore.list(store, prefix=dir_key):
-        for obj in listing:
-            m = _PART_SEQ.search(obj["path"].rsplit("/", 1)[-1])
-            if m:
-                seqs.append(int(m.group(1)))
+    for path in listed:
+        m = _PART_SEQ.search(path.rsplit("/", 1)[-1])
+        if m:
+            seqs.append(int(m.group(1)))
     return max(seqs) + 1
 
 
@@ -109,6 +151,16 @@ def _key(uri: str, warehouse_prefix: str) -> str:
     """
     marker = warehouse_prefix.strip("/")
     return (marker + "/" + uri.rsplit(f"/{marker}/", 1)[1]).lstrip("/")
+
+
+def _registered_paths(table) -> set[str]:
+    """Every file path currently registered in the table (one manifest scan)."""
+    try:
+        inspect = table.inspect.files()
+        col = inspect.column("file_path") if hasattr(inspect, "column") else inspect["file_path"]
+        return {str(v).removeprefix("file:") for v in col.to_pylist()}
+    except Exception:
+        return {t.file.file_path for t in table.scan().plan_files()}
 
 
 def _temporal_predicate(tile: str, bin_value: str):
@@ -152,25 +204,89 @@ def _temporal_predicate(tile: str, bin_value: str):
     )
 
 
-def consolidate_partition(
+def _fetch_bytes(store: ObjectStore, key: str) -> bytes:
+    return bytes(obstore.get(store, key).bytes())
+
+
+def _fetch_many(store: ObjectStore, keys: list[str], workers: int) -> list[bytes | None]:
+    """Fetch *keys* concurrently (order-preserving); missing keys → ``None``."""
+
+    def _get(key: str) -> bytes | None:
+        try:
+            return _fetch_bytes(store, key)
+        except FileNotFoundError:
+            return None
+
+    if workers <= 1 or len(keys) <= 1:
+        return [_get(k) for k in keys]
+    with ThreadPoolExecutor(max_workers=min(workers, len(keys))) as pool:
+        return list(pool.map(_get, keys))
+
+
+def _delete_old_objects(
+    store: ObjectStore,
+    warehouse_prefix: str,
+    entries: list[tuple[str, dict]],
+    registered: set[str],
+    *,
+    workers: int = DEFAULT_DELETE_WORKERS,
+) -> None:
+    """Unlink old objects that the commit removed from the metadata.
+
+    *entries* pairs each candidate URI with the report it belongs to.  A
+    URI still present in *registered* is left alone (the predicate did not
+    prove every row and the file survived).  Every other delete is retried;
+    a persistent failure is counted as ``old_files_left`` — non-fatal, the
+    object is merely an unreferenced orphan.
+    """
+    pending = [(u, rep) for u, rep in entries if u not in registered]
+    if not pending:
+        return
+
+    def _delete(uri: str) -> str:
+        key = _key(uri, warehouse_prefix)
+        for attempt in range(_DELETE_RETRIES):
+            try:
+                obstore.delete(store, key)
+                return "removed"
+            except FileNotFoundError:
+                return "missing"
+            except Exception:
+                if attempt == _DELETE_RETRIES - 1:
+                    return "left"
+                time.sleep(5 * (attempt + 1))
+        return "left"  # pragma: no cover — loop always returns
+
+    uris = [u for u, _ in pending]
+    if workers <= 1 or len(uris) <= 1:
+        outcomes = [_delete(u) for u in uris]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(uris))) as pool:
+            outcomes = list(pool.map(_delete, uris))
+
+    for (_, rep), outcome in zip(pending, outcomes):
+        if outcome == "left":
+            rep["old_files_left"] += 1
+        else:
+            rep["old_files_deleted"] += 1
+
+
+def _rewrite_partition(
     store: ObjectStore,
     table,
     plan: PartitionPlan,
     warehouse_prefix: str,
     *,
     dedupe: bool = True,
-) -> dict:
-    """Rewrite *plan*'s files into one and atomically replace them.
+    fetch_workers: int = DEFAULT_FETCH_WORKERS,
+) -> _Rewrite:
+    """Rewrite *plan*'s files into one new part; do **not** commit yet.
 
-    Reads every file in the partition, (optionally) dedupes by item id,
-    writes ``part_{next:06d}.parquet`` beside them, and commits ONE
-    transaction that drops the old files (by partition predicate — whole
-    files leave only when every row provably matches, so nothing is ever
-    partially deleted) and appends the new file.  Old S3 objects are
-    removed only after the commit confirms they left the metadata.
-
-    Returns a stats dict; raises on any verification failure (the new file
-    is removed and the table untouched).
+    Reads every surviving file in the partition, (optionally) dedupes by
+    item id, and writes ``part_{next:06d}.parquet`` beside them.  The
+    Iceberg transaction that drops the old files and registers the new one
+    is staged by :func:`_commit_batch`, so many partitions share one
+    manifest rewrite.
     """
     first_key = _key(plan.files[0], warehouse_prefix)
     dir_key = first_key.rsplit("/", 1)[0]
@@ -200,22 +316,22 @@ def consolidate_partition(
     if orphan_key:
         new_key = orphan_key
         new_uri = plan.files[0].rsplit("/", 1)[0] + "/" + orphan_key.rsplit("/", 1)[1]
-        rows = pq.ParquetFile(
-            io.BytesIO(bytes(obstore.get(store, new_key).bytes()))
-        ).metadata.num_rows
+        rows = pq.ParquetFile(io.BytesIO(_fetch_bytes(store, new_key))).metadata.num_rows
     elif meta_keys & listed:
-        # Stream one source file at a time into the output ParquetWriter:
-        # memory peaks at a single file plus the dedupe id set, never at
-        # the whole partition (plan() caps partition sizes upstream).
+        # Fetch every surviving source blob concurrently, then stream one at
+        # a time into the output writer: memory peaks at the partition's
+        # compressed bytes plus a single decoded file, never at the decoded
+        # whole partition (plan() caps partition sizes upstream).
+        source_keys = [k for k in (_key(u, warehouse_prefix) for u in plan.files) if k in listed]
+        blobs = _fetch_many(store, source_keys, fetch_workers)
         sink = io.BytesIO()
         writer: pq.ParquetWriter | None = None
         seen: set[str] = set()
         rows_in = 0
-        for uri in plan.files:
-            key = _key(uri, warehouse_prefix)
-            if key not in listed:
+        for blob in blobs:
+            if blob is None:  # vanished between LIST and GET — crash window
                 continue
-            tbl = pq.ParquetFile(io.BytesIO(bytes(obstore.get(store, key).bytes()))).read()
+            tbl = pq.ParquetFile(io.BytesIO(blob)).read()
             rows_in += tbl.num_rows
             if dedupe:
                 keep: list[bool] = []
@@ -241,62 +357,85 @@ def consolidate_partition(
             if written != rows:
                 raise RuntimeError(f"consolidation verification failed for {dir_key}")
             removed_dupes = rows_in - rows
-            seq = _next_seq(dir_key, store)
+            seq = _next_seq(listed)
             new_key = f"{dir_key}/part_{seq:06d}.parquet"
             obstore.put(store, new_key, sink.getvalue())
             new_uri = plan.files[0].rsplit("/", 1)[0] + f"/part_{seq:06d}.parquet"
-            removed_dupes = rows_in - rows
     # else: every listed object is gone and no orphan exists — a pure
     # phantom cleanup (predicate-delete only, nothing appended).
 
-    # The delete producer must be created (and its parent snapshot pinned)
-    # before the append is staged, so it computes against the old manifests.
-    with table.transaction() as tx:
-        deleter = tx.update_snapshot({"earthcatalog.consolidated": "true"}).delete()
-        deleter.delete_by_predicate(_temporal_predicate(plan.tile, plan.bin_value))
-        deleter.commit()
-        if new_uri:
-            tx.add_files([new_uri])
-
-    # Drop only objects the commit actually removed from the metadata.  A
-    # failed delete is never fatal: the object is orphaned but harmless
-    # (unreferenced), so retry briefly and leave anything that still fails.
-    remaining = {
-        t.file.file_path for t in table.scan().plan_files() if t.file.partition[0] == plan.tile
-    }
-    removed = 0
-    left = 0
-    import time
-
-    for uri in plan.files:
-        if uri in remaining:
-            continue
-        for attempt in range(3):
-            try:
-                obstore.delete(store, _key(uri, warehouse_prefix))
-                removed += 1
-                break
-            except FileNotFoundError:
-                removed += 1
-                break
-            except Exception:
-                if attempt == 2:
-                    left += 1
-                else:
-                    time.sleep(5 * (attempt + 1))
-
-    return {
+    report = {
         "tile": plan.tile,
         "bin_value": plan.bin_value,
         "files_before": len(plan.files),
         "files_after": 1 if new_uri else 0,
         "rows": rows,
         "rows_removed_dupes": removed_dupes,
-        "old_files_deleted": removed,
-        "old_files_left": left,
+        "old_files_deleted": 0,
+        "old_files_left": 0,
         "already_missing": already_missing,
         "new_file": new_key,
     }
+    return _Rewrite(
+        report=report,
+        predicate=_temporal_predicate(plan.tile, plan.bin_value),
+        new_uri=new_uri,
+        old_uris=plan.files,
+    )
+
+
+def _commit_batch(table, rewrites: list[_Rewrite]) -> None:
+    """Commit many rewritten partitions in one Iceberg transaction.
+
+    All predicates are OR-ed into a single delete producer (one manifest
+    rewrite for the whole batch); all new parts are appended in one
+    ``add_files`` with the duplicate scan disabled.  The delete producer is
+    staged before the append — as the per-partition version required — so
+    it computes against the old manifests.
+    """
+    if not rewrites:
+        return
+    new_uris = [r.new_uri for r in rewrites if r.new_uri]
+    with table.transaction() as tx:
+        deleter = tx.update_snapshot(_SNAPSHOT_PROPS).delete()
+        for r in rewrites:
+            deleter.delete_by_predicate(r.predicate)
+        deleter.commit()
+        if new_uris:
+            tx.add_files(new_uris, check_duplicate_files=False)
+
+
+def consolidate_partition(
+    store: ObjectStore,
+    table,
+    plan: PartitionPlan,
+    warehouse_prefix: str,
+    *,
+    dedupe: bool = True,
+    delete_old: bool = True,
+    fetch_workers: int = DEFAULT_FETCH_WORKERS,
+) -> dict:
+    """Rewrite and atomically replace a single partition (commit + delete).
+
+    Convenience wrapper around :func:`_rewrite_partition` /
+    :func:`_commit_batch` for callers outside :func:`run`.  ``run`` uses the
+    batched path so that many partitions share one transaction.
+    """
+    rewrite = _rewrite_partition(
+        store, table, plan, warehouse_prefix, dedupe=dedupe, fetch_workers=fetch_workers
+    )
+    _commit_batch(table, [rewrite])
+    report = rewrite.report
+    if delete_old:
+        _delete_old_objects(
+            store,
+            warehouse_prefix,
+            [(u, report) for u in rewrite.old_uris],
+            _registered_paths(table),
+        )
+    else:
+        report["_old_files"] = rewrite.old_uris
+    return report
 
 
 def run(
@@ -309,8 +448,22 @@ def run(
     max_bytes: int = 512_000_000,
     max_rows: int = 5_000_000,
     dry_run: bool = False,
+    dedupe: bool = True,
+    flush_every: int | None = None,
+    on_flush: Callable[[], None] | None = None,
+    on_report: Callable[[dict], None] | None = None,
+    fetch_workers: int = DEFAULT_FETCH_WORKERS,
+    delete_workers: int = DEFAULT_DELETE_WORKERS,
 ) -> list[dict]:
-    """Plan (always) and consolidate (unless *dry_run*). Returns the reports."""
+    """Plan (always) and consolidate (unless *dry_run*). Returns the reports.
+
+    Partitions are rewritten and committed in batches of *flush_every*
+    (one Iceberg transaction per batch).  When *on_flush* is given (the CLI
+    passes a catalog upload) it is called after each batch's commit — and
+    once more at the end — **before** that batch's old objects are
+    unlinked.  A timeout therefore discards at most the last batch, and the
+    remote catalog never references an object that has been deleted.
+    """
     plans = plan(
         table,
         min_files=min_files,
@@ -330,4 +483,46 @@ def run(
             }
             for p in plans
         ]
-    return [consolidate_partition(store, table, p, warehouse_prefix) for p in plans]
+
+    reports: list[dict] = []
+    batch: list[_Rewrite] = []
+    pending: list[tuple[str, dict]] = []
+
+    def flush() -> None:
+        if not batch and not pending:
+            return
+        if batch:
+            _commit_batch(table, batch)
+            for rewrite in batch:
+                pending.extend((uri, rewrite.report) for uri in rewrite.old_uris)
+            batch.clear()
+        if on_flush is not None:
+            on_flush()
+        if pending:
+            _delete_old_objects(
+                store,
+                warehouse_prefix,
+                pending,
+                _registered_paths(table),
+                workers=delete_workers,
+            )
+            pending.clear()
+
+    for p in plans:
+        rewrite = _rewrite_partition(
+            store,
+            table,
+            p,
+            warehouse_prefix,
+            dedupe=dedupe,
+            fetch_workers=fetch_workers,
+        )
+        batch.append(rewrite)
+        reports.append(rewrite.report)
+        if on_report is not None:
+            on_report(rewrite.report)
+        if flush_every and len(batch) >= flush_every:
+            flush()
+
+    flush()
+    return reports
